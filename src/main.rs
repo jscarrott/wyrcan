@@ -21,20 +21,10 @@ struct App {
 
 impl App {
     fn new() -> App {
+        let t = todo_txt::task::Task::default();
         App {
             state: TableState::default(),
-            items: vec![
-                todo_txt::Task {
-                    status: Status::ToDo,
-                    description: String::from("test"),
-                    due: None,
-                },
-                Item {
-                    status: Status::ToDo,
-                    description: String::from("test2"),
-                    due: None,
-                },
-            ],
+            items: vec![t.clone(), t],
             adding_item: false,
             input: Input::default(),
         }
@@ -67,7 +57,7 @@ impl App {
         self.state.select(Some(i));
     }
 
-    pub fn get_selected_item(&mut self) -> Option<&mut Item> {
+    pub fn get_selected_item(&mut self) -> Option<&mut todo_txt::Task> {
         let index = self.state.selected();
         match index {
             Some(index) => Some(self.items.get_mut(index).unwrap()),
@@ -130,11 +120,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             if app.adding_item {
                 match key.code {
                     KeyCode::Enter => {
-                        app.items.push(Item {
-                            status: Status::ToDo,
-                            description: app.input.to_string(),
-                            due: None,
-                        });
+                        let mut task = todo_txt::task::Task::default();
+                        task.subject = app.input.to_string();
+                        app.items.push(task);
                         app.input.reset();
                         app.adding_item = false;
                     }
@@ -149,10 +137,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Char('a') => app.adding_item = true,
-                    KeyCode::Char('c') => {
-                        app.get_selected_item().unwrap().status =
-                            Status::Done(std::time::SystemTime::now())
-                    }
+                    KeyCode::Char('c') => app.get_selected_item().unwrap().complete(),
                     KeyCode::Down | KeyCode::Char('j') => app.next(),
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
                     _ => {}
@@ -211,18 +196,18 @@ fn ui(f: &mut Frame, app: &mut App) {
         let header = Row::new(header_cells).style(normal_style).height(1);
         // .bottom_margin(1);
         let rows = app.items.iter().map(|item| {
-            let height = item.description.chars().filter(|c| *c == '\n').count() + 1;
+            let height = item.subject.chars().filter(|c| *c == '\n').count() + 1;
             let cells = vec![
-                Cell::from(Text::from(item.status.to_string())),
-                Cell::from(Text::from(item.description.clone())),
+                Cell::from(Text::from(item.finished.to_string())),
+                Cell::from(Text::from(item.subject.to_string())),
             ];
             Row::new(cells).height(height as u16)
         });
         let t = Table::new(
             rows,
             [
-                Constraint::Percentage(50),
-                Constraint::Max(30),
+                Constraint::Max(10),
+                Constraint::Max(70),
                 Constraint::Min(10),
             ],
         )
