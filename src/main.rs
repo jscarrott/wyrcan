@@ -9,27 +9,32 @@ use crossterm::{
 use ratatui::{prelude::*, widgets::*};
 use std::str::FromStr;
 use strum_macros::{Display, EnumString};
+use todo_lib::todotxt::Task;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 struct App {
-    state: TableState,
-    items: Vec<todo_txt::Task>,
+    project_state: StatefulList<String>,
+    table_state: TableState,
+    items: Vec<Task>,
     adding_item: bool,
     input: Input,
 }
 
-impl App {
-    fn new() -> App {
-        let t = todo_txt::task::Task::default();
-        App {
-            state: TableState::default(),
-            items: vec![t.clone(), t],
-            adding_item: false,
-            input: Input::default(),
+struct StatefulList<T> {
+    state: ListState,
+    items: Vec<T>,
+}
+
+impl<T> StatefulList<T> {
+    fn with_items(items: Vec<T>) -> StatefulList<T> {
+        StatefulList {
+            state: ListState::default(),
+            items,
         }
     }
-    pub fn next(&mut self) {
+
+    fn next(&mut self) {
         let i = match self.state.selected() {
             Some(i) => {
                 if i >= self.items.len() - 1 {
@@ -43,7 +48,7 @@ impl App {
         self.state.select(Some(i));
     }
 
-    pub fn previous(&mut self) {
+    fn previous(&mut self) {
         let i = match self.state.selected() {
             Some(i) => {
                 if i == 0 {
@@ -57,13 +62,66 @@ impl App {
         self.state.select(Some(i));
     }
 
-    pub fn get_selected_item(&mut self) -> Option<&mut todo_txt::Task> {
-        let index = self.state.selected();
+    fn unselect(&mut self) {
+        self.state.select(None);
+    }
+}
+
+impl App {
+    fn new() -> App {
+        let todo_file = get_todo_file();
+        let todos = std::fs::read_to_string(todo_file).unwrap();
+        let now = chrono::Local::now().date_naive();
+        let todos: Vec<Task> = todos.split('\n').map(|x| Task::parse(&x, now)).collect();
+        App {
+            table_state: TableState::default(),
+            project_state: StatefulList::with_items(vec![]),
+            items: todos,
+            adding_item: false,
+            input: Input::default(),
+        }
+    }
+    pub fn next(&mut self) {
+        let i = match self.table_state.selected() {
+            Some(i) => {
+                if i >= self.items.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    pub fn previous(&mut self) {
+        let i = match self.table_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.items.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    pub fn get_selected_item(&mut self) -> Option<&mut Task> {
+        let index = self.table_state.selected();
         match index {
             Some(index) => Some(self.items.get_mut(index).unwrap()),
             None => None,
         }
     }
+}
+
+fn get_todo_file() -> std::path::PathBuf {
+    let todo_file = directories::ProjectDirs::from("", "", "todo-list").unwrap();
+    let todo_file = todo_file.config_dir().join("todo.txt");
+    todo_file
 }
 
 struct Item {
@@ -120,8 +178,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             if app.adding_item {
                 match key.code {
                     KeyCode::Enter => {
-                        let mut task = todo_txt::task::Task::default();
-                        task.subject = app.input.to_string();
+                        let now = chrono::Local::now().date_naive();
+                        let task = Task::parse(&app.input.to_string(), now);
                         app.items.push(task);
                         app.input.reset();
                         app.adding_item = false;
@@ -136,12 +194,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             } else if key.kind == KeyEventKind::Press {
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        return Ok(())
+                    }
                     KeyCode::Char('a') => app.adding_item = true,
-                    KeyCode::Char('c') => app.get_selected_item().unwrap().complete(),
+                    KeyCode::Char('c') => {
+                        app.get_selected_item().unwrap().complete(
+                            chrono::Local::now().date_naive(),
+                            todo_lib::todotxt::CompletionMode::JustMark,
+                        );
+                    }
                     KeyCode::Down | KeyCode::Char('j') => app.next(),
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
                     _ => {}
                 }
+                let new_todo: Vec<String> = app.items.iter().map(|x| x.to_string()).collect();
+                let new_todo = new_todo.join("\n");
+                let todo_file = get_todo_file();
+                std::fs::write(todo_file, new_todo).unwrap();
             }
         }
     }
@@ -185,15 +255,45 @@ fn ui(f: &mut Frame, app: &mut App) {
         )
     } else {
         let rects = Layout::default()
-            .constraints([Constraint::Percentage(100)])
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
             .split(f.size());
 
-        let selected_style = Style::default().add_modifier(Modifier::REVERSED);
-        let normal_style = Style::default().bg(Color::Blue);
+        let items: Vec<ListItem> = app
+            .items
+            .iter()
+            .flat_map(|i| {
+                i.projects.clone()
+                //
+            })
+            // .cloned()
+            .map(|x| ListItem::new(x).style(Style::default()))
+            .collect();
+
+        // Create a List from all list items and highlight the currently selected one
+        let items = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title("Projects"))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(">> ");
+
+        // We can now render the item list
+        f.render_stateful_widget(items, rects[0], &mut app.project_state.state);
+
+        let selected_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let normal_style = Style::default();
         let header_cells = ["Status", "Task", "Due"]
             .iter()
-            .map(|h| Cell::from(*h).style(Style::default().fg(Color::Red)));
-        let header = Row::new(header_cells).style(normal_style).height(1);
+            .map(|h| Cell::from(*h).style(Style::default().fg(Color::LightBlue)));
+        let header = Row::new(header_cells)
+            .style(normal_style)
+            .bottom_margin(1)
+            .height(1);
         // .bottom_margin(1);
         let rows = app.items.iter().map(|item| {
             let height = item.subject.chars().filter(|c| *c == '\n').count() + 1;
@@ -212,9 +312,9 @@ fn ui(f: &mut Frame, app: &mut App) {
             ],
         )
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title("Table"))
+        .block(Block::default().borders(Borders::ALL).title("TODOs"))
         .highlight_style(selected_style)
         .highlight_symbol(">> ");
-        f.render_stateful_widget(t, rects[0], &mut app.state);
+        f.render_stateful_widget(t, rects[1], &mut app.table_state);
     }
 }
