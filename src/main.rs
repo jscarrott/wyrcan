@@ -176,12 +176,16 @@ impl App {
     }
     pub fn get_selected_item(&mut self) -> Option<&mut Task> {
         let index = self.table_state.selected();
+        let mut todos = self.get_todo_list();
         match index {
-            Some(index) => Some(self.items.get_mut(index).unwrap()),
+            Some(index) => {
+                let t = todos.remove(index);
+                Some(t)
+            }
             None => None,
         }
     }
-    pub fn get_selected_project(&mut self) -> Option<String> {
+    pub fn get_selected_project(&self) -> Option<String> {
         let index = self.project_state.state.selected();
         // println!("{:?}", index);
         match index {
@@ -189,7 +193,7 @@ impl App {
             None => None,
         }
     }
-    fn get_projects(&mut self) -> Vec<String> {
+    fn get_projects(&self) -> Vec<String> {
         let items: Vec<String> = self
             .items
             .iter()
@@ -201,6 +205,35 @@ impl App {
             // .map(|x| ListItem::new(x).style(Style::default()))
             .collect();
         items
+    }
+
+    pub fn get_todo_list(&mut self) -> Vec<&mut Task> {
+        let mut filter_conf = todo_lib::tfilter::Conf::default();
+        let project_filter = self.get_selected_project();
+        let todos: Vec<&mut Task>;
+        if let Some(project) = project_filter {
+            let tag_filter = todo_lib::tfilter::TagFilter {
+                projects: vec![project.clone()],
+                contexts: vec![],
+                tags: vec![],
+                hashtags: vec![],
+            };
+            filter_conf.include = tag_filter;
+            filter_conf.all = todo_lib::tfilter::TodoStatus::All;
+            // println!("{:?}", project);
+            let ids = todo_lib::tfilter::filter(&self.items, &filter_conf);
+            // println!("{:?}", ids);
+
+            todos = self
+                .items
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(id, x)| if ids.contains(&id) { Some(x) } else { None })
+                .collect();
+        } else {
+            todos = self.items.iter_mut().collect();
+        };
+        todos
     }
 }
 
@@ -373,36 +406,11 @@ fn ui(f: &mut Frame, app: &mut App) {
             .bottom_margin(1)
             .height(1);
         // .bottom_margin(1);
-        let project_filter = app.get_selected_project();
-        // println!("{:?}", project_filter);
-        let mut filter_conf = todo_lib::tfilter::Conf::default();
-        let todos: Vec<&Task>;
-        if let Some(project) = project_filter {
-            let tag_filter = todo_lib::tfilter::TagFilter {
-                projects: vec![project.clone()],
-                contexts: vec![],
-                tags: vec![],
-                hashtags: vec![],
-            };
-            filter_conf.include = tag_filter;
-            filter_conf.all = todo_lib::tfilter::TodoStatus::All;
-            // println!("{:?}", project);
-            let ids = todo_lib::tfilter::filter(&app.items, &filter_conf);
-            // println!("{:?}", ids);
-
-            todos = app
-                .items
-                .iter()
-                .enumerate()
-                .filter_map(|(id, x)| if ids.contains(&id) { Some(x) } else { None })
-                .collect();
-        } else {
-            todos = app.items.iter().collect();
-        };
+        let todos = app.get_todo_list();
         let rows = todos.iter().map(|item| {
             let height = item.subject.chars().filter(|c| *c == '\n').count() + 1;
             let mut cells = vec![
-                Cell::from(Text::from(item.finished.to_string())),
+                Cell::from(Line::from(format_status(item.finished)).alignment(Alignment::Center)),
                 Cell::from(Text::from(item.subject.to_string())),
             ];
             if let Some(date) = item.due_date {
@@ -444,5 +452,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         };
         f.render_stateful_widget(items, rects[0], &mut app.project_state.state);
         f.render_stateful_widget(t, rects[1], &mut app.table_state);
+    }
+}
+
+fn format_status(input: bool) -> String {
+    match input {
+        true => String::from("✓"),
+        false => String::from("●"),
     }
 }
