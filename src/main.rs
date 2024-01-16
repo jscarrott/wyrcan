@@ -13,12 +13,21 @@ use todo_lib::todotxt::Task;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
+#[derive(Debug)]
+enum FocussedTab {
+    Projects,
+    TODOs,
+}
+
+impl FocussedTab {}
+
 struct App {
     project_state: StatefulList<String>,
     table_state: TableState,
     items: Vec<Task>,
     adding_item: bool,
     input: Input,
+    focus: FocussedTab,
 }
 
 struct StatefulList<T> {
@@ -79,10 +88,37 @@ impl App {
             items: todos,
             adding_item: false,
             input: Input::default(),
+            focus: FocussedTab::Projects,
         }
     }
     pub fn next(&mut self) {
-        let i = match self.table_state.selected() {
+        match self.focus {
+            FocussedTab::Projects => {
+                let i = self.next_project();
+                // println!("{}", i);
+                self.project_state.state.select(Some(i));
+            }
+            FocussedTab::TODOs => {
+                let i = self.next_todo();
+                self.table_state.select(Some(i));
+            }
+        }
+    }
+    pub fn previous(&mut self) {
+        match self.focus {
+            FocussedTab::Projects => {
+                self.previous_project();
+                // self.project_state.state.select(Some(i));
+            }
+            FocussedTab::TODOs => {
+                self.previous_todo();
+                // self.table_state.select(Some(i));
+            }
+        }
+    }
+
+    fn next_todo(&mut self) -> usize {
+        match self.table_state.selected() {
             Some(i) => {
                 if i >= self.items.len() - 1 {
                     0
@@ -91,11 +127,21 @@ impl App {
                 }
             }
             None => 0,
-        };
-        self.table_state.select(Some(i));
+        }
     }
-
-    pub fn previous(&mut self) {
+    fn next_project(&mut self) -> usize {
+        match self.project_state.state.selected() {
+            Some(i) => {
+                if i >= self.items.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        }
+    }
+    pub fn previous_todo(&mut self) {
         let i = match self.table_state.selected() {
             Some(i) => {
                 if i == 0 {
@@ -108,13 +154,53 @@ impl App {
         };
         self.table_state.select(Some(i));
     }
+    pub fn previous_project(&mut self) {
+        let i = match self.project_state.state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.items.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.project_state.state.select(Some(i));
+    }
 
+    fn next_pane(&mut self) {
+        self.focus = match self.focus {
+            FocussedTab::Projects => FocussedTab::TODOs,
+            FocussedTab::TODOs => FocussedTab::Projects,
+        }
+    }
     pub fn get_selected_item(&mut self) -> Option<&mut Task> {
         let index = self.table_state.selected();
         match index {
             Some(index) => Some(self.items.get_mut(index).unwrap()),
             None => None,
         }
+    }
+    pub fn get_selected_project(&mut self) -> Option<String> {
+        let index = self.project_state.state.selected();
+        // println!("{:?}", index);
+        match index {
+            Some(index) => self.get_projects().get_mut(index).cloned(),
+            None => None,
+        }
+    }
+    fn get_projects(&mut self) -> Vec<String> {
+        let items: Vec<String> = self
+            .items
+            .iter()
+            .flat_map(|i| {
+                i.projects.clone()
+                //
+            })
+            // .cloned()
+            // .map(|x| ListItem::new(x).style(Style::default()))
+            .collect();
+        items
     }
 }
 
@@ -194,6 +280,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             } else if key.kind == KeyEventKind::Press {
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Tab => app.next_pane(),
                     KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                         return Ok(())
                     }
@@ -259,19 +346,11 @@ fn ui(f: &mut Frame, app: &mut App) {
             .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
             .split(f.size());
 
-        let items: Vec<ListItem> = app
-            .items
-            .iter()
-            .flat_map(|i| {
-                i.projects.clone()
-                //
-            })
-            // .cloned()
-            .map(|x| ListItem::new(x).style(Style::default()))
-            .collect();
+        let items = app.get_projects();
+        let items: Vec<ListItem<'_>> = items.iter().map(|x| ListItem::new(x.clone())).collect();
 
         // Create a List from all list items and highlight the currently selected one
-        let items = List::new(items)
+        let mut items = List::new(items)
             .block(Block::default().borders(Borders::ALL).title("Projects"))
             .highlight_style(
                 Style::default()
@@ -281,7 +360,6 @@ fn ui(f: &mut Frame, app: &mut App) {
             .highlight_symbol(">> ");
 
         // We can now render the item list
-        f.render_stateful_widget(items, rects[0], &mut app.project_state.state);
 
         let selected_style = Style::default()
             .fg(Color::Yellow)
@@ -295,15 +373,46 @@ fn ui(f: &mut Frame, app: &mut App) {
             .bottom_margin(1)
             .height(1);
         // .bottom_margin(1);
-        let rows = app.items.iter().map(|item| {
+        let project_filter = app.get_selected_project();
+        // println!("{:?}", project_filter);
+        let mut filter_conf = todo_lib::tfilter::Conf::default();
+        let todos: Vec<&Task>;
+        if let Some(project) = project_filter {
+            let tag_filter = todo_lib::tfilter::TagFilter {
+                projects: vec![project.clone()],
+                contexts: vec![],
+                tags: vec![],
+                hashtags: vec![],
+            };
+            filter_conf.include = tag_filter;
+            filter_conf.all = todo_lib::tfilter::TodoStatus::All;
+            // println!("{:?}", project);
+            let ids = todo_lib::tfilter::filter(&app.items, &filter_conf);
+            // println!("{:?}", ids);
+
+            todos = app
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(id, x)| if ids.contains(&id) { Some(x) } else { None })
+                .collect();
+        } else {
+            todos = app.items.iter().collect();
+        };
+        let rows = todos.iter().map(|item| {
             let height = item.subject.chars().filter(|c| *c == '\n').count() + 1;
-            let cells = vec![
+            let mut cells = vec![
                 Cell::from(Text::from(item.finished.to_string())),
                 Cell::from(Text::from(item.subject.to_string())),
             ];
+            if let Some(date) = item.due_date {
+                cells.push(Cell::from(Text::from(date.to_string())));
+            } else {
+                cells.push(Cell::from(Text::from("N/A")));
+            }
             Row::new(cells).height(height as u16)
         });
-        let t = Table::new(
+        let mut t = Table::new(
             rows,
             [
                 Constraint::Max(10),
@@ -315,6 +424,25 @@ fn ui(f: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL).title("TODOs"))
         .highlight_style(selected_style)
         .highlight_symbol(">> ");
+        match app.focus {
+            FocussedTab::Projects => {
+                items = items.block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().cyan())
+                        .title("Projects"),
+                );
+            }
+            FocussedTab::TODOs => {
+                t = t.block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().cyan())
+                        .title("TODOs"),
+                );
+            }
+        };
+        f.render_stateful_widget(items, rects[0], &mut app.project_state.state);
         f.render_stateful_widget(t, rects[1], &mut app.table_state);
     }
 }
