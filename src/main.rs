@@ -149,6 +149,13 @@ impl App {
             None => None,
         }
     }
+    pub fn remove_selected_item(&mut self) {
+        let selected = self.get_selected_item();
+        if let Some(item) = selected {
+            let selected = item.clone();
+            self.items.retain(|x| *x != selected)
+        }
+    }
     pub fn get_selected_project(&self) -> Option<String> {
         let index = self.project_state.state.selected();
         // println!("{:?}", index);
@@ -243,7 +250,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 match key.code {
                     KeyCode::Enter => {
                         let now = chrono::Local::now().date_naive();
-                        let task = Task::parse(&app.input.to_string(), now);
+                        let mut task = Task::parse(&app.input.to_string(), now);
+                        if task.create_date.is_none() {
+                            task.create_date = Some(now);
+                        }
                         app.items.push(task);
                         app.input.reset();
                         app.adding_item = false;
@@ -262,6 +272,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                         return Ok(())
                     }
+                    KeyCode::Char('D') => app.remove_selected_item(),
                     KeyCode::Char('a') => app.adding_item = true,
                     KeyCode::Char('c') => {
                         app.get_selected_item().unwrap().complete(
