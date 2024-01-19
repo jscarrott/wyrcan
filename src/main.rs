@@ -1,5 +1,4 @@
-use std::fmt::Display;
-use std::{error::Error, io};
+use std::io;
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -7,8 +6,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{prelude::*, widgets::*};
-use std::str::FromStr;
-use strum_macros::{Display, EnumString};
+
 use todo_lib::todotxt::Task;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
@@ -22,7 +20,7 @@ enum FocussedTab {
 impl FocussedTab {}
 
 struct App {
-    project_state: StatefulList<String>,
+    project_state: StatefulList,
     table_state: TableState,
     items: Vec<Task>,
     adding_item: bool,
@@ -30,49 +28,15 @@ struct App {
     focus: FocussedTab,
 }
 
-struct StatefulList<T> {
+struct StatefulList {
     state: ListState,
-    items: Vec<T>,
 }
 
-impl<T> StatefulList<T> {
-    fn with_items(items: Vec<T>) -> StatefulList<T> {
+impl StatefulList {
+    fn new() -> StatefulList {
         StatefulList {
             state: ListState::default(),
-            items,
         }
-    }
-
-    fn next(&mut self) {
-        let i = match self.state.selected() {
-            Some(i) => {
-                if i >= self.items.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
-            }
-            None => 0,
-        };
-        self.state.select(Some(i));
-    }
-
-    fn previous(&mut self) {
-        let i = match self.state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.items.len() - 1
-                } else {
-                    i - 1
-                }
-            }
-            None => 0,
-        };
-        self.state.select(Some(i));
-    }
-
-    fn unselect(&mut self) {
-        self.state.select(None);
     }
 }
 
@@ -81,10 +45,10 @@ impl App {
         let todo_file = get_todo_file();
         let todos = std::fs::read_to_string(todo_file).unwrap();
         let now = chrono::Local::now().date_naive();
-        let todos: Vec<Task> = todos.split('\n').map(|x| Task::parse(&x, now)).collect();
+        let todos: Vec<Task> = todos.split('\n').map(|x| Task::parse(x, now)).collect();
         App {
             table_state: TableState::default(),
-            project_state: StatefulList::with_items(vec![]),
+            project_state: StatefulList::new(),
             items: todos,
             adding_item: false,
             input: Input::default(),
@@ -241,25 +205,6 @@ fn get_todo_file() -> std::path::PathBuf {
     let todo_file = directories::ProjectDirs::from("", "", "todo-list").unwrap();
     let todo_file = todo_file.config_dir().join("todo.txt");
     todo_file
-}
-
-struct Item {
-    status: Status,
-    description: String,
-    due: Option<std::time::SystemTime>,
-}
-
-impl Display for Item {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
-    }
-}
-
-#[derive(Debug, Display)]
-enum Status {
-    Done(std::time::SystemTime),
-    InProgress,
-    ToDo,
 }
 
 fn main() -> eyre::Result<()> {
