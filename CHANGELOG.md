@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/jscarrott/wyrcan/compare/v0.1.4...v0.1.5) - 2024-01-19
+
+### Fixed
+- *(CI)* Fixed auto release
+- Updated CI
+- *(CI)* Add editied to manually trigger release
+
 ## [0.1.4](https://github.com/jscarrott/wyrcan/compare/v0.1.3...v0.1.4) - 2024-01-19
 
 ### Added
