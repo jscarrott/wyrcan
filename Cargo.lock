@@ -753,25 +753,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "todo-list"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "crossterm",
- "directories",
- "eyre",
- "figment",
- "ratatui",
- "serde",
- "serde_json",
- "strum",
- "strum_macros",
- "todo_lib",
- "tui-input",
-]
-
-[[package]]
 name = "todo_lib"
 version = "7.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1095,6 +1076,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7cf47b659b318dccbd69cc4797a39ae128f533dce7902a1096044d1967b9c16"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "wyrcan-todo"
+version = "0.1.1"
+dependencies = [
+ "chrono",
+ "clap",
+ "crossterm",
+ "directories",
+ "eyre",
+ "figment",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "strum",
+ "strum_macros",
+ "todo_lib",
+ "tui-input",
 ]
 
 [[package]]
