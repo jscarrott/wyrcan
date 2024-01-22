@@ -1,11 +1,17 @@
-use std::io;
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{prelude::*, widgets::*};
+use ratatui::{
+    prelude::*,
+    widgets::{block::Title, calendar::Monthly, *},
+};
 
 use todo_lib::todotxt::Task;
 use tui_input::backend::crossterm::EventHandler;
@@ -26,6 +32,7 @@ struct App {
     adding_item: bool,
     input: Input,
     focus: FocussedTab,
+    sorting: bool,
 }
 
 struct StatefulList {
@@ -53,6 +60,7 @@ impl App {
             adding_item: false,
             input: Input::default(),
             focus: FocussedTab::Projects,
+            sorting: true,
         }
     }
     pub fn next(&mut self) {
@@ -165,7 +173,7 @@ impl App {
         }
     }
     fn get_projects(&self) -> Vec<String> {
-        let items: Vec<String> = self
+        let items: HashSet<String> = self
             .items
             .iter()
             .flat_map(|i| {
@@ -175,35 +183,50 @@ impl App {
             // .cloned()
             // .map(|x| ListItem::new(x).style(Style::default()))
             .collect();
+        let mut items: Vec<String> = items.into_iter().collect();
+        items.sort();
         items
     }
 
     pub fn get_todo_list(&mut self) -> Vec<&mut Task> {
         let mut filter_conf = todo_lib::tfilter::Conf::default();
         let project_filter = self.get_selected_project();
-        let todos: Vec<&mut Task>;
-        if let Some(project) = project_filter {
-            let tag_filter = todo_lib::tfilter::TagFilter {
-                projects: vec![project.clone()],
-                contexts: vec![],
-                tags: vec![],
-                hashtags: vec![],
-            };
-            filter_conf.include = tag_filter;
-            filter_conf.all = todo_lib::tfilter::TodoStatus::All;
-            // println!("{:?}", project);
-            let ids = todo_lib::tfilter::filter(&self.items, &filter_conf);
-            // println!("{:?}", ids);
-
-            todos = self
-                .items
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(id, x)| if ids.contains(&id) { Some(x) } else { None })
-                .collect();
-        } else {
-            todos = self.items.iter_mut().collect();
+        let mut todos: Vec<&mut Task>;
+        let project_filter = match project_filter {
+            Some(project) => vec![project.clone()],
+            None => vec![],
         };
+        let tag_filter = todo_lib::tfilter::TagFilter {
+            projects: project_filter,
+            contexts: vec![],
+            tags: vec![],
+            hashtags: vec![],
+        };
+        filter_conf.include = tag_filter;
+        filter_conf.all = todo_lib::tfilter::TodoStatus::All;
+        // println!("{:?}", project);
+        let mut ids = todo_lib::tfilter::filter(&self.items, &filter_conf);
+        // println!("{:?}", ids);
+
+        // } else {
+        //     todos = self.items.iter_mut().collect();
+        // };
+        if self.sorting {
+            let sort_conf = todo_lib::tsort::Conf {
+                fields: Some(String::from("done")),
+                rev: false,
+            };
+            todo_lib::tsort::sort(&mut ids, &self.items, &sort_conf);
+        }
+        let mut lookup_vec: HashMap<usize, &mut Task> = self.items.iter_mut().enumerate().collect();
+        todos = ids.iter().filter_map(|id| lookup_vec.remove(id)).collect();
+        // todos = self
+        //     .items
+        //     .iter_mut()
+        //     .enumerate()
+        //     .filter_map(|(id, x)| if ids.contains(&id) { Some(x) } else { None })
+        //     .collect();
+
         todos
     }
 }
@@ -274,14 +297,25 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     }
                     KeyCode::Char('D') => app.remove_selected_item(),
                     KeyCode::Char('a') => app.adding_item = true,
+                    KeyCode::Char('s') => app.sorting = !app.sorting,
                     KeyCode::Char('c') => {
-                        app.get_selected_item().unwrap().complete(
-                            chrono::Local::now().date_naive(),
-                            todo_lib::todotxt::CompletionMode::JustMark,
-                        );
+                        let sel_task = app.get_selected_item().unwrap();
+                        match sel_task.finished {
+                            true => {
+                                sel_task.uncomplete(todo_lib::todotxt::CompletionMode::JustMark)
+                            }
+                            false => sel_task.complete(
+                                chrono::Local::now().date_naive(),
+                                todo_lib::todotxt::CompletionMode::JustMark,
+                            ),
+                        };
                     }
                     KeyCode::Down | KeyCode::Char('j') => app.next(),
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                    KeyCode::Esc => match app.focus {
+                        FocussedTab::Projects => app.project_state.state.select(None),
+                        FocussedTab::TODOs => app.table_state.select(None),
+                    },
                     _ => {}
                 }
                 let new_todo: Vec<String> = app.items.iter().map(|x| x.to_string()).collect();
@@ -321,6 +355,22 @@ fn ui(f: &mut Frame, app: &mut App) {
         let input = Paragraph::new(app.input.value())
             .scroll((0, scroll as u16))
             .block(Block::default().borders(Borders::ALL).title("Input"));
+        // let header_style = Style::default()
+        //     .add_modifier(Modifier::BOLD)
+        //     .fg(Color::Green);
+
+        // let default_style = Style::default()
+        //     .add_modifier(Modifier::BOLD)
+        //     .bg(Color::Rgb(50, 50, 50));
+
+        // Monthly::new(
+        //     Date::from_calendar_date(2024, time::Month::January, 1).unwrap(),
+        //     es,
+        // )
+        // .show_surrounding(Style::default().add_modifier(Modifier::DIM))
+        // .show_weekdays_header(header_style)
+        // .default_style(default_style)
+        // .show_month_header(Style::default());
         f.render_widget(input, chunks[1]);
         // Make the cursor visible and ask tui-rs to put it at the specified coordinates after rendering
         f.set_cursor(
@@ -346,7 +396,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol(">> ");
+            .highlight_symbol(">>");
 
         // We can now render the item list
 
@@ -359,14 +409,14 @@ fn ui(f: &mut Frame, app: &mut App) {
             .map(|h| Cell::from(*h).style(Style::default().fg(Color::LightBlue)));
         let header = Row::new(header_cells)
             .style(normal_style)
-            .bottom_margin(1)
+            // .bottom_margin(1)
             .height(1);
         // .bottom_margin(1);
         let todos = app.get_todo_list();
         let rows = todos.iter().map(|item| {
             let height = item.subject.chars().filter(|c| *c == '\n').count() + 1;
             let mut cells = vec![
-                Cell::from(Line::from(format_status(item.finished)).alignment(Alignment::Center)),
+                Cell::from(format_status(item.finished).alignment(Alignment::Center)),
                 Cell::from(Text::from(item.subject.to_string())),
             ];
             if let Some(date) = item.due_date {
@@ -387,22 +437,22 @@ fn ui(f: &mut Frame, app: &mut App) {
         .header(header)
         .block(Block::default().borders(Borders::ALL).title("TODOs"))
         .highlight_style(selected_style)
-        .highlight_symbol(">> ");
+        .highlight_symbol(">>");
         match app.focus {
             FocussedTab::Projects => {
                 items = items.block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::new().cyan())
-                        .title("Projects"),
+                        .border_style(Style::new().blue())
+                        .title(Title::from("Projects".not_dim().white().on_blue())),
                 );
             }
             FocussedTab::TODOs => {
                 t = t.block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::new().cyan())
-                        .title("TODOs"),
+                        .border_style(Style::new().blue())
+                        .title("TODOs".not_dim().white().on_blue()),
                 );
             }
         };
@@ -411,9 +461,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn format_status(input: bool) -> String {
+fn format_status(input: bool) -> Line<'static> {
     match input {
-        true => String::from("✓"),
-        false => String::from("●"),
+        true => Line::from("✓".green()),
+        false => Line::from("●".yellow()),
     }
 }
