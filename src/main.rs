@@ -21,6 +21,7 @@ use tui_input::Input;
 enum FocussedTab {
     Projects,
     TODOs,
+    Contexts,
 }
 
 impl FocussedTab {}
@@ -28,6 +29,7 @@ impl FocussedTab {}
 struct App {
     project_state: StatefulList,
     table_state: TableState,
+    context_state: ListState,
     items: Vec<Task>,
     adding_item: bool,
     input: Input,
@@ -56,6 +58,7 @@ impl App {
         App {
             table_state: TableState::default(),
             project_state: StatefulList::new(),
+            context_state: ListState::default(),
             items: todos,
             adding_item: false,
             input: Input::default(),
@@ -67,12 +70,15 @@ impl App {
         match self.focus {
             FocussedTab::Projects => {
                 let i = self.next_project();
-                // println!("{}", i);
                 self.project_state.state.select(Some(i));
             }
             FocussedTab::TODOs => {
                 let i = self.next_todo();
                 self.table_state.select(Some(i));
+            }
+            FocussedTab::Contexts => {
+                let i = self.next_context();
+                self.context_state.select(Some(i));
             }
         }
     }
@@ -86,6 +92,7 @@ impl App {
                 self.previous_todo();
                 // self.table_state.select(Some(i));
             }
+            FocussedTab::Contexts => self.previous_context(),
         }
     }
 
@@ -103,6 +110,18 @@ impl App {
     }
     fn next_project(&mut self) -> usize {
         match self.project_state.state.selected() {
+            Some(i) => {
+                if i >= self.items.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        }
+    }
+    fn next_context(&mut self) -> usize {
+        match self.context_state.selected() {
             Some(i) => {
                 if i >= self.items.len() - 1 {
                     0
@@ -139,11 +158,32 @@ impl App {
         };
         self.project_state.state.select(Some(i));
     }
+    pub fn previous_context(&mut self) {
+        let i = match self.context_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.items.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.context_state.select(Some(i));
+    }
 
     fn next_pane(&mut self) {
         self.focus = match self.focus {
-            FocussedTab::Projects => FocussedTab::TODOs,
+            FocussedTab::Projects => FocussedTab::Contexts,
             FocussedTab::TODOs => FocussedTab::Projects,
+            FocussedTab::Contexts => FocussedTab::TODOs,
+        }
+    }
+    fn prev_pane(&mut self) {
+        self.focus = match self.focus {
+            FocussedTab::Projects => FocussedTab::TODOs,
+            FocussedTab::TODOs => FocussedTab::Contexts,
+            FocussedTab::Contexts => FocussedTab::Projects,
         }
     }
     pub fn get_selected_item(&mut self) -> Option<&mut Task> {
@@ -178,6 +218,21 @@ impl App {
             .iter()
             .flat_map(|i| {
                 i.projects.clone()
+                //
+            })
+            // .cloned()
+            // .map(|x| ListItem::new(x).style(Style::default()))
+            .collect();
+        let mut items: Vec<String> = items.into_iter().collect();
+        items.sort();
+        items
+    }
+    fn get_contexts(&self) -> Vec<String> {
+        let items: HashSet<String> = self
+            .items
+            .iter()
+            .flat_map(|i| {
+                i.contexts.clone()
                 //
             })
             // .cloned()
@@ -292,11 +347,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Tab => app.next_pane(),
+                    KeyCode::BackTab => app.prev_pane(),
                     KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                         return Ok(())
                     }
                     KeyCode::Char('D') => app.remove_selected_item(),
                     KeyCode::Char('a') => app.adding_item = true,
+                    KeyCode::Char('e') => {
+                        app.input = app.get_selected_item().unwrap().to_string().into();
+                        app.remove_selected_item();
+                        app.adding_item = true
+                    }
                     KeyCode::Char('s') => app.sorting = !app.sorting,
                     KeyCode::Char('c') => {
                         let sel_task = app.get_selected_item().unwrap();
@@ -315,6 +376,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     KeyCode::Esc => match app.focus {
                         FocussedTab::Projects => app.project_state.state.select(None),
                         FocussedTab::TODOs => app.table_state.select(None),
+                        FocussedTab::Contexts => app.context_state.select(None),
                     },
                     _ => {}
                 }
@@ -380,17 +442,33 @@ fn ui(f: &mut Frame, app: &mut App) {
             chunks[1].y + 1,
         )
     } else {
-        let rects = Layout::default()
+        let top_level = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
             .split(f.size());
+        let filter_pane = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(top_level[0]);
 
-        let items = app.get_projects();
-        let items: Vec<ListItem<'_>> = items.iter().map(|x| ListItem::new(x.clone())).collect();
+        let contexts = app.get_contexts();
+        let contexts: Vec<ListItem<'_>> =
+            contexts.iter().map(|x| ListItem::new(x.clone())).collect();
+        let projects = app.get_projects();
+        let projects: Vec<ListItem<'_>> =
+            projects.iter().map(|x| ListItem::new(x.clone())).collect();
 
         // Create a List from all list items and highlight the currently selected one
-        let mut items = List::new(items)
+        let mut projects = List::new(projects)
             .block(Block::default().borders(Borders::ALL).title("Projects"))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(">>");
+        let mut contexts = List::new(contexts)
+            .block(Block::default().borders(Borders::ALL).title("Contexts"))
             .highlight_style(
                 Style::default()
                     .fg(Color::Yellow)
@@ -440,7 +518,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .highlight_symbol(">>");
         match app.focus {
             FocussedTab::Projects => {
-                items = items.block(
+                projects = projects.block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::new().blue())
@@ -455,9 +533,18 @@ fn ui(f: &mut Frame, app: &mut App) {
                         .title("TODOs".not_dim().white().on_blue()),
                 );
             }
+            FocussedTab::Contexts => {
+                contexts = contexts.block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().blue())
+                        .title(Title::from("Contexts".not_dim().white().on_blue())),
+                );
+            }
         };
-        f.render_stateful_widget(items, rects[0], &mut app.project_state.state);
-        f.render_stateful_widget(t, rects[1], &mut app.table_state);
+        f.render_stateful_widget(projects, filter_pane[0], &mut app.project_state.state);
+        f.render_stateful_widget(contexts, filter_pane[1], &mut app.context_state);
+        f.render_stateful_widget(t, top_level[1], &mut app.table_state);
     }
 }
 
