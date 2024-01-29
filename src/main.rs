@@ -62,7 +62,7 @@ impl App {
             items: todos,
             adding_item: false,
             input: Input::default(),
-            focus: FocussedTab::Projects,
+            focus: FocussedTab::TODOs,
             sorting: true,
         }
     }
@@ -123,7 +123,7 @@ impl App {
     fn next_context(&mut self) -> usize {
         match self.context_state.selected() {
             Some(i) => {
-                if i >= self.items.len() - 1 {
+                if i >= self.get_contexts().len() - 1 {
                     0
                 } else {
                     i + 1
@@ -136,7 +136,7 @@ impl App {
         let i = match self.table_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.items.len() - 1
+                    self.get_projects().len() - 1
                 } else {
                     i - 1
                 }
@@ -149,7 +149,7 @@ impl App {
         let i = match self.project_state.state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.items.len() - 1
+                    self.get_projects().len() - 1
                 } else {
                     i - 1
                 }
@@ -162,7 +162,7 @@ impl App {
         let i = match self.context_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.items.len() - 1
+                    self.get_contexts().len() - 1
                 } else {
                     i - 1
                 }
@@ -212,6 +212,13 @@ impl App {
             None => None,
         }
     }
+    pub fn get_selected_context(&self) -> Option<String> {
+        let index = self.context_state.selected();
+        match index {
+            Some(index) => self.get_contexts().get_mut(index).cloned(),
+            None => None,
+        }
+    }
     fn get_projects(&self) -> Vec<String> {
         let items: HashSet<String> = self
             .items
@@ -246,14 +253,19 @@ impl App {
     pub fn get_todo_list(&mut self) -> Vec<&mut Task> {
         let mut filter_conf = todo_lib::tfilter::Conf::default();
         let project_filter = self.get_selected_project();
+        let context_filter = self.get_selected_context();
         let mut todos: Vec<&mut Task>;
         let project_filter = match project_filter {
             Some(project) => vec![project.clone()],
             None => vec![],
         };
+        let context_filter = match context_filter {
+            Some(context) => vec![context.clone()],
+            None => vec![],
+        };
         let tag_filter = todo_lib::tfilter::TagFilter {
             projects: project_filter,
-            contexts: vec![],
+            contexts: context_filter,
             tags: vec![],
             hashtags: vec![],
         };
@@ -320,6 +332,7 @@ fn main() -> eyre::Result<()> {
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+    let mut last_list = String::from("");
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
@@ -373,17 +386,21 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     }
                     KeyCode::Down | KeyCode::Char('j') => app.next(),
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                    KeyCode::Esc => match app.focus {
-                        FocussedTab::Projects => app.project_state.state.select(None),
-                        FocussedTab::TODOs => app.table_state.select(None),
-                        FocussedTab::Contexts => app.context_state.select(None),
-                    },
+                    KeyCode::Esc => {
+                        app.project_state.state.select(None);
+                        app.table_state.select(None);
+                        app.context_state.select(None);
+                        app.focus = FocussedTab::TODOs;
+                    }
                     _ => {}
                 }
                 let new_todo: Vec<String> = app.items.iter().map(|x| x.to_string()).collect();
                 let new_todo = new_todo.join("\n");
                 let todo_file = get_todo_file();
-                std::fs::write(todo_file, new_todo).unwrap();
+                if last_list != new_todo {
+                    std::fs::write(todo_file, &new_todo).unwrap();
+                    last_list = new_todo;
+                }
             }
         }
     }
