@@ -27,4 +27,7 @@ todo_lib = "7.0.1"
 time = { version = "0.3.11", optional = true, features = ["local-offset"] }
 tui-input = "0.8.0"
 oauth2 = "4.4.2"
-reqwest = { version = "0.11.23", features = ["json"] }
+reqwest = { version = "0.11.23", features = ["json", "blocking"] }
+url = "2.5.0"
+graph-rs-sdk = "2.0.0-beta.0"
+tokio = { version = "1.35.1", features = ["full"] }

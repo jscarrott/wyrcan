@@ -8,11 +8,13 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use graph_rs_sdk::*;
 use ratatui::{
     prelude::*,
     widgets::{block::Title, calendar::Monthly, *},
 };
 
+use serde::{Deserialize, Serialize};
 use todo_lib::todotxt::Task;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
@@ -50,11 +52,14 @@ impl StatefulList {
 }
 
 impl App {
-    fn new() -> App {
+    fn new(input_tasks: Option<Vec<Task>>) -> App {
         let todo_file = get_todo_file();
         let todos = std::fs::read_to_string(todo_file).unwrap();
         let now = chrono::Local::now().date_naive();
-        let todos: Vec<Task> = todos.split('\n').map(|x| Task::parse(x, now)).collect();
+        let mut todos: Vec<Task> = todos.split('\n').map(|x| Task::parse(x, now)).collect();
+        if let Some(mut extra_tasks) = input_tasks {
+            todos.append(&mut extra_tasks);
+        }
         App {
             table_state: TableState::default(),
             project_state: StatefulList::new(),
@@ -299,12 +304,179 @@ impl App {
 }
 
 fn get_todo_file() -> std::path::PathBuf {
-    let todo_file = directories::ProjectDirs::from("", "", "todo-list").unwrap();
+    let todo_file = directories::ProjectDirs::from("", "", "wyrcan").unwrap();
     let todo_file = todo_file.config_dir().join("todo.txt");
     todo_file
 }
+fn get_config_file() -> std::path::PathBuf {
+    let todo_file = directories::ProjectDirs::from("", "", "wyrcan").unwrap();
+    let todo_file = todo_file.config_dir().join("wyrcan.json");
+    todo_file
+}
+use oauth2::{basic::BasicClient, reqwest::async_http_client, RefreshToken, TokenResponse};
+// Alternatively, this can be `oauth2::curl::http_client` or a custom client.
+use oauth2::{
+    AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    RedirectUrl, Scope, TokenUrl,
+};
+use std::env;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use url::Url;
 
-fn main() -> eyre::Result<()> {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TodoList {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    displayName: Option<String>,
+    // ... Any other fields
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TodoLists {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<Vec<TodoList>>,
+    // ... Any other fields
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MicrosoftTasks {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<Vec<MicrosoftTask>>,
+    // ... Any other fields
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MicrosoftTask {
+    id: String,
+    title: String,
+    createdDateTime: String,
+    lastModifiedDateTime: String,
+    status: String,
+    // ... Any other fields
+}
+
+impl MicrosoftTask {
+    fn get_completed_mark(&self) -> String {
+        match self.status.as_ref() {
+            "completed" => "x ".to_owned(),
+            _ => "".to_owned(),
+        }
+    }
+}
+
+trait GetTodoTxt {
+    fn get_todo_txt(&self) -> todo_lib::todotxt::Task;
+}
+
+impl GetTodoTxt for MicrosoftTask {
+    fn get_todo_txt(&self) -> todo_lib::todotxt::Task {
+        Task {
+            subject: self.title.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+impl GetTodoTxt for Task {
+    fn get_todo_txt(&self) -> todo_lib::todotxt::Task {
+        self.clone()
+    }
+}
+
+async fn get_microsoft_tasks() -> eyre::Result<Vec<Task>> {
+    let graph_client_id = ClientId::new(String::from("d4b5c04f-2a75-421c-84f0-dd898502c93e"));
+    let auth_url =
+        AuthUrl::new("https://login.microsoftonline.com/common/oauth2/v2.0/authorize".to_string())
+            .expect("Invalid authorization endpoint URL");
+    let token_url =
+        TokenUrl::new("https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string())
+            .expect("Invalid token endpoint URL");
+
+    // Set up the config for the Microsoft Graph OAuth2 process.
+    let client = BasicClient::new(graph_client_id, None, auth_url, Some(token_url))
+        // Microsoft Graph requires client_id and client_secret in URL rather than
+        // using Basic authentication.
+        .set_auth_type(AuthType::RequestBody)
+        // This example will be running its own server at localhost:3003.
+        // See below for the server implementation.
+        .set_redirect_uri(
+            RedirectUrl::new("http://localhost:3003/redirect".to_string())
+                .expect("Invalid redirect URL"),
+        );
+    let refresh_token: Result<String, std::io::Error> = std::fs::read_to_string(get_config_file());
+    let refresh_token = match refresh_token {
+        Ok(token) => serde_json::from_str(&token).unwrap(),
+        Err(_) => get_oauth_key(&client).await,
+    };
+    let auth_token = client
+        .exchange_refresh_token(&refresh_token)
+        .request_async(async_http_client)
+        .await
+        .unwrap();
+    let bearer_token = auth_token.access_token().secret();
+
+    let graph_client = Graph::new(bearer_token);
+    let resp = graph_client
+        .me()
+        .todo()
+        .lists()
+        .list_lists()
+        .send()
+        .await?
+        .json::<TodoLists>()
+        .await
+        .unwrap();
+    let wyrcan_list = resp
+        .value
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|x| x.displayName.as_ref().unwrap().as_str() == "Wyrcan")
+        .unwrap();
+
+    let id = wyrcan_list.id.as_ref().unwrap();
+    let list: MicrosoftTasks = graph_client
+        .me()
+        .todo()
+        .list(id)
+        .tasks()
+        .list_tasks()
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(list
+        .value
+        .unwrap()
+        .into_iter()
+        .map(|x| {
+            Task::parse(
+                &format!("{}{} id:{}", x.get_completed_mark(), x.title, x.id),
+                chrono::Local::now().date_naive(),
+            )
+        })
+        .collect())
+}
+
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+    // let mut client = reqwest::blocking::Client::new();
+    // let resp = client
+    //     .get("https://graph.microsoft.com/v1.0/me/todo/lists/AQMkADAwATYwMAItODQwOC0zYTdlLTAwAi0wMAoALgAAA6XTWk_Pnx1Es7FQsRaCZL4BAFc_HazdTXFFn0H3zltP3_8ABmsOTmIAAAA=\\/tasks")
+    //     .bearer_auth(bearer_token)
+    //     .send()
+    //     .unwrap()
+    //     .text()
+    //     .unwrap();
+
+    let tasks = get_microsoft_tasks().await?;
+
+    println!("{tasks:#?}");
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -312,7 +484,7 @@ fn main() -> eyre::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // create app and run it
-    let app = App::new();
+    let app = App::new(Some(tasks));
     let res = run_app(&mut terminal, app);
 
     // restore terminal
@@ -329,6 +501,128 @@ fn main() -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+async fn get_oauth_key(
+    client: &oauth2::Client<
+        oauth2::StandardErrorResponse<oauth2::basic::BasicErrorResponseType>,
+        oauth2::StandardTokenResponse<oauth2::EmptyExtraTokenFields, oauth2::basic::BasicTokenType>,
+        oauth2::basic::BasicTokenType,
+        oauth2::StandardTokenIntrospectionResponse<
+            oauth2::EmptyExtraTokenFields,
+            oauth2::basic::BasicTokenType,
+        >,
+        oauth2::StandardRevocableToken,
+        oauth2::StandardErrorResponse<oauth2::RevocationErrorResponseType>,
+    >,
+) -> RefreshToken {
+    // Microsoft Graph supports Proof Key for Code Exchange (PKCE - https://oauth.net/2/pkce/).
+    // Create a PKCE code verifier and SHA-256 encode it as a code challenge.
+    let (pkce_code_challenge, pkce_code_verifier) = PkceCodeChallenge::new_random_sha256();
+
+    // Generate the authorization URL to which we'll redirect the user.
+    let (authorize_url, csrf_state) = client
+        .authorize_url(CsrfToken::new_random)
+        // This example requests read access to OneDrive.
+        .add_scope(Scope::new(
+            "https://graph.microsoft.com/Files.Read".to_string(),
+        ))
+        .add_scope(Scope::new("offline_access".to_string()))
+        .set_pkce_challenge(pkce_code_challenge)
+        .url();
+
+    println!(
+        "Open this URL in your browser:\n{}\n",
+        authorize_url.to_string()
+    );
+
+    // A very naive implementation of the redirect server.
+    let listener = TcpListener::bind("127.0.0.1:3003").unwrap();
+    for stream in listener.incoming() {
+        if let Ok(mut stream) = stream {
+            let code;
+            let state;
+            {
+                let mut reader = BufReader::new(&stream);
+
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+
+                let redirect_url = request_line.split_whitespace().nth(1).unwrap();
+                let url = Url::parse(&("http://localhost".to_string() + redirect_url)).unwrap();
+
+                let code_pair = url
+                    .query_pairs()
+                    .find(|pair| {
+                        let &(ref key, _) = pair;
+                        key == "code"
+                    })
+                    .unwrap();
+
+                let (_, value) = code_pair;
+                code = AuthorizationCode::new(value.into_owned());
+
+                let state_pair = url
+                    .query_pairs()
+                    .find(|pair| {
+                        let &(ref key, _) = pair;
+                        key == "state"
+                    })
+                    .unwrap();
+
+                let (_, value) = state_pair;
+                state = CsrfToken::new(value.into_owned());
+            }
+
+            let message = "Go back to your terminal :)";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+                message.len(),
+                message
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+
+            println!("MS Graph returned the following code:\n{}\n", code.secret());
+            println!(
+                "MS Graph returned the following state:\n{} (expected `{}`)\n",
+                state.secret(),
+                csrf_state.secret()
+            );
+
+            // Exchange the code with a token.
+            let token = client
+                .exchange_code(code)
+                // Send the PKCE code verifier in the token request
+                .set_pkce_verifier(pkce_code_verifier)
+                .request_async(async_http_client)
+                .await;
+
+            println!("MS Graph returned the following token:\n{:?}\n", token);
+            let token = token.unwrap();
+            println!(
+                "Access token {:?}\n refresh token {:?}",
+                &token.access_token(),
+                token.refresh_token()
+            );
+
+            // The server will terminate itself after collecting the first code.
+            // let token = client
+            //     .exchange_refresh_token(&token.refresh_token().unwrap())
+            //     .request(http_client);
+
+            // let token = token.unwrap();
+            // println!(
+            //     "Access token {:?}\n refresh token {:?}",
+            //     &token.access_token(),
+            //     token.refresh_token()
+            // );
+            let serialized_refresh_token =
+                serde_json::to_string_pretty(&token.refresh_token()).unwrap();
+            std::fs::write(get_config_file(), serialized_refresh_token).unwrap();
+            return token.refresh_token().unwrap().clone();
+        }
+    }
+    panic!("oauth didn't work")
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
