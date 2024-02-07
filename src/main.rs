@@ -11,9 +11,10 @@ use crossterm::{
 use graph_rs_sdk::*;
 use ratatui::{
     prelude::*,
-    widgets::{block::Title, calendar::Monthly, *},
+    widgets::{block::Title, *},
 };
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use todo_lib::todotxt::Task;
 use tui_input::backend::crossterm::EventHandler;
@@ -29,7 +30,7 @@ enum FocussedTab {
 impl FocussedTab {}
 
 struct App {
-    project_state: StatefulList,
+    project_state: ListState,
     table_state: TableState,
     context_state: ListState,
     items: Vec<Task>,
@@ -62,7 +63,7 @@ impl App {
         }
         App {
             table_state: TableState::default(),
-            project_state: StatefulList::new(),
+            project_state: ListState::default(),
             context_state: ListState::default(),
             items: todos,
             adding_item: false,
@@ -75,7 +76,7 @@ impl App {
         match self.focus {
             FocussedTab::Projects => {
                 let i = self.next_project();
-                self.project_state.state.select(Some(i));
+                self.project_state.select(Some(i));
             }
             FocussedTab::TODOs => {
                 let i = self.next_todo();
@@ -91,7 +92,7 @@ impl App {
         match self.focus {
             FocussedTab::Projects => {
                 self.previous_project();
-                // self.project_state.state.select(Some(i));
+                // self.project_state.select(Some(i));
             }
             FocussedTab::TODOs => {
                 self.previous_todo();
@@ -114,7 +115,7 @@ impl App {
         }
     }
     fn next_project(&mut self) -> usize {
-        match self.project_state.state.selected() {
+        match self.project_state.selected() {
             Some(i) => {
                 if i >= self.items.len() - 1 {
                     0
@@ -151,7 +152,7 @@ impl App {
         self.table_state.select(Some(i));
     }
     pub fn previous_project(&mut self) {
-        let i = match self.project_state.state.selected() {
+        let i = match self.project_state.selected() {
             Some(i) => {
                 if i == 0 {
                     self.get_projects().len() - 1
@@ -161,7 +162,7 @@ impl App {
             }
             None => 0,
         };
-        self.project_state.state.select(Some(i));
+        self.project_state.select(Some(i));
     }
     pub fn previous_context(&mut self) {
         let i = match self.context_state.selected() {
@@ -210,7 +211,7 @@ impl App {
         }
     }
     pub fn get_selected_project(&self) -> Option<String> {
-        let index = self.project_state.state.selected();
+        let index = self.project_state.selected();
         // println!("{:?}", index);
         match index {
             Some(index) => self.get_projects().get_mut(index).cloned(),
@@ -259,7 +260,7 @@ impl App {
         let mut filter_conf = todo_lib::tfilter::Conf::default();
         let project_filter = self.get_selected_project();
         let context_filter = self.get_selected_context();
-        let mut todos: Vec<&mut Task>;
+
         let project_filter = match project_filter {
             Some(project) => vec![project.clone()],
             None => vec![],
@@ -291,7 +292,7 @@ impl App {
             todo_lib::tsort::sort(&mut ids, &self.items, &sort_conf);
         }
         let mut lookup_vec: HashMap<usize, &mut Task> = self.items.iter_mut().enumerate().collect();
-        todos = ids.iter().filter_map(|id| lookup_vec.remove(id)).collect();
+        let todos: Vec<&mut Task> = ids.iter().filter_map(|id| lookup_vec.remove(id)).collect();
         // todos = self
         //     .items
         //     .iter_mut()
@@ -316,10 +317,10 @@ fn get_config_file() -> std::path::PathBuf {
 use oauth2::{basic::BasicClient, reqwest::async_http_client, RefreshToken, TokenResponse};
 // Alternatively, this can be `oauth2::curl::http_client` or a custom client.
 use oauth2::{
-    AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    RedirectUrl, Scope, TokenUrl,
+    AuthType, AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl,
+    Scope, TokenUrl,
 };
-use std::env;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use url::Url;
@@ -455,7 +456,7 @@ async fn get_microsoft_tasks() -> eyre::Result<Vec<Task>> {
         .into_iter()
         .map(|x| {
             Task::parse(
-                &format!("{}{} id:{}", x.get_completed_mark(), x.title, x.id),
+                &format!("{}{} mtodo:{}", x.get_completed_mark(), x.title, x.id),
                 chrono::Local::now().date_naive(),
             )
         })
@@ -503,19 +504,7 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-async fn get_oauth_key(
-    client: &oauth2::Client<
-        oauth2::StandardErrorResponse<oauth2::basic::BasicErrorResponseType>,
-        oauth2::StandardTokenResponse<oauth2::EmptyExtraTokenFields, oauth2::basic::BasicTokenType>,
-        oauth2::basic::BasicTokenType,
-        oauth2::StandardTokenIntrospectionResponse<
-            oauth2::EmptyExtraTokenFields,
-            oauth2::basic::BasicTokenType,
-        >,
-        oauth2::StandardRevocableToken,
-        oauth2::StandardErrorResponse<oauth2::RevocationErrorResponseType>,
-    >,
-) -> RefreshToken {
+async fn get_oauth_key(client: &oauth2::basic::BasicClient) -> RefreshToken {
     // Microsoft Graph supports Proof Key for Code Exchange (PKCE - https://oauth.net/2/pkce/).
     // Create a PKCE code verifier and SHA-256 encode it as a code challenge.
     let (pkce_code_challenge, pkce_code_verifier) = PkceCodeChallenge::new_random_sha256();
@@ -531,10 +520,7 @@ async fn get_oauth_key(
         .set_pkce_challenge(pkce_code_challenge)
         .url();
 
-    println!(
-        "Open this URL in your browser:\n{}\n",
-        authorize_url.to_string()
-    );
+    println!("Open this URL in your browser:\n{}\n", authorize_url);
 
     // A very naive implementation of the redirect server.
     let listener = TcpListener::bind("127.0.0.1:3003").unwrap();
@@ -542,37 +528,36 @@ async fn get_oauth_key(
         if let Ok(mut stream) = stream {
             let code;
             let state;
-            {
-                let mut reader = BufReader::new(&stream);
 
-                let mut request_line = String::new();
-                reader.read_line(&mut request_line).unwrap();
+            let mut reader = BufReader::new(&stream);
 
-                let redirect_url = request_line.split_whitespace().nth(1).unwrap();
-                let url = Url::parse(&("http://localhost".to_string() + redirect_url)).unwrap();
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
 
-                let code_pair = url
-                    .query_pairs()
-                    .find(|pair| {
-                        let &(ref key, _) = pair;
-                        key == "code"
-                    })
-                    .unwrap();
+            let redirect_url = request_line.split_whitespace().nth(1).unwrap();
+            let url = Url::parse(&("http://localhost".to_string() + redirect_url)).unwrap();
 
-                let (_, value) = code_pair;
-                code = AuthorizationCode::new(value.into_owned());
+            let code_pair = url
+                .query_pairs()
+                .find(|pair| {
+                    let (key, _) = pair;
+                    key == "code"
+                })
+                .unwrap();
 
-                let state_pair = url
-                    .query_pairs()
-                    .find(|pair| {
-                        let &(ref key, _) = pair;
-                        key == "state"
-                    })
-                    .unwrap();
+            let (_, value) = code_pair;
+            code = AuthorizationCode::new(value.into_owned());
 
-                let (_, value) = state_pair;
-                state = CsrfToken::new(value.into_owned());
-            }
+            let state_pair = url
+                .query_pairs()
+                .find(|pair| {
+                    let (key, _) = pair;
+                    key == "state"
+                })
+                .unwrap();
+
+            let (_, value) = state_pair;
+            state = CsrfToken::new(value.into_owned());
 
             let message = "Go back to your terminal :)";
             let response = format!(
@@ -681,7 +666,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     KeyCode::Down | KeyCode::Char('j') => app.next(),
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
                     KeyCode::Esc => {
-                        app.project_state.state.select(None);
+                        app.project_state.select(None);
                         app.table_state.select(None);
                         app.context_state.select(None);
                         app.focus = FocussedTab::TODOs;
@@ -806,7 +791,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             let height = item.subject.chars().filter(|c| *c == '\n').count() + 1;
             let mut cells = vec![
                 Cell::from(format_status(item.finished).alignment(Alignment::Center)),
-                Cell::from(Text::from(item.subject.to_string())),
+                Cell::from(Text::from(format_subject(&item.subject))),
             ];
             if let Some(date) = item.due_date {
                 cells.push(Cell::from(Text::from(date.to_string())));
@@ -853,7 +838,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 );
             }
         };
-        f.render_stateful_widget(projects, filter_pane[0], &mut app.project_state.state);
+        f.render_stateful_widget(projects, filter_pane[0], &mut app.project_state);
         f.render_stateful_widget(contexts, filter_pane[1], &mut app.context_state);
         f.render_stateful_widget(t, top_level[1], &mut app.table_state);
     }
@@ -864,4 +849,13 @@ fn format_status(input: bool) -> Line<'static> {
         true => Line::from("✓".green()),
         false => Line::from("●".yellow()),
     }
+}
+fn format_subject(input: &str) -> String {
+    let mtodo_regex = Regex::new(r"mtodo:\w+").unwrap();
+    let project_regex = Regex::new(r"\+\w+").unwrap();
+    let context_regex = Regex::new(r"@\w+").unwrap();
+    let stripped = mtodo_regex.replace(input, "");
+    let stripped = project_regex.replace(&stripped, "");
+    let stripped = context_regex.replace(&stripped, "");
+    stripped.to_string()
 }

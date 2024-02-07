@@ -2964,6 +2964,7 @@ dependencies = [
  "graph-rs-sdk",
  "oauth2",
  "ratatui",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
