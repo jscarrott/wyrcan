@@ -211,6 +211,11 @@ impl App {
 fn get_todo_file() -> std::path::PathBuf {
     let todo_file = directories::ProjectDirs::from("", "", "todo-list").unwrap();
     let todo_file = todo_file.config_dir().join("todo.txt");
+    let prefix = todo_file.parent().unwrap();
+    std::fs::create_dir_all(prefix).unwrap();
+    if !todo_file.exists() {
+        std::fs::File::create(&todo_file).unwrap();
+    }
     todo_file
 }
 
