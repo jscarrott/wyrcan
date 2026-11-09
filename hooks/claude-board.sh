@@ -55,6 +55,13 @@ zj() { # zellij fields, only those that are set
     '{zellij_session:$s, zellij_pane:$p} | with_entries(select(.value != ""))'
 }
 
+put() { # put: atomically replace the state file with stdin, under the lock
+  flock -w 1 8 || return 1
+  cat >"$sf.tmp" && mv "$sf.tmp" "$sf"; local r=$?
+  flock -u 8; return $r
+}
+drop() { flock -w 1 8; rm -f "$sf"; flock -u 8; }
+
 upd() { # upd JQ_ARGS... FILTER: locked read-modify-write of the state file
   flock -w 1 8 || return 1
   jq "$@" "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"; local r=$?
@@ -111,13 +118,13 @@ first_prompt() {
 case "$action" in
 state)
   [[ -s $sf && ${2:-} =~ ^(working|waiting|blocked|ended)$ ]] || exit 0
-  [[ $(jq -r .agent "$sf") == closed ]] && exit 0
-  upd --arg a "$2" --argjson t "$(date +%s)" --argjson z "$(zj)" '.agent=$a | .state_at=$t | . + $z'
+  # closed guard lives inside the locked filter so a concurrent `close` can't be overwritten
+  upd --arg a "$2" --argjson t "$(date +%s)" --argjson z "$(zj)" 'if .agent=="closed" then . else .agent=$a | .state_at=$t | . + $z end'
   exit 0 ;;
 register-pen)
   [[ -n ${3:-} ]] || exit 0
   jq -n --arg s "$session" --arg cwd "$3" --argjson t "$(date +%s)" --argjson z "$(zj)" \
-    '{session:$s, cwd:$cwd, kind:"pen", agent:"working", state_at:$t, zellij_session:null, zellij_pane:null} + $z' >"$sf"
+    '{session:$s, cwd:$cwd, kind:"pen", agent:"working", state_at:$t, zellij_session:null, zellij_pane:null} + $z' | put
   exit 0 ;;
 close)
   [[ -s $sf ]] && upd --argjson t "$(date +%s)" '.agent="closed" | .state_at=$t'
@@ -127,7 +134,7 @@ edit|stop)
     [[ $(jq -r '.kind // "task"' "$sf") == pen ]] && exit 0
     if [[ $(jq -r .agent "$sf") == closed ]]; then
       [[ $action == stop ]] && exit 0
-      rm -f "$sf" # a closed session's next edit starts a new task
+      drop # a closed session's next edit starts a new task
     fi
   fi ;;
 esac
@@ -149,11 +156,11 @@ edit)
   if [[ ! -s $sf ]]; then
     title=$(first_prompt); title=${title:-Claude session in $(basename "$root")}
     jq -nc --arg s "$session" --arg cwd "$cwd" --arg r "$root" --arg ref "$ref" --argjson t "$(date +%s)" --argjson z "$(zj)" \
-      '{session:$s, cwd:$cwd, repos:[{root:$r,ref:$ref}], dirty:true, section:"ip", kind:"task", agent:"working", state_at:$t, zellij_session:null, zellij_pane:null} + $z' >"$sf"
+      '{session:$s, cwd:$cwd, repos:[{root:$r,ref:$ref}], dirty:true, section:"ip", kind:"task", agent:"working", state_at:$t, zellij_session:null, zellij_pane:null} + $z' | put
     task=$(api POST /tasks "$(jq -nc --arg c "$title" --arg d "$(describe)" --arg p "$P" --arg sec "$IP" \
       --arg l "$(basename "$root")" '{content:$c, description:$d, project_id:$p, section_id:$sec, labels:[$l]}')" \
       | jq -r '.id // empty')
-    [[ -n $task ]] || { rm -f "$sf"; exit 0; }
+    [[ -n $task ]] || { drop; exit 0; }
     upd --arg t "$task" '.task=$t'
     exit 0
   fi
@@ -205,7 +212,7 @@ claim)
   # repos start empty; the edit hook fills them in and appends them under the task's own description
   jq -n --arg s "$session" --arg cwd "$claim_cwd" --arg task "$claim_task" --argjson t "$t" --argjson now "$(date +%s)" --argjson z "$(zj)" \
     '{session:$s, cwd:$cwd, task:$task, repos:[], dirty:false, section:"ip", note:($t.description // ""), labels0:($t.labels // []),
-      kind:"task", agent:"working", state_at:$now, zellij_session:null, zellij_pane:null} + $z' >"$sf"
+      kind:"task", agent:"working", state_at:$now, zellij_session:null, zellij_pane:null} + $z' | put
   echo "claimed $claim_task"
   ;;
 esac
