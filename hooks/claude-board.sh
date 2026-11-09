@@ -15,7 +15,7 @@ action="${1:-}"
 TOKEN_FILE="${CLAUDE_BOARD_TOKEN_FILE:-$HOME/.config/todoist/token}"
 PROJECT="${CLAUDE_BOARD_PROJECT:-Claude Board}"
 STATE="${CLAUDE_BOARD_STATE:-$HOME/.local/state/claude-board}"
-API=https://api.todoist.com/api/v1
+API=${CLAUDE_BOARD_API:-https://api.todoist.com/api/v1}
 IN_PROGRESS="In progress"
 NEEDS_REVIEW="Needs review"
 UP_NEXT="Up next"
@@ -36,9 +36,14 @@ session=$(jq -r '.session_id // empty' <<<"$input")
 [[ $session =~ ^[A-Za-z0-9_-]+$ ]] || exit 0
 sf="$STATE/$session.json"
 
-# Serialise per session: async hooks for parallel edits can overlap.
-exec 9>"$sf.lock"
-flock -w 20 9 || exit 0
+# fd 8 guards every state-file write (short, never held across the API). fd 9 serialises whole
+# API hooks per session (parallel async edits must not double-create a task); the sync
+# state/pen/close modes skip fd 9 so they never queue behind a slow curl.
+exec 8>"$sf.flock"
+case "$action" in
+  state|register-pen|close) ;;
+  *) exec 9>"$sf.lock"; flock -w 20 9 || exit 0 ;;
+esac
 
 api() { # api METHOD PATH [JSON]
   curl -sf -m 10 -X "$1" -H "Authorization: Bearer $TOKEN" \
@@ -50,7 +55,11 @@ zj() { # zellij fields, only those that are set
     '{zellij_session:$s, zellij_pane:$p} | with_entries(select(.value != ""))'
 }
 
-upd() { jq "$@" "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"; } # upd JQ_ARGS... FILTER
+upd() { # upd JQ_ARGS... FILTER: locked read-modify-write of the state file
+  flock -w 1 8 || return 1
+  jq "$@" "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"; local r=$?
+  flock -u 8; return $r
+}
 
 board_ids() { # prints "project_id up_next_id in_progress_id needs_review_id", cached
   local cache="$STATE/board-$(printf %s "$PROJECT" | md5sum | cut -c1-8).json"
@@ -145,21 +154,21 @@ edit)
       --arg l "$(basename "$root")" '{content:$c, description:$d, project_id:$p, section_id:$sec, labels:[$l]}')" \
       | jq -r '.id // empty')
     [[ -n $task ]] || { rm -f "$sf"; exit 0; }
-    jq --arg t "$task" '.task=$t' "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"
+    upd --arg t "$task" '.task=$t'
     exit 0
   fi
 
   task=$(jq -r .task "$sf")
-  jq '.dirty=true' "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"
+  upd '.dirty=true'
   if ! jq -e --arg r "$root" 'any(.repos[]; .root==$r)' "$sf" >/dev/null; then
-    jq --arg r "$root" --arg ref "$ref" '.repos += [{root:$r,ref:$ref}]' "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"
+    upd --arg r "$root" --arg ref "$ref" '.repos += [{root:$r,ref:$ref}]'
     api POST "/tasks/$task" "$(jq -nc --arg d "$(describe)" --argjson l "$(jq -c '(.labels0 // []) + [.repos[].root | split("/") | last] | unique' "$sf")" \
       '{description:$d, labels:$l}')" >/dev/null
   fi
   if [[ $(jq -r .section "$sf") != ip ]]; then
     # shortcut: if you already completed the task in Todoist this moves it but leaves it completed; reopen by hand
     api POST "/tasks/$task/move" "$(jq -nc --arg s "$IP" '{section_id:$s}')" >/dev/null \
-      && jq '.section="ip"' "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"
+      && upd '.section="ip"'
   fi
   ;;
 stop)
@@ -175,7 +184,7 @@ stop)
     [[ -n $msg ]] && api POST /comments "$(jq -nc --arg t "$task" --arg c "$msg" '{task_id:$t, content:$c}')" >/dev/null
   fi
   if api POST "/tasks/$task/move" "$(jq -nc --arg s "$NR" '{section_id:$s}')" >/dev/null; then
-    jq '.section="nr" | .dirty=false' "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"
+    upd '.section="nr" | .dirty=false'
   fi
   ;;
 add)
