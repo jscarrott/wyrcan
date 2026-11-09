@@ -4,7 +4,7 @@ mod install;
 
 fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
-        Some("install") => install::run(&std::env::current_dir()?),
+        Some("install") => install::run(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &config::home().join(".claude-work")),
         _ => anyhow::bail!("usage: claude-board install"),
     }
 }

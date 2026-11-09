@@ -1,4 +1,3 @@
-use crate::config::home;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -44,14 +43,20 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-fn backup(path: &Path) -> Result<()> {
-    let mut bak = path.as_os_str().to_owned();
-    bak.push(format!(".bak-{}", now()));
-    std::fs::rename(path, &bak).with_context(|| format!("backing up {}", path.display()))
+/// Backups live outside hooks/ and skills/ so Claude Code never loads them.
+fn backup_path(claude: &Path, path: &Path, ts: u64) -> PathBuf {
+    let rel = path.strip_prefix(claude).unwrap_or(path);
+    claude.join("backups/claude-board").join(ts.to_string()).join(rel)
+}
+
+fn backup(claude: &Path, path: &Path) -> Result<()> {
+    let dest = backup_path(claude, path, now());
+    std::fs::create_dir_all(dest.parent().unwrap())?;
+    std::fs::rename(path, &dest).with_context(|| format!("backing up {}", path.display()))
 }
 
 /// Point `link` at `target`, backing up whatever regular file/dir is there.
-fn symlink(target: &Path, link: &Path) -> Result<()> {
+fn symlink(claude: &Path, target: &Path, link: &Path) -> Result<()> {
     match std::fs::symlink_metadata(link) {
         Ok(m) if m.file_type().is_symlink() => {
             if std::fs::read_link(link)? == target {
@@ -59,7 +64,7 @@ fn symlink(target: &Path, link: &Path) -> Result<()> {
             }
             std::fs::remove_file(link)?;
         }
-        Ok(_) => backup(link)?,
+        Ok(_) => backup(claude, link)?,
         Err(_) => {}
     }
     std::os::unix::fs::symlink(target, link)
@@ -68,13 +73,17 @@ fn symlink(target: &Path, link: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run(repo_root: &Path) -> Result<()> {
+pub fn run(repo_root: &Path, claude: &Path) -> Result<()> {
     let root = repo_root.canonicalize()?;
-    let claude = home().join(".claude-work");
+    // Validate before touching anything under the target dir.
+    for need in ["hooks/claude-board.sh", "skills"] {
+        anyhow::ensure!(root.join(need).exists(), "{} not found in {}", need, root.display());
+    }
+    let claude = claude.to_path_buf();
     let script = claude.join("hooks/claude-board.sh");
     std::fs::create_dir_all(claude.join("hooks"))?;
     std::fs::create_dir_all(claude.join("skills"))?;
-    symlink(&root.join("hooks/claude-board.sh"), &script)?;
+    symlink(&claude, &root.join("hooks/claude-board.sh"), &script)?;
     let mut skills: Vec<PathBuf> = std::fs::read_dir(root.join("skills"))?
         .collect::<std::io::Result<Vec<_>>>()?
         .into_iter()
@@ -83,7 +92,7 @@ pub fn run(repo_root: &Path) -> Result<()> {
         .collect();
     skills.sort();
     for s in skills {
-        symlink(&s, &claude.join("skills").join(s.file_name().unwrap()))?;
+        symlink(&claude, &s, &claude.join("skills").join(s.file_name().unwrap()))?;
     }
 
     let settings_path = claude.join("settings.json");
@@ -94,7 +103,7 @@ pub fn run(repo_root: &Path) -> Result<()> {
     let new = merge_hooks(old.clone(), &script);
     if new != old {
         if settings_path.exists() {
-            backup(&settings_path)?;
+            backup(&claude, &settings_path)?;
         }
         std::fs::write(&settings_path, serde_json::to_string_pretty(&new)? + "\n")?;
         println!("updated {}", settings_path.display());
@@ -107,6 +116,26 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::Path;
+
+    #[test]
+    fn backups_go_outside_skills_and_hooks() {
+        let c = Path::new("/h/.claude-work");
+        let b = backup_path(c, &c.join("skills/next"), 7);
+        assert_eq!(b, Path::new("/h/.claude-work/backups/claude-board/7/skills/next"));
+    }
+
+    #[test]
+    fn run_refuses_bad_root_without_touching_target() {
+        let t = std::env::temp_dir().join(format!("cb-test-{}", std::process::id()));
+        let (root, claude) = (t.join("root"), t.join("claude"));
+        std::fs::create_dir_all(root.join("skills")).unwrap();
+        std::fs::create_dir_all(claude.join("hooks")).unwrap();
+        std::fs::write(claude.join("hooks/claude-board.sh"), "live").unwrap();
+        assert!(run(&root, &claude).is_err());
+        assert_eq!(std::fs::read_to_string(claude.join("hooks/claude-board.sh")).unwrap(), "live");
+        assert!(!claude.join("backups").exists());
+        std::fs::remove_dir_all(&t).unwrap();
+    }
 
     const P: &str = "/h/.claude-work/hooks/claude-board.sh";
 
