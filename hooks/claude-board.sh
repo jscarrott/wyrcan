@@ -4,6 +4,10 @@
 #   claude-board.sh stop  (Stop)                                         -> task to "Needs review" + summary comment
 #   claude-board.sh next                     -> prints top "Up next" task as JSON (exit 1 if none)   [used by /next]
 #   claude-board.sh claim SESSION TASK CWD   -> moves TASK to "In progress" and links it to SESSION  [used by /next]
+#   claude-board.sh state working|waiting|blocked|ended  (hook JSON on stdin; offline, only touches an existing state file)
+#   claude-board.sh register-pen SESSION CWD -> state record for a pen (scratch) session
+#   claude-board.sh add TITLE DESC [LABEL...] -> new task at the bottom of Up next; prints its id
+#   claude-board.sh close SESSION            -> marks the session closed (the TUI calls this on complete)
 # Hook modes never fail the hook: every error path exits 0.
 set -uo pipefail
 
@@ -22,6 +26,8 @@ mkdir -p "$STATE" || exit 0
 
 case "$action" in
   claim) input=$(jq -nc --arg s "${2:-}" '{session_id:$s}'); claim_task="${3:-}"; claim_cwd="${4:-$PWD}" ;;
+  register-pen|close) input=$(jq -nc --arg s "${2:-}" '{session_id:$s}') ;;
+  add) input='{"session_id":"add"}' ;;  # no session; "add" is just a lock name
   next) input='{"session_id":"next"}' ;;  # no session; "next" is just a lock name
   *) input=$(cat) ;;
 esac
@@ -38,6 +44,13 @@ api() { # api METHOD PATH [JSON]
   curl -sf -m 10 -X "$1" -H "Authorization: Bearer $TOKEN" \
     -H 'Content-Type: application/json' ${3:+--data "$3"} "$API$2"
 }
+
+zj() { # zellij fields, only those that are set
+  jq -nc --arg s "${ZELLIJ_SESSION_NAME:-}" --arg p "${ZELLIJ_PANE_ID:+terminal_$ZELLIJ_PANE_ID}" \
+    '{zellij_session:$s, zellij_pane:$p} | with_entries(select(.value != ""))'
+}
+
+upd() { jq "$@" "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"; } # upd JQ_ARGS... FILTER
 
 board_ids() { # prints "project_id up_next_id in_progress_id needs_review_id", cached
   local cache="$STATE/board-$(printf %s "$PROJECT" | md5sum | cut -c1-8).json"
@@ -85,9 +98,34 @@ first_prompt() {
     | tr '\n' ' ' | cut -c1-100
 }
 
+# Modes that never touch the API: handled before the board lookup so they work offline.
+case "$action" in
+state)
+  [[ -s $sf && ${2:-} =~ ^(working|waiting|blocked|ended)$ ]] || exit 0
+  [[ $(jq -r .agent "$sf") == closed ]] && exit 0
+  upd --arg a "$2" --argjson t "$(date +%s)" --argjson z "$(zj)" '.agent=$a | .state_at=$t | . + $z'
+  exit 0 ;;
+register-pen)
+  [[ -n ${3:-} ]] || exit 0
+  jq -n --arg s "$session" --arg cwd "$3" --argjson t "$(date +%s)" --argjson z "$(zj)" \
+    '{session:$s, cwd:$cwd, kind:"pen", agent:"working", state_at:$t, zellij_session:null, zellij_pane:null} + $z' >"$sf"
+  exit 0 ;;
+close)
+  [[ -s $sf ]] && upd --argjson t "$(date +%s)" '.agent="closed" | .state_at=$t'
+  exit 0 ;;
+edit|stop)
+  if [[ -s $sf ]]; then
+    [[ $(jq -r '.kind // "task"' "$sf") == pen ]] && exit 0
+    if [[ $(jq -r .agent "$sf") == closed ]]; then
+      [[ $action == stop ]] && exit 0
+      rm -f "$sf" # a closed session's next edit starts a new task
+    fi
+  fi ;;
+esac
+
 read -r P UN IP NR <<<"$(board_ids)" || exit 0
 if [[ -z ${NR:-} ]]; then
-  [[ $action == next || $action == claim ]] && { echo "claude-board: can't reach Todoist" >&2; exit 1; }
+  [[ $action == next || $action == claim || $action == add ]] && { echo "claude-board: can't reach Todoist" >&2; exit 1; }
   exit 0
 fi
 
@@ -101,8 +139,8 @@ edit)
 
   if [[ ! -s $sf ]]; then
     title=$(first_prompt); title=${title:-Claude session in $(basename "$root")}
-    jq -nc --arg s "$session" --arg cwd "$cwd" --arg r "$root" --arg ref "$ref" \
-      '{session:$s, cwd:$cwd, repos:[{root:$r,ref:$ref}], dirty:true, section:"ip"}' >"$sf"
+    jq -nc --arg s "$session" --arg cwd "$cwd" --arg r "$root" --arg ref "$ref" --argjson t "$(date +%s)" --argjson z "$(zj)" \
+      '{session:$s, cwd:$cwd, repos:[{root:$r,ref:$ref}], dirty:true, section:"ip", kind:"task", agent:"working", state_at:$t, zellij_session:null, zellij_pane:null} + $z' >"$sf"
     task=$(api POST /tasks "$(jq -nc --arg c "$title" --arg d "$(describe)" --arg p "$P" --arg sec "$IP" \
       --arg l "$(basename "$root")" '{content:$c, description:$d, project_id:$p, section_id:$sec, labels:[$l]}')" \
       | jq -r '.id // empty')
@@ -140,6 +178,12 @@ stop)
     jq '.section="nr" | .dirty=false' "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"
   fi
   ;;
+add)
+  [[ -n ${2:-} ]] || { echo "usage: claude-board.sh add TITLE DESCRIPTION [LABEL...]" >&2; exit 1; }
+  api POST /tasks "$(jq -nc --arg c "$2" --arg d "${3:-}" --arg p "$P" --arg s "$UN" --args '$ARGS.positional[3:] as $l
+    | {content:$c, description:$d, project_id:$p, section_id:$s, labels:$l}' "$@")" | jq -er '.id' \
+    || { echo "claude-board: add failed" >&2; exit 1; }
+  ;;
 next)
   api GET "/tasks?project_id=$P&section_id=$UN" \
     | jq -ce '[.results[] | select(.parent_id == null)] | sort_by(.child_order) | first // empty
@@ -150,8 +194,9 @@ claim)
   t=$(api GET "/tasks/$claim_task") || { echo "claude-board: task $claim_task not found" >&2; exit 1; }
   api POST "/tasks/$claim_task/move" "$(jq -nc --arg s "$IP" '{section_id:$s}')" >/dev/null || exit 1
   # repos start empty; the edit hook fills them in and appends them under the task's own description
-  jq -n --arg s "$session" --arg cwd "$claim_cwd" --arg task "$claim_task" --argjson t "$t" \
-    '{session:$s, cwd:$cwd, task:$task, repos:[], dirty:false, section:"ip", note:($t.description // ""), labels0:($t.labels // [])}' >"$sf"
+  jq -n --arg s "$session" --arg cwd "$claim_cwd" --arg task "$claim_task" --argjson t "$t" --argjson now "$(date +%s)" --argjson z "$(zj)" \
+    '{session:$s, cwd:$cwd, task:$task, repos:[], dirty:false, section:"ip", note:($t.description // ""), labels0:($t.labels // []),
+      kind:"task", agent:"working", state_at:$now, zellij_session:null, zellij_pane:null} + $z' >"$sf"
   echo "claimed $claim_task"
   ;;
 esac

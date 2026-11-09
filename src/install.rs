@@ -2,10 +2,15 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// (event, matcher, script arg, async)
-pub const HOOKS: &[(&str, Option<&str>, &str, bool)] = &[
-    ("PostToolUse", Some("Edit|Write|MultiEdit|NotebookEdit"), "edit", true),
-    ("Stop", None, "stop", true),
+/// (event, matcher, script args, async, timeout secs)
+pub const HOOKS: &[(&str, Option<&str>, &str, bool, u32)] = &[
+    ("PostToolUse", Some("Edit|Write|MultiEdit|NotebookEdit"), "edit", true, 30),
+    ("Stop", None, "stop", true, 30),
+    ("UserPromptSubmit", None, "state working", false, 5),
+    ("PostToolUse", Some("*"), "state working", false, 5),
+    ("Stop", None, "state waiting", false, 5),
+    ("Notification", Some("permission_prompt|elicitation_dialog"), "state blocked", false, 5),
+    ("SessionEnd", None, "state ended", false, 5),
 ];
 
 fn is_board(entry: &Value) -> bool {
@@ -24,11 +29,11 @@ pub fn merge_hooks(mut settings: Value, script: &Path) -> Value {
         list.retain(|e| !is_board(e));
     }
     hooks.retain(|_, v| v.as_array().is_none_or(|a| !a.is_empty()));
-    for (event, matcher, arg, is_async) in HOOKS {
+    for (event, matcher, arg, is_async, timeout) in HOOKS {
         let mut entry = json!({"hooks": [{
             "type": "command",
             "command": format!("bash {} {arg}", script.display()),
-            "timeout": 30,
+            "timeout": timeout,
             "async": is_async,
         }]});
         if let Some(m) = matcher {
@@ -147,6 +152,9 @@ mod tests {
         assert_eq!(e["hooks"][0]["command"], format!("bash {P} edit"));
         assert_eq!(e["hooks"][0]["async"], true);
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], format!("bash {P} stop"));
+        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["command"], format!("bash {P} state waiting"));
+        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["timeout"], 5);
+        assert_eq!(v["hooks"]["Notification"][0]["matcher"], "permission_prompt|elicitation_dialog");
     }
 
     #[test]
@@ -164,7 +172,7 @@ mod tests {
         assert_eq!(v["theme"], "dark");
         assert_eq!(v["hooks"]["SessionStart"], json!([herdr]));
         assert_eq!(v["hooks"]["PostToolUse"][0], other);
-        assert_eq!(v["hooks"]["PostToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(v["hooks"]["PostToolUse"].as_array().unwrap().len(), 3);
     }
 
     #[test]
@@ -172,7 +180,7 @@ mod tests {
         let stale = json!({"hooks":[{"type":"command","command":"bash /old/claude-board.sh edit"}]});
         let s = json!({"hooks":{"Stop":[stale]}});
         let v = merge_hooks(s, Path::new(P));
-        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 2);
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], format!("bash {P} stop"));
     }
 }

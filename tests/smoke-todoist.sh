@@ -35,10 +35,13 @@ b=$(mk "$(jq -nc --arg p $P --arg s $UN '{content:"Second job",project_id:$p,sec
 $H claim sess-2 "$a" $W/repoB
 [[ $(api /tasks/$a | jq -r .section_id) == "$IP" ]]
 [[ $($H next | jq -r .id) == "$b" ]]
+c=$($H add "Pen job" "desc" mine)
+j=$(api /tasks/$c); [[ $(jq -r .section_id <<<"$j") == "$UN" && $(jq -r .content <<<"$j") == "Pen job" && $(jq -c .labels <<<"$j") == '["mine"]' ]]
+[[ $(api "/tasks?project_id=$P&section_id=$UN" | jq -r '[.results[]|select(.parent_id==null)]|sort_by(.child_order)|last.id') == "$c" ]]
 jq -nc --arg f $W/repoB/q.py --arg c $W/repoB '{session_id:"sess-2",cwd:$c,tool_input:{file_path:$f}}' | $H edit
 j=$(api /tasks/$a); echo "$j" | jq '{description,labels}'
 [[ $(jq -r .description <<<"$j") == "my brief"* && $(jq -r .description <<<"$j") == *repoB* ]]
 [[ $(jq -c '.labels|sort' <<<"$j") == '["mine","repoB"]' ]]
-[[ $(api "/tasks?project_id=$P" | jq '.results|length') == 3 ]]   # no duplicate task for sess-2
+[[ $(api "/tasks?project_id=$P" | jq '.results|length') == 4 ]]   # no duplicate task for sess-2
 curl -sf -m 10 -X DELETE -H "Authorization: Bearer $T" $API/projects/$P
 echo PASS
