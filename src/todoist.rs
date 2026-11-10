@@ -17,14 +17,32 @@ pub struct Task {
 }
 
 #[derive(Deserialize)]
-struct Page {
-    results: Vec<Task>,
+struct Page<T> {
+    results: Vec<T>,
     next_cursor: Option<String>,
 }
 
-pub fn parse_page(body: &str) -> anyhow::Result<(Vec<Task>, Option<String>)> {
-    let p: Page = serde_json::from_str(body).context("bad Todoist tasks page")?;
+fn parse<T: serde::de::DeserializeOwned>(body: &str) -> anyhow::Result<(Vec<T>, Option<String>)> {
+    let p: Page<T> = serde_json::from_str(body).context("bad Todoist page")?;
     Ok((p.results, p.next_cursor))
+}
+
+pub fn parse_page(body: &str) -> anyhow::Result<(Vec<Task>, Option<String>)> {
+    parse(body)
+}
+
+/// Follows next_cursor until null; `fetch` gets the cursor and returns one page.
+fn paginate<T>(mut fetch: impl FnMut(Option<&str>) -> anyhow::Result<(Vec<T>, Option<String>)>) -> anyhow::Result<Vec<T>> {
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let (mut items, next) = fetch(cursor.as_deref())?;
+        all.append(&mut items);
+        match next {
+            Some(c) => cursor = Some(c),
+            None => return Ok(all),
+        }
+    }
 }
 
 pub struct Client {
@@ -58,19 +76,24 @@ impl Client {
         Ok(resp.body_mut().read_to_string()?)
     }
 
-    /// First page's results only; shortcut: no pagination, fine for one project's sections.
+    fn list<T: serde::de::DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> anyhow::Result<Vec<T>> {
+        paginate(|cursor| {
+            let mut q = query.to_vec();
+            if let Some(c) = cursor {
+                q.push(("cursor", c));
+            }
+            parse(&self.get(path, &q)?)
+        })
+    }
+
     fn find_id(&self, path: &str, query: &[(&str, &str)], name: &str) -> anyhow::Result<Option<String>> {
         #[derive(Deserialize)]
         struct Item {
             id: String,
             name: String,
         }
-        #[derive(Deserialize)]
-        struct R {
-            results: Vec<Item>,
-        }
-        let r: R = serde_json::from_str(&self.get(path, query)?).with_context(|| format!("bad {path} response"))?;
-        Ok(r.results.into_iter().find(|i| i.name == name).map(|i| i.id))
+        let items: Vec<Item> = self.list(path, query)?;
+        Ok(items.into_iter().find(|i| i.name == name).map(|i| i.id))
     }
 
     pub fn resolve(&self, project: &str) -> anyhow::Result<(String, SectionIds)> {
@@ -91,20 +114,7 @@ impl Client {
     }
 
     pub fn tasks(&self, project_id: &str) -> anyhow::Result<Vec<Task>> {
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let mut q = vec![("project_id", project_id)];
-            if let Some(c) = cursor.as_deref() {
-                q.push(("cursor", c));
-            }
-            let (mut t, next) = parse_page(&self.get("/tasks", &q)?)?;
-            all.append(&mut t);
-            match next {
-                Some(c) => cursor = Some(c),
-                None => return Ok(all),
-            }
-        }
+        self.list("/tasks", &[("project_id", project_id)])
     }
 
     pub fn complete(&self, task_id: &str) -> anyhow::Result<()> {
@@ -143,6 +153,20 @@ mod tests {
         let (tasks, _) = parse_page(PAGE).unwrap();
         assert_eq!(tasks[1].section_id, None);
         assert_eq!(tasks[1].child_order, 2);
+    }
+
+    #[test]
+    fn paginate_follows_cursors() {
+        let pages = [r#"{"results":[{"id":"a","content":"x","section_id":null}],"next_cursor":"c1"}"#,
+                     r#"{"results":[{"id":"b","content":"y","section_id":null}],"next_cursor":null}"#];
+        let mut seen = vec![];
+        let all: Vec<Task> = paginate(|c| {
+            seen.push(c.map(String::from));
+            parse(pages[seen.len() - 1])
+        })
+        .unwrap();
+        assert_eq!(all.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(seen, [None, Some("c1".to_string())]);
     }
 
     #[test]
