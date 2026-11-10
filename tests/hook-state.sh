@@ -90,7 +90,7 @@ if [[ $(jq -c .labels "$CURL_BODY") != '[]' ]]; then fail "add empty labels"; fi
 for m in next "claim s t1 /x" "add t d"; do
   if CLAUDE_BOARD_TOKEN_FILE=$W/none $H $m 2>/dev/null; then fail "$m exited 0 without token"; fi
 done
-CLAUDE_BOARD_TOKEN_FILE=$W/none edit 2>/dev/null || fail "edit without token"
+ev | CLAUDE_BOARD_TOKEN_FILE=$W/none $H edit 2>/dev/null || fail "edit without token"
 ev | CLAUDE_BOARD_TOKEN_FILE=$W/none $H state working 2>/dev/null || fail "state without token"
 
 # pen: edit/stop leave it alone
