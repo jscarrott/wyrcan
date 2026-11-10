@@ -353,7 +353,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(dead_code)] // task view, Task 7
     pub fn events(&self, task_id: i64) -> Result<Vec<Event>> {
         let mut q = self.conn.prepare("SELECT task_id,at,kind,detail FROM events WHERE task_id=?1 ORDER BY id")?;
         let rows = q

@@ -1,7 +1,7 @@
 //! Board state and input: a snapshot of the store, the selection, and keys/mouse turned into effects.
 use crate::config::Config;
 use crate::gate;
-use crate::model::{AgentState, Pr, PrState, Session, SessionKind, Stage, Task};
+use crate::model::{AgentState, Event, Pr, PrState, Session, SessionKind, Stage, Task};
 use crate::store::Store;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -28,7 +28,7 @@ impl Group {
         }
     }
 
-    fn of(stage: Stage) -> Option<Group> {
+    pub fn of(stage: Stage) -> Option<Group> {
         match stage {
             Stage::Active => Some(Group::Active),
             Stage::Review => Some(Group::Review),
@@ -141,7 +141,6 @@ pub enum Effect {
     SpawnPen,
     OpenExplainer(i64),
     OpenPr(i64),
-    #[allow(dead_code)] // emitted by quick add, Task 7
     Add { title: String, dir: Option<String>, labels: Vec<String> },
     Quit,
 }
@@ -173,11 +172,96 @@ impl Prompt {
     }
 }
 
-/// Where a card landed in the last frame, for mouse clicks.
+/// What the mouse can hit: a card, a column or group (a drop target), or "+ Add task".
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    Card(CardKey),
+    Group(Group),
+    AddTask,
+}
+
+/// Where something landed in the last frame, for the mouse.
 #[derive(Debug, Clone)]
 pub struct Hit {
     pub rect: Rect,
+    pub target: Target,
+}
+
+/// What the task view shows beyond the card; read from the store by the loop while the view is open.
+#[derive(Debug)]
+pub struct Detail {
+    pub task: Task,
+    pub session: Option<Session>,
+    pub prs: Vec<Pr>,
+    pub repos: Vec<String>,
+    pub events: Vec<Event>,
+}
+
+pub fn detail(store: &Store, id: i64) -> anyhow::Result<Option<Detail>> {
+    let Some(task) = store.task(id)? else { return Ok(None) };
+    let (session, prs, repos, events) = (store.current_session(id)?, store.prs(id)?, store.task_repos(id)?, store.events(id)?);
+    Ok(Some(Detail { task, session, prs, repos, events }))
+}
+
+#[derive(Debug)]
+pub struct TaskView {
+    pub id: i64,
+    pub scroll: u16,
+    pub detail: Option<Detail>,
+}
+
+/// The quick-add line; `cursor` counts chars.
+#[derive(Debug, Default)]
+pub struct Input {
+    pub text: String,
+    pub cursor: usize,
+}
+
+impl Input {
+    fn byte(&self, i: usize) -> usize {
+        self.text.char_indices().nth(i).map_or(self.text.len(), |(b, _)| b)
+    }
+
+    fn key(&mut self, code: KeyCode) {
+        let n = self.text.chars().count();
+        match code {
+            KeyCode::Char(c) => {
+                let b = self.byte(self.cursor);
+                self.text.insert(b, c);
+                self.cursor += 1;
+            }
+            KeyCode::Backspace if self.cursor > 0 => {
+                self.cursor -= 1;
+                let b = self.byte(self.cursor);
+                self.text.remove(b);
+            }
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => self.cursor = (self.cursor + 1).min(n),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = n,
+            _ => {}
+        }
+    }
+}
+
+/// `@word` is a label, `#path` the directory (`~` expanded), the rest the title. Only at the start of a word.
+pub fn parse_quick_add(s: &str) -> (String, Option<String>, Vec<String>) {
+    let (mut title, mut dir, mut labels) = (vec![], None, vec![]);
+    for w in s.split_whitespace() {
+        match (w.strip_prefix('@'), w.strip_prefix('#')) {
+            (Some(l), _) if !l.is_empty() => labels.push(l.to_string()),
+            (_, Some(d)) if !d.is_empty() => dir = Some(crate::config::expand_home(d)),
+            _ => title.push(w),
+        }
+    }
+    (title.join(" "), dir, labels)
+}
+
+/// A card being dragged, and the drop target under the pointer.
+#[derive(Debug)]
+pub struct Drag {
     pub key: CardKey,
+    pub over: Option<Group>,
 }
 
 pub struct App {
@@ -186,18 +270,40 @@ pub struct App {
     pub message: Option<String>,
     pub prompt: Option<Prompt>,
     pub confirm: Option<Pending>,
-    #[allow(dead_code)] // the task view, Task 7
-    pub modal: Option<i64>,
+    pub modal: Option<TaskView>,
+    pub quick: Option<Input>,
+    pub drag: Option<Drag>,
     pub hits: Vec<Hit>,
-    /// The wide form is on screen (set by the loop from the terminal width).
+    /// The wide form is on screen (set by `ui::draw` from the width).
     pub wide: bool,
+    /// Wide form: each column's scroll offset in lines, by `Group as usize`.
+    pub scroll: [usize; 5],
+    /// The selection the wide form last scrolled into view; a new one gets scrolled to once.
+    pub followed: Option<CardKey>,
 }
 
 impl App {
     pub fn new(snap: Snapshot) -> App {
-        let mut a = App { snap, selected: None, message: None, prompt: None, confirm: None, modal: None, hits: vec![], wide: false };
+        let mut a = App {
+            snap,
+            selected: None,
+            message: None,
+            prompt: None,
+            confirm: None,
+            modal: None,
+            quick: None,
+            drag: None,
+            hits: vec![],
+            wide: false,
+            scroll: [0; 5],
+            followed: None,
+        };
         a.selected = a.flat().first().map(|c| c.key());
         a
+    }
+
+    pub fn group_of(&self, k: &CardKey) -> Option<Group> {
+        self.snap.groups.iter().find(|g| g.1.iter().any(|c| c.key() == *k)).map(|g| g.0)
     }
 
     /// Every card, in screen order.
@@ -217,6 +323,10 @@ impl App {
         if self.index().is_none() {
             let flat = self.flat();
             self.selected = flat.get(old.unwrap_or(0).min(flat.len().saturating_sub(1))).map(|c| c.key());
+        }
+        // The task view follows its card; once the card leaves the board (done, dropped), it closes.
+        if self.modal.as_ref().is_some_and(|v| self.selected != Some(CardKey::Task(v.id))) {
+            self.modal = None;
         }
     }
 
@@ -269,23 +379,85 @@ impl App {
         }
     }
 
+    fn hit(&self, at: Position, want: fn(&Target) -> bool) -> Option<Target> {
+        self.hits.iter().find(|h| want(&h.target) && h.rect.contains(at)).map(|h| h.target.clone())
+    }
+
+    fn group_at(&self, at: Position) -> Option<Group> {
+        match self.hit(at, |t| matches!(t, Target::Group(_))) {
+            Some(Target::Group(g)) => Some(g),
+            _ => None,
+        }
+    }
+
     pub fn on_mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
-        if self.confirm.is_some() || self.prompt.is_some() {
+        if self.confirm.is_some() || self.prompt.is_some() || self.quick.is_some() {
+            return vec![];
+        }
+        let at = Position { x: m.column, y: m.row };
+        let wheel = match m.kind {
+            MouseEventKind::ScrollDown => 1,
+            MouseEventKind::ScrollUp => -1,
+            _ => 0,
+        };
+        if let Some(v) = self.modal.as_mut() {
+            v.scroll = v.scroll.saturating_add_signed(wheel * 3);
             return vec![];
         }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let at = Position { x: m.column, y: m.row };
-                let Some(k) = self.hits.iter().find(|h| h.rect.contains(at)).map(|h| h.key.clone()) else { return vec![] };
                 self.message = None;
-                match self.flat().iter().position(|c| c.key() == k) {
-                    Some(i) => self.select(i),
-                    None => vec![],
+                match self.hit(at, |t| !matches!(t, Target::Group(_))) {
+                    Some(Target::AddTask) => {
+                        self.quick = Some(Input::default());
+                        vec![]
+                    }
+                    Some(Target::Card(k)) => {
+                        self.drag = Some(Drag { key: k.clone(), over: None });
+                        match self.flat().iter().position(|c| c.key() == k) {
+                            Some(i) => self.select(i),
+                            None => vec![],
+                        }
+                    }
+                    _ => vec![],
                 }
             }
-            MouseEventKind::ScrollDown => self.step(1),
-            MouseEventKind::ScrollUp => self.step(-1),
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let over = self.group_at(at);
+                if let Some(d) = self.drag.as_mut() {
+                    d.over = over;
+                }
+                vec![]
+            }
+            MouseEventKind::Up(MouseButton::Left) => match (self.drag.take(), self.group_at(at)) {
+                (Some(d), Some(g)) if self.selected.as_ref() == Some(&d.key) => self.drop_on(g),
+                _ => vec![],
+            },
+            _ if wheel != 0 && self.wide => {
+                if let Some(g) = self.group_at(at) {
+                    let o = &mut self.scroll[g as usize];
+                    *o = o.saturating_add_signed(wheel as isize * 3);
+                }
+                vec![]
+            }
+            _ if wheel != 0 => self.step(wheel as isize),
             _ => vec![],
+        }
+    }
+
+    /// A card dropped on a column asks for that stage the way the keys do; the store has the last word.
+    fn drop_on(&mut self, g: Group) -> Vec<Effect> {
+        let Some((t, _)) = self.task() else { return vec![] };
+        if Group::of(t.stage) == Some(g) {
+            return vec![];
+        }
+        match g {
+            Group::Active if t.stage == Stage::Queue => vec![Effect::Start(t.id)],
+            Group::Active => vec![Effect::Resume(t.id)],
+            Group::Review => vec![Effect::ToReview(t.id)],
+            Group::Queue => vec![Effect::Requeue(t.id)],
+            Group::Parked => self.guarded("Park", Effect::Park),
+            Group::Untracked => vec![],
         }
     }
 
@@ -301,6 +473,32 @@ impl App {
             return if k.code == KeyCode::Char('y') { vec![p.effect] } else { vec![] };
         }
         self.message = None;
+        if let Some(q) = self.quick.as_mut() {
+            match k.code {
+                KeyCode::Esc => self.quick = None,
+                KeyCode::Enter => {
+                    let (title, dir, labels) = parse_quick_add(&q.text);
+                    if !title.is_empty() {
+                        // Stays open until the add succeeds, so a bad directory can be fixed.
+                        return vec![Effect::Add { title, dir, labels }];
+                    }
+                    self.quick = None;
+                }
+                c => q.key(c),
+            }
+            return vec![];
+        }
+        // In the task view these act on the card in view, as on the board; other keys stay in the view.
+        let passes = matches!(k.code, KeyCode::Char('e' | 'o' | 'w' | 'P' | 'x' | 'D'));
+        if let Some(v) = self.modal.as_mut().filter(|_| !passes) {
+            match k.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Up | KeyCode::Char('k') => v.scroll = v.scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => v.scroll += 1,
+                _ => {}
+            }
+            return vec![];
+        }
         let code = match (k.modifiers.contains(KeyModifiers::SHIFT), k.code) {
             (true, KeyCode::Left) => KeyCode::Char('H'),
             (true, KeyCode::Right) => KeyCode::Char('L'),
@@ -333,8 +531,14 @@ impl App {
             KeyCode::Char('o') => on(Effect::OpenPr),
             KeyCode::Char('v') => vec![Effect::ToggleBoardWide],
             KeyCode::Char('p') => vec![Effect::SpawnPen],
-            KeyCode::Char(' ' | '+') => {
-                self.message = Some("Task view and quick add come in the next step.".into());
+            KeyCode::Char(' ') => {
+                if let Some((t, _)) = self.task() {
+                    self.modal = Some(TaskView { id: t.id, scroll: 0, detail: None });
+                }
+                vec![]
+            }
+            KeyCode::Char('+') => {
+                self.quick = Some(Input::default());
                 vec![]
             }
             KeyCode::Char('q') => vec![Effect::Quit],
@@ -431,12 +635,16 @@ pub(crate) mod tests {
     use super::*;
     use crate::store::{NewTask, SessionUpdate};
 
+    /// Built by hand so tests never read the user's config file.
     pub fn cfg(max: usize) -> Config {
-        let mut c = Config::from_env();
-        c.max_active = max;
-        c.file = String::new();
-        c.claude_dir = "/c".into();
-        c
+        Config {
+            token_file: "/nonexistent/token".into(),
+            project: "Claude Board".into(),
+            state_dir: "/nonexistent/state".into(),
+            claude_dir: "/c".into(),
+            max_active: max,
+            file: String::new(),
+        }
     }
 
     pub fn add(s: &Store, title: &str, stage: Stage) -> i64 {
@@ -630,16 +838,90 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn parse_quick_add_parses_tokens() {
+        let home = crate::config::home().to_string_lossy().into_owned();
+        let (t, d, l) = parse_quick_add("Fix login @delta @api #~/git-work/delta");
+        assert_eq!((t.as_str(), d, l), ("Fix login", Some(format!("{home}/git-work/delta")), vec!["delta".to_string(), "api".to_string()]));
+        // `@` and `#` only count at the start of a word; a bare one is text.
+        assert_eq!(parse_quick_add("email me@example.com about issue#4 @ #"), ("email me@example.com about issue#4 @ #".into(), None, vec![]));
+        assert_eq!(parse_quick_add("   "), (String::new(), None, vec![]));
+        assert_eq!(parse_quick_add("x #~").1, Some(home));
+    }
+
+    fn type_into(ap: &mut App, s: &str) {
+        for c in s.chars() {
+            ap.on_key_event(key(c));
+        }
+    }
+
+    #[test]
+    fn quick_add_edits_and_submits() {
+        let s = Store::open_in_memory();
+        let mut ap = app(&s, &cfg(3));
+        ap.on_key_event(key('+'));
+        type_into(&mut ap, "fix login @api");
+        // Board keys don't fire underneath: 'q' and 'D' were typed, not obeyed.
+        ap.on_key_event(KeyCode::Home.into());
+        type_into(&mut ap, "Dq ");
+        ap.on_key_event(KeyCode::End.into());
+        ap.on_key_event(KeyCode::Left.into());
+        ap.on_key_event(KeyCode::Backspace.into());
+        assert_eq!(ap.quick.as_ref().unwrap().text, "Dq fix login @ai");
+        assert!(ap.confirm.is_none());
+        let e = ap.on_key_event(KeyCode::Enter.into());
+        assert_eq!(e, [Effect::Add { title: "Dq fix login".into(), dir: None, labels: vec!["ai".into()] }]);
+        ap.on_key_event(KeyCode::Esc.into());
+        assert!(ap.quick.is_none());
+    }
+
+    #[test]
+    fn empty_quick_add_adds_nothing() {
+        let s = Store::open_in_memory();
+        let mut ap = app(&s, &cfg(3));
+        ap.on_key_event(key('+'));
+        type_into(&mut ap, "  @label  ");
+        assert!(ap.on_key_event(KeyCode::Enter.into()).is_empty());
+        assert!(ap.quick.is_none());
+    }
+
+    #[test]
+    fn task_view_captures_keys_but_passes_actions() {
+        let s = Store::open_in_memory();
+        let id = add(&s, "t", Stage::Active);
+        let mut ap = app(&s, &cfg(3));
+        ap.on_key_event(key(' '));
+        assert_eq!(ap.modal.as_ref().unwrap().id, id);
+        assert!(ap.on_key_event(key('q')).is_empty(), "q doesn't quit under the modal");
+        ap.on_key_event(KeyCode::Down.into());
+        assert_eq!(ap.modal.as_ref().unwrap().scroll, 1);
+        assert_eq!(ap.on_key_event(key('w')), [Effect::Wrap(id)]);
+        assert_eq!(ap.on_key_event(key('P')), [Effect::Park(id)]);
+        ap.on_key_event(KeyCode::Esc.into());
+        assert!(ap.modal.is_none());
+    }
+
+    #[test]
     fn click_selects_and_wheel_scrolls() {
         let s = Store::open_in_memory();
         let (a, b) = (add(&s, "a", Stage::Queue), add(&s, "b", Stage::Queue));
         let mut ap = app(&s, &cfg(3));
-        ap.wide = true;
-        ap.hits = vec![Hit { rect: Rect::new(0, 0, 10, 3), key: CardKey::Task(a) }, Hit { rect: Rect::new(0, 3, 10, 3), key: CardKey::Task(b) }];
+        ap.hits = vec![
+            Hit { rect: Rect::new(0, 0, 10, 3), target: Target::Card(CardKey::Task(a)) },
+            Hit { rect: Rect::new(0, 3, 10, 3), target: Target::Card(CardKey::Task(b)) },
+            Hit { rect: Rect::new(0, 0, 10, 8), target: Target::Group(Group::Queue) },
+            Hit { rect: Rect::new(0, 6, 10, 1), target: Target::AddTask },
+        ];
         let ev = |kind, row| MouseEvent { kind, column: 2, row, modifiers: KeyModifiers::NONE };
-        ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 4));
+        assert_eq!(ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 4)), [Effect::Show(b)]);
         assert_eq!(ap.selected, Some(CardKey::Task(b)));
+        // Narrow: the wheel walks the list.
         ap.on_mouse(ev(MouseEventKind::ScrollUp, 0));
         assert_eq!(ap.selected, Some(CardKey::Task(a)));
+        // Wide: it scrolls the column under the pointer and leaves the selection alone.
+        ap.wide = true;
+        ap.on_mouse(ev(MouseEventKind::ScrollDown, 0));
+        assert_eq!((ap.selected.clone(), ap.scroll[Group::Queue as usize]), (Some(CardKey::Task(a)), 3));
+        ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 6));
+        assert!(ap.quick.is_some());
     }
 }

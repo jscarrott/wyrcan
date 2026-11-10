@@ -56,7 +56,7 @@ pub fn age(now: i64, since: i64) -> String {
     }
 }
 
-fn home_short(path: &str) -> String {
+pub fn home_short(path: &str) -> String {
     let home = crate::config::home().to_string_lossy().into_owned();
     match path.strip_prefix(&home) {
         Some(rest) if !home.is_empty() => format!("~{rest}"),
@@ -124,7 +124,7 @@ fn fit(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
 }
 
 /// Packs label chips into lines no wider than `width`.
-fn chips(labels: &[String], width: usize) -> Vec<Vec<Span<'static>>> {
+pub fn chips(labels: &[String], width: usize) -> Vec<Vec<Span<'static>>> {
     let mut rows: Vec<Vec<Span>> = vec![];
     let mut used = 0;
     for l in labels {
@@ -279,14 +279,13 @@ mod tests {
         let t = text(&card_lines(&card(&long), 24, false, 0));
         let joined: String = t.chars().filter(|c| c.is_ascii_lowercase()).collect();
         assert!(joined.contains(&long), "{t}");
-        // A 10×5 terminal draws without panicking.
+        // A 10×5 terminal, and a wide but very short one, draw without panicking.
         use crate::app::{App, Group, Snapshot};
         let snap = Snapshot { groups: vec![(Group::Active, vec![card(&long), card("修复 登录 超时 🚀")])], max_active: 3, ..Default::default() };
-        let app = App::new(snap);
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(10, 5)).unwrap();
-        term.draw(|f| {
-            super::super::draw(f, &app);
-        })
-        .unwrap();
+        let mut app = App::new(snap);
+        for w in [10, 140] {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 5)).unwrap();
+            term.draw(|f| super::super::draw(f, &mut app)).unwrap();
+        }
     }
 }

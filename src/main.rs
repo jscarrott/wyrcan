@@ -64,10 +64,7 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, store: &store:
             refresh(&mut app, store, cfg);
             last_read = Instant::now();
         }
-        app.wide = term.size()?.width >= ui::WIDE_MIN;
-        let mut hits = vec![];
-        term.draw(|f| hits = ui::draw(f, &app))?;
-        app.hits = hits;
+        term.draw(|f| ui::draw(f, &mut app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -76,7 +73,8 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, store: &store:
             Event::Mouse(m) => app.on_mouse(m),
             _ => continue,
         };
-        if effects.is_empty() {
+        // A task view that just opened has nothing to show until refresh reads it.
+        if effects.is_empty() && !app.modal.as_ref().is_some_and(|v| v.detail.is_none()) {
             continue;
         }
         if effects::run_all(effects, &ctx, &mut panes, &mut app) {
@@ -89,6 +87,11 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, store: &store:
 fn refresh(app: &mut App, store: &store::Store, cfg: &config::Config) {
     match app::snapshot(store, cfg) {
         Ok(s) => app.set_snapshot(s),
+        Err(e) => app.message = Some(format!("{e:#}")),
+    }
+    let Some(id) = app.modal.as_ref().map(|v| v.id) else { return };
+    match app::detail(store, id) {
+        Ok(d) => app.modal.as_mut().expect("checked above").detail = d,
         Err(e) => app.message = Some(format!("{e:#}")),
     }
 }

@@ -49,7 +49,6 @@ pub struct Task {
     pub explainer: Option<String>,
     #[allow(dead_code)] // Task 9 sync
     pub todoist_id: Option<String>,
-    #[allow(dead_code)] // task view, Task 7
     pub created_at: i64,
     pub stage_at: i64,
 }
@@ -80,9 +79,9 @@ pub struct Pr {
     pub reviewers: String,
 }
 
-#[allow(dead_code)] // task view, Task 7
 #[derive(Clone, Debug)]
 pub struct Event {
+    #[allow(dead_code)] // mirrors the column
     pub task_id: i64,
     pub at: i64,
     /// "stage", "summary", "pr", "comment" or "flag".

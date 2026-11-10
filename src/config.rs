@@ -18,6 +18,14 @@ pub fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
 
+/// `~` and `~/…` mean $HOME.
+pub fn expand_home(p: &str) -> String {
+    match p.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{}{rest}", home().to_string_lossy()),
+        _ => p.to_string(),
+    }
+}
+
 fn config_file() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .ok()
@@ -35,11 +43,7 @@ fn file_value(text: &str, key: &str) -> Option<String> {
         if l.trim_start().starts_with('#') || k.trim() != key {
             return None;
         }
-        let v = v.trim().trim_matches('"');
-        Some(match v.strip_prefix("~/") {
-            Some(rest) => home().join(rest).to_string_lossy().into_owned(),
-            None => v.to_string(),
-        })
+        Some(expand_home(v.trim().trim_matches('"')))
     })
 }
 

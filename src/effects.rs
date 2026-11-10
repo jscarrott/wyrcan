@@ -114,13 +114,8 @@ pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
         Effect::Start(id) => open(c, p, app, id, false)?,
         Effect::Resume(id) => open(c, p, app, id, true)?,
         Effect::SetDir { id, dir } => {
-            let dir = match dir.strip_prefix("~/") {
-                Some(rest) => crate::config::home().join(rest).to_string_lossy().into_owned(),
-                None => dir,
-            };
-            if !std::path::Path::new(&dir).is_dir() {
-                bail!("No such directory: {dir}");
-            }
+            let dir = crate::config::expand_home(&dir);
+            is_dir(&dir)?;
             let t = c.task(id)?;
             c.store.update_task(id, &t.title, &t.description, Some(&dir), &t.labels)?;
         }
@@ -176,9 +171,21 @@ pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
             }
         }
         Effect::Add { title, dir, labels } => {
-            c.store.add_task(NewTask { title: &title, description: "", dir: dir.as_deref(), labels: &labels, todoist_id: None })?;
+            if let Some(d) = &dir {
+                is_dir(d)?;
+            }
+            let id = c.store.add_task(NewTask { title: &title, description: "", dir: dir.as_deref(), labels: &labels, todoist_id: None })?;
+            app.quick = None;
+            app.selected = Some(CardKey::Task(id));
         }
         Effect::Quit => {}
+    }
+    Ok(())
+}
+
+fn is_dir(d: &str) -> Result<()> {
+    if !std::path::Path::new(d).is_dir() {
+        bail!("No such directory: {d}");
     }
     Ok(())
 }
@@ -229,7 +236,8 @@ fn xdg_open(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Every second: refresh the live panes and close the panes of streams that left Active, once their agent isn't working.
+/// Every second: refresh the live panes and close the panes of streams that left Active, once their agent is idle.
+/// Working or Blocked (say, a wrapped-up agent on a permission prompt) keeps its pane.
 pub fn tick(c: &Ctx, p: &mut Panes) -> Result<()> {
     if c.zj.board().is_err() {
         return Ok(());
@@ -238,7 +246,7 @@ pub fn tick(c: &Ctx, p: &mut Panes) -> Result<()> {
     let sessions = c.store.sessions()?;
     for t in c.store.tasks()?.iter().filter(|t| t.stage != Stage::Active && t.stage_at >= p.since) {
         let Some(s) = sessions.iter().find(|s| s.task_id == Some(t.id) && s.current) else { continue };
-        if s.state == AgentState::Working {
+        if !matches!(s.state, AgentState::Waiting | AgentState::Ended) {
             continue;
         }
         // pane_of confirms the pane is live and in this zellij session.
@@ -450,10 +458,71 @@ mod tests {
         assert!(r.calls.borrow().contains(&"zellij action write-chars --pane-id terminal_4 /wrap".to_string()));
     }
 
+    /// Draws the wide board, then drags `id`'s card onto the `to` column and runs what that asks for.
+    fn drag(s: &Store, c: &Config, ap: &mut App, id: i64, to: crate::app::Group) {
+        use crate::app::Target;
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind as K};
+        use ratatui::layout::Rect;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| crate::ui::draw(f, ap)).unwrap();
+        let rect = |t: Target| ap.hits.iter().find(|h| h.target == t).unwrap().rect;
+        let (from, onto) = (rect(Target::Card(CardKey::Task(id))), rect(Target::Group(to)));
+        let ev = |kind, r: Rect| MouseEvent { kind, column: r.x + 2, row: r.y + 2, modifiers: KeyModifiers::NONE };
+        let mut e = ap.on_mouse(ev(K::Down(MouseButton::Left), from));
+        e.extend(ap.on_mouse(ev(K::Drag(MouseButton::Left), onto)));
+        assert_eq!(ap.drag.as_ref().and_then(|d| d.over), Some(to), "the target highlights");
+        e.extend(ap.on_mouse(ev(K::Up(MouseButton::Left), onto)));
+        let (zj, r) = (inside(), rec(&["terminal_0"]));
+        run_all(e, &ctx(s, c, &zj, &r), &mut Panes::new(0), ap);
+    }
+
+    #[test]
+    fn drag_to_review_is_refused_by_gate() {
+        let (s, c) = (Store::open_in_memory(), cfg(3));
+        let id = add(&s, "a", Stage::Active);
+        let mut ap = app(&s, &c);
+        drag(&s, &c, &mut ap, id, crate::app::Group::Review);
+        assert_eq!(ap.message.as_deref(), Some("Not ready for review: no explainer"));
+        assert_eq!(stage(&s, id), Stage::Active);
+    }
+
+    #[test]
+    fn drag_to_parked_moves() {
+        let (s, c) = (Store::open_in_memory(), cfg(3));
+        let id = add(&s, "a", Stage::Active);
+        let q = add(&s, "q", Stage::Queue);
+        let mut ap = app(&s, &c);
+        drag(&s, &c, &mut ap, id, crate::app::Group::Parked);
+        assert_eq!((ap.message.as_deref(), stage(&s, id)), (None, Stage::Parked));
+        // Onto its own column: nothing happens.
+        drag(&s, &c, &mut ap, q, crate::app::Group::Queue);
+        assert_eq!((ap.message.as_deref(), stage(&s, q)), (None, Stage::Queue));
+    }
+
+    #[test]
+    fn quick_add_goes_to_the_bottom_of_the_queue() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&[]));
+        let first = add(&s, "first", Stage::Queue);
+        let mut ap = app(&s, &c);
+        ap.quick = Some(Default::default());
+        let e = vec![Effect::Add { title: "second".into(), dir: None, labels: vec!["api".into()] }];
+        run_all(e, &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        let queue: Vec<_> = s.tasks().unwrap().into_iter().filter(|t| t.stage == Stage::Queue).map(|t| (t.title, t.labels)).collect();
+        assert_eq!(queue, [("first".into(), vec![]), ("second".to_string(), vec!["api".to_string()])]);
+        assert!(ap.quick.is_none() && ap.selected != Some(CardKey::Task(first)));
+        // A directory that isn't there is refused and the box stays open.
+        ap.quick = Some(Default::default());
+        let e = vec![Effect::Add { title: "x".into(), dir: Some("/nonexistent/dir".into()), labels: vec![] }];
+        run_all(e, &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert_eq!(ap.message.as_deref(), Some("No such directory: /nonexistent/dir"));
+        assert!(ap.quick.is_some());
+        assert_eq!(s.tasks().unwrap().len(), 2);
+    }
+
     #[test]
     fn tick_closes_idle_panes_of_streams_that_left_active() {
         let (s, c, zj) = (Store::open_in_memory(), cfg(3), inside());
-        let r = rec(&["terminal_0", "terminal_1", "terminal_2", "terminal_3", "terminal_4"]);
+        let r = rec(&["terminal_0", "terminal_1", "terminal_2", "terminal_3", "terminal_4", "terminal_5", "terminal_6"]);
         let mk = |stage: Stage, sid: &str, pane_id: &str, state| {
             let id = add(&s, sid, Stage::Active);
             session(&s, sid, Some(id), state);
@@ -464,13 +533,17 @@ mod tests {
         };
         mk(Stage::Review, "idle", "terminal_1", AgentState::Waiting);
         mk(Stage::Parked, "busy", "terminal_2", AgentState::Working);
+        // Wrapped up but stuck on a permission prompt: its pane must stay.
+        mk(Stage::Review, "asking", "terminal_5", AgentState::Blocked);
+        mk(Stage::Parked, "gone", "terminal_6", AgentState::Ended);
         mk(Stage::Active, "active", "terminal_3", AgentState::Waiting);
         // A stale session whose recorded pane id is now someone else's: other zellij session.
         mk(Stage::Review, "stale", "terminal_4", AgentState::Waiting);
         s.touch_session(SessionUpdate { id: "stale", cwd: "/w", state: AgentState::Waiting, zellij_session: Some("old"), zellij_pane: None }, false).unwrap();
         tick(&ctx(&s, &c, &zj, &r), &mut Panes::new(0)).unwrap();
-        let closes: Vec<String> = r.calls.borrow().iter().filter(|l| l.contains("close-pane")).cloned().collect();
-        assert_eq!(closes, ["zellij action close-pane --pane-id terminal_1"]);
+        let mut closes: Vec<String> = r.calls.borrow().iter().filter(|l| l.contains("close-pane")).cloned().collect();
+        closes.sort();
+        assert_eq!(closes, ["zellij action close-pane --pane-id terminal_1", "zellij action close-pane --pane-id terminal_6"]);
         // Streams that left Active before the board started are left alone.
         let r2 = rec(&["terminal_0", "terminal_1"]);
         tick(&ctx(&s, &c, &zj, &r2), &mut Panes::new(i64::MAX)).unwrap();

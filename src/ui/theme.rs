@@ -14,6 +14,11 @@ pub fn bold() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
+/// A column or group a dragged card is over.
+pub fn target() -> Style {
+    Style::new().bg(ACCENT).fg(Color::White).add_modifier(Modifier::BOLD)
+}
+
 pub fn chip() -> Style {
     Style::new().bg(DIM).fg(Color::White)
 }
