@@ -19,8 +19,15 @@ pub fn evaluate(store: &Store, task: &Task, checks: &[String], verify_pr: &PrVer
     for check in checks {
         match check.as_str() {
             "pr" => {
-                let prs = store.prs(task.id).unwrap_or_default();
-                for root in store.task_repos(task.id).unwrap_or_default() {
+                // A read failure must refuse, never pass.
+                let (prs, roots) = match (store.prs(task.id), store.task_repos(task.id)) {
+                    (Ok(p), Ok(r)) => (p, r),
+                    (Err(e), _) | (_, Err(e)) => {
+                        missing.push(format!("couldn't read PRs: {e}"));
+                        continue;
+                    }
+                };
+                for root in roots {
                     let name = basename(&root);
                     match prs.iter().find(|p| p.root == root) {
                         Some(p) if waived(p) => {}
@@ -112,6 +119,14 @@ mod tests {
         s.set_pr(id, "/x/a", Some("https://x/pr/1"), None).unwrap();
         explainer(&s, id);
         assert_eq!(eval(&s, id, false), ["couldn't verify PR https://x/pr/1"]);
+    }
+
+    #[test]
+    fn store_read_error_fails_closed() {
+        let (s, id) = setup();
+        s.conn.execute("DROP TABLE repos", []).unwrap();
+        let r = eval(&s, id, true);
+        assert!(r[0].starts_with("couldn't read PRs:"), "{r:?}");
     }
 
     #[test]
