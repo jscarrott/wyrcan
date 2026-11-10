@@ -107,10 +107,15 @@ pub fn run(repo_root: &Path, claude: &Path) -> Result<()> {
     };
     let new = merge_hooks(old.clone(), &script);
     if new != old {
+        // Copy, not move: a failed write below must still leave settings.json in place.
         if settings_path.exists() {
-            backup(&claude, &settings_path)?;
+            let dest = backup_path(&claude, &settings_path, now());
+            std::fs::create_dir_all(dest.parent().unwrap())?;
+            std::fs::copy(&settings_path, &dest).context("backing up settings.json")?;
         }
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&new)? + "\n")?;
+        let tmp = settings_path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(&new)? + "\n")?;
+        std::fs::rename(&tmp, &settings_path).context("replacing settings.json")?;
         println!("updated {}", settings_path.display());
     }
     Ok(())
@@ -139,6 +144,23 @@ mod tests {
         assert!(run(&root, &claude).is_err());
         assert_eq!(std::fs::read_to_string(claude.join("hooks/claude-board.sh")).unwrap(), "live");
         assert!(!claude.join("backups").exists());
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn run_keeps_settings_key_order_and_backs_up() {
+        let t = std::env::temp_dir().join(format!("cb-order-{}", std::process::id()));
+        let claude = t.join("claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let orig = r#"{"zeta": 1, "alpha": {"y": 1, "b": 2}}"#;
+        std::fs::write(claude.join("settings.json"), orig).unwrap();
+        run(Path::new(env!("CARGO_MANIFEST_DIR")), &claude).unwrap();
+        let out = std::fs::read_to_string(claude.join("settings.json")).unwrap();
+        let pos = |k: &str| out.find(k).unwrap();
+        assert!(pos("zeta") < pos("alpha") && pos("alpha") < pos("hooks") && pos("\"y\"") < pos("\"b\""), "{out}");
+        let backups: Vec<_> = std::fs::read_dir(claude.join("backups/claude-board")).unwrap().collect();
+        let b = backups[0].as_ref().unwrap().path().join("settings.json");
+        assert_eq!(std::fs::read_to_string(b).unwrap(), orig);
         std::fs::remove_dir_all(&t).unwrap();
     }
 
