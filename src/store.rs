@@ -9,7 +9,7 @@ use std::path::Path;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks(
     id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-    kind TEXT NOT NULL DEFAULT 'task', stage TEXT NOT NULL DEFAULT 'queue',
+    kind TEXT NOT NULL DEFAULT 'default', stage TEXT NOT NULL DEFAULT 'queue',
     position REAL NOT NULL DEFAULT 0, dir TEXT, labels TEXT NOT NULL DEFAULT '[]',
     explainer TEXT, todoist_id TEXT, created_at INTEGER NOT NULL, stage_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(

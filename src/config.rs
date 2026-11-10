@@ -71,7 +71,6 @@ impl Config {
         v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
     }
 
-    #[allow(dead_code)] // used by later workstream tasks
     pub fn db_path(&self) -> PathBuf {
         self.state_dir.join("board.db")
     }
@@ -79,10 +78,6 @@ impl Config {
     #[allow(dead_code)] // used by later workstream tasks
     pub fn explainer_dir(&self) -> PathBuf {
         self.state_dir.join("explainers")
-    }
-
-    pub fn hook(&self) -> PathBuf {
-        self.claude_dir.join("hooks/claude-board.sh")
     }
 
     pub fn token(&self) -> anyhow::Result<String> {

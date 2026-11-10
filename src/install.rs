@@ -2,24 +2,28 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// (event, matcher, script args, async, timeout secs)
-pub const HOOKS: &[(&str, Option<&str>, &str, bool, u32)] = &[
-    ("PostToolUse", Some("Edit|Write|MultiEdit|NotebookEdit"), "edit", true, 30),
-    ("Stop", None, "stop", true, 30),
-    ("UserPromptSubmit", None, "state working", false, 5),
-    ("PostToolUse", Some("*"), "state working", false, 5),
-    ("Stop", None, "state waiting", false, 5),
-    ("Notification", Some("permission_prompt|elicitation_dialog"), "state blocked", false, 5),
-    ("SessionEnd", None, "state ended", false, 5),
+/// (Claude hook, matcher, `claude-board hook` event); all sync with a 5 s timeout.
+pub const HOOKS: &[(&str, Option<&str>, &str)] = &[
+    ("UserPromptSubmit", None, "working"),
+    ("PostToolUse", Some("*"), "working"),
+    ("PostToolUse", Some("Edit|Write|MultiEdit|NotebookEdit"), "edit"),
+    ("Stop", None, "waiting"),
+    ("Notification", Some("permission_prompt|elicitation_dialog"), "blocked"),
+    ("SessionEnd", None, "ended"),
 ];
 
+/// Also matches the retired bash hook so old entries are replaced.
 fn is_board(entry: &Value) -> bool {
     entry["hooks"].as_array().is_some_and(|hs| {
-        hs.iter().any(|h| h["command"].as_str().is_some_and(|c| c.contains("claude-board.sh")))
+        hs.iter().any(|h| {
+            h["command"].as_str().is_some_and(|c| {
+                c.contains("claude-board.sh") || c.split_whitespace().next().is_some_and(|b| b.ends_with("/claude-board")) && c.contains(" hook ")
+            })
+        })
     })
 }
 
-pub fn merge_hooks(mut settings: Value, script: &Path) -> Value {
+pub fn merge_hooks(mut settings: Value, bin: &Path) -> Value {
     if !settings["hooks"].is_object() {
         settings["hooks"] = json!({});
     }
@@ -29,12 +33,11 @@ pub fn merge_hooks(mut settings: Value, script: &Path) -> Value {
         list.retain(|e| !is_board(e));
     }
     hooks.retain(|_, v| v.as_array().is_none_or(|a| !a.is_empty()));
-    for (event, matcher, arg, is_async, timeout) in HOOKS {
+    for (event, matcher, arg) in HOOKS {
         let mut entry = json!({"hooks": [{
             "type": "command",
-            "command": format!("bash {} {arg}", script.display()),
-            "timeout": timeout,
-            "async": is_async,
+            "command": format!("{} hook {arg}", bin.display()),
+            "timeout": 5,
         }]});
         if let Some(m) = matcher {
             entry["matcher"] = json!(m);
@@ -78,17 +81,21 @@ fn symlink(claude: &Path, target: &Path, link: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run(repo_root: &Path, claude: &Path) -> Result<()> {
+pub fn run(repo_root: &Path, claude: &Path, bin_dir: &Path) -> Result<()> {
     let root = repo_root.canonicalize()?;
-    // Validate before touching anything under the target dir.
-    for need in ["hooks/claude-board.sh", "skills"] {
-        anyhow::ensure!(root.join(need).exists(), "{} not found in {}", need, root.display());
-    }
+    // Validate before touching anything under the target dirs.
+    anyhow::ensure!(root.join("skills").exists(), "skills not found in {}", root.display());
     let claude = claude.to_path_buf();
-    let script = claude.join("hooks/claude-board.sh");
-    std::fs::create_dir_all(claude.join("hooks"))?;
+    let bin = bin_dir.join("claude-board");
+    std::fs::create_dir_all(bin_dir)?;
     std::fs::create_dir_all(claude.join("skills"))?;
-    symlink(&claude, &root.join("hooks/claude-board.sh"), &script)?;
+    symlink(&claude, &root.join("target/release/claude-board"), &bin)?;
+    // The bash hook is gone; its link would dangle.
+    let stale = claude.join("hooks/claude-board.sh");
+    if std::fs::symlink_metadata(&stale).is_ok_and(|m| m.file_type().is_symlink()) {
+        std::fs::remove_file(&stale)?;
+        println!("removed {}", stale.display());
+    }
     let mut skills: Vec<PathBuf> = std::fs::read_dir(root.join("skills"))?
         .collect::<std::io::Result<Vec<_>>>()?
         .into_iter()
@@ -105,7 +112,7 @@ pub fn run(repo_root: &Path, claude: &Path) -> Result<()> {
         Ok(s) => serde_json::from_str(&s).context("parsing settings.json")?,
         Err(_) => json!({}),
     };
-    let new = merge_hooks(old.clone(), &script);
+    let new = merge_hooks(old.clone(), &bin);
     if new != old {
         // Copy, not move: a failed write below must still leave settings.json in place.
         if settings_path.exists() {
@@ -118,6 +125,7 @@ pub fn run(repo_root: &Path, claude: &Path) -> Result<()> {
         std::fs::rename(&tmp, &settings_path).context("replacing settings.json")?;
         println!("updated {}", settings_path.display());
     }
+    println!("zellij keybinding: to be defined with the board screen (not installed yet)");
     Ok(())
 }
 
@@ -138,12 +146,10 @@ mod tests {
     fn run_refuses_bad_root_without_touching_target() {
         let t = std::env::temp_dir().join(format!("cb-test-{}", std::process::id()));
         let (root, claude) = (t.join("root"), t.join("claude"));
-        std::fs::create_dir_all(root.join("skills")).unwrap();
-        std::fs::create_dir_all(claude.join("hooks")).unwrap();
-        std::fs::write(claude.join("hooks/claude-board.sh"), "live").unwrap();
-        assert!(run(&root, &claude).is_err());
-        assert_eq!(std::fs::read_to_string(claude.join("hooks/claude-board.sh")).unwrap(), "live");
-        assert!(!claude.join("backups").exists());
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&claude).unwrap();
+        assert!(run(&root, &claude, &t.join("bin")).is_err());
+        assert!(!claude.join("skills").exists() && !t.join("bin").exists());
         std::fs::remove_dir_all(&t).unwrap();
     }
 
@@ -154,7 +160,7 @@ mod tests {
         std::fs::create_dir_all(&claude).unwrap();
         let orig = r#"{"zeta": 1, "alpha": {"y": 1, "b": 2}}"#;
         std::fs::write(claude.join("settings.json"), orig).unwrap();
-        run(Path::new(env!("CARGO_MANIFEST_DIR")), &claude).unwrap();
+        run(Path::new(env!("CARGO_MANIFEST_DIR")), &claude, &t.join("bin")).unwrap();
         let out = std::fs::read_to_string(claude.join("settings.json")).unwrap();
         let pos = |k: &str| out.find(k).unwrap();
         assert!(pos("zeta") < pos("alpha") && pos("alpha") < pos("hooks") && pos("\"y\"") < pos("\"b\""), "{out}");
@@ -164,19 +170,19 @@ mod tests {
         std::fs::remove_dir_all(&t).unwrap();
     }
 
-    const P: &str = "/h/.claude-work/hooks/claude-board.sh";
+    const P: &str = "/h/.local/bin/claude-board";
 
     #[test]
     fn merge_adds_hooks_to_empty() {
         let v = merge_hooks(json!({}), Path::new(P));
-        let e = &v["hooks"]["PostToolUse"][0];
+        let e = &v["hooks"]["PostToolUse"][1];
         assert_eq!(e["matcher"], "Edit|Write|MultiEdit|NotebookEdit");
-        assert_eq!(e["hooks"][0]["command"], format!("bash {P} edit"));
-        assert_eq!(e["hooks"][0]["async"], true);
-        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], format!("bash {P} stop"));
-        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["command"], format!("bash {P} state waiting"));
-        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["timeout"], 5);
+        assert_eq!(e["hooks"][0]["command"], format!("{P} hook edit"));
+        assert_eq!(e["hooks"][0]["timeout"], 5);
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], format!("{P} hook waiting"));
         assert_eq!(v["hooks"]["Notification"][0]["matcher"], "permission_prompt|elicitation_dialog");
+        let n: usize = v["hooks"].as_object().unwrap().values().map(|l| l.as_array().unwrap().len()).sum();
+        assert_eq!(n, HOOKS.len());
     }
 
     #[test]
@@ -198,11 +204,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_replaces_stale_board_entries() {
-        let stale = json!({"hooks":[{"type":"command","command":"bash /old/claude-board.sh edit"}]});
-        let s = json!({"hooks":{"Stop":[stale]}});
+    fn merge_replaces_old_bash_entries() {
+        let old = |a: &str| json!({"hooks":[{"type":"command","command":format!("bash /old/hooks/claude-board.sh {a}")}]});
+        let s = json!({"hooks":{"Stop":[old("stop"), old("state waiting")]}});
         let v = merge_hooks(s, Path::new(P));
-        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 2);
-        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], format!("bash {P} stop"));
+        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], format!("{P} hook waiting"));
+        assert!(!v.to_string().contains("claude-board.sh"));
     }
 }

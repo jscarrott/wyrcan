@@ -2,6 +2,7 @@ mod app;
 mod board;
 mod config;
 mod gate;
+mod hook;
 mod install;
 mod model;
 mod state;
@@ -22,10 +23,14 @@ fn main() -> Result<()> {
         Some("install") => {
             let dir = config::Config::from_env().claude_dir;
             println!("installing into {}", dir.display());
-            install::run(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &dir)
+            install::run(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &dir, &config::home().join(".local/bin"))
+        }
+        Some("hook") => {
+            hook::run(&std::env::args().nth(2).unwrap_or_default(), &config::Config::from_env());
+            Ok(())
         }
         None => tui(),
-        _ => anyhow::bail!("usage: claude-board [install]"),
+        _ => anyhow::bail!("usage: claude-board [install | hook <event>]"),
     }
 }
 
@@ -73,7 +78,6 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, client: Arc<to
         client,
         cwd: std::env::current_dir().context("cwd")?.to_string_lossy().into_owned(),
         claude_dir: cfg.claude_dir.to_string_lossy().into_owned(),
-        hook: cfg.hook(),
         refresh: refresh_tx,
         upd: upd_tx,
     };
@@ -121,7 +125,6 @@ struct Ctx {
     client: Arc<todoist::Client>,
     cwd: String,
     claude_dir: String,
-    hook: std::path::PathBuf,
     refresh: mpsc::Sender<()>,
     upd: mpsc::Sender<Update>,
 }
@@ -161,16 +164,10 @@ fn handle(e: Effect, ctx: &Ctx) -> Result<()> {
                 .spawn()
                 .context("running xdg-open")?;
         }
-        Effect::Complete { task_id, session } => {
-            let hook = ctx.hook.to_string_lossy().into_owned();
-            background(ctx, true, move |c| {
-                c.complete(&task_id)?;
-                if let Some(s) = session {
-                    zellij::run(&[hook, "close".into(), s])?;
-                }
-                Ok(Box::new(|_| {}))
-            });
-        }
+        Effect::Complete { task_id, .. } => background(ctx, true, move |c| {
+            c.complete(&task_id)?;
+            Ok(Box::new(|_| {}))
+        }),
         Effect::Move { task_id, section_id } => background(ctx, true, move |c| {
             c.move_task(&task_id, &section_id)?;
             Ok(Box::new(|_| {}))
