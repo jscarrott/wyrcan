@@ -97,7 +97,15 @@ fn handle(e: Effect, client: &todoist::Client, cwd: &str, refresh: &mpsc::Sender
         Effect::Jump(zellij::Jump::Focus(pane)) => zellij::run(&zellij::focus_cmd(&pane))?,
         Effect::Jump(_) | Effect::Quit => {}
         Effect::OpenInTodoist(id) => {
-            zellij::run(&["xdg-open".into(), format!("https://app.todoist.com/app/task/{id}")])?
+            // Detached: Command::output() would block until the browser closes its inherited pipes.
+            // shortcut: the child is never waited on (zombie until exit), fine for a short-lived TUI.
+            std::process::Command::new("xdg-open")
+                .arg(format!("https://app.todoist.com/app/task/{id}"))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .context("running xdg-open")?;
         }
         Effect::Complete { task_id, session } => {
             client.complete(&task_id)?;
