@@ -6,6 +6,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Claude Code config dir: hooks, skills and settings.json live here.
     pub claude_dir: PathBuf,
+    #[allow(dead_code)] // read by later workstream tasks
+    /// Cap on tasks in the Active stage.
+    pub max_active: usize,
 }
 
 pub fn home() -> PathBuf {
@@ -54,7 +57,18 @@ impl Config {
                 .or_else(|| file_value(&file, "claude_dir"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home().join(".claude")),
+            max_active: file_value(&file, "max_active").and_then(|v| v.parse().ok()).unwrap_or(3),
         }
+    }
+
+    #[allow(dead_code)] // used by later workstream tasks
+    pub fn db_path(&self) -> PathBuf {
+        self.state_dir.join("board.db")
+    }
+
+    #[allow(dead_code)] // used by later workstream tasks
+    pub fn explainer_dir(&self) -> PathBuf {
+        self.state_dir.join("explainers")
     }
 
     pub fn hook(&self) -> PathBuf {
@@ -80,5 +94,6 @@ mod tests {
         assert_eq!(file_value(t, "missing"), None);
         let tilde = file_value("claude_dir = \"~/.claude-work\"", "claude_dir").unwrap();
         assert_eq!(PathBuf::from(tilde), home().join(".claude-work"));
+        assert_eq!(file_value("max_active = 5", "max_active").and_then(|v| v.parse::<usize>().ok()), Some(5));
     }
 }
