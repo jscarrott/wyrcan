@@ -7,6 +7,8 @@ mod state;
 #[allow(dead_code)]
 mod todoist;
 mod install;
+#[allow(dead_code)]
+mod zellij;
 
 fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
