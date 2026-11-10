@@ -34,9 +34,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     // Another process may have migrated while we waited for the lock.
     let r = (|| -> Result<()> {
         if version(conn)? < 2 {
+            // An older binary resets user_version on every open, so trust the schema, not the number.
+            let has: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info('tasks') WHERE name='synced_stage'", [], |r| r.get(0))?;
+            if has == 0 {
+                conn.execute_batch("ALTER TABLE tasks ADD COLUMN synced_stage TEXT")?;
+            }
             conn.execute_batch(
-                "ALTER TABLE tasks ADD COLUMN synced_stage TEXT;
-                 CREATE UNIQUE INDEX IF NOT EXISTS tasks_todoist_id ON tasks(todoist_id) WHERE todoist_id IS NOT NULL;
+                "CREATE UNIQUE INDEX IF NOT EXISTS tasks_todoist_id ON tasks(todoist_id) WHERE todoist_id IS NOT NULL;
                  PRAGMA user_version = 2;",
             )?;
         }
@@ -602,5 +606,29 @@ mod tests {
         mk(None).unwrap();
         mk(Some("a")).unwrap();
         assert!(mk(Some("a")).is_err());
+    }
+
+    #[test]
+    fn v2_database_reset_to_v1_by_an_old_binary_still_opens() {
+        let dir = std::env::temp_dir().join(format!("cb-reset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("board.db");
+        drop(Store::open(&path).unwrap());
+        Connection::open(&path).unwrap().execute_batch("PRAGMA user_version = 1").unwrap();
+        let s = Store::open(&path).unwrap();
+        assert_eq!(version(&s), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_v1_file_both_succeed() {
+        let dir = std::env::temp_dir().join(format!("cb-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = v1_db(&dir);
+        let hs: Vec<_> = (0..2).map(|_| { let p = path.clone(); std::thread::spawn(move || Store::open(&p).map(|s| version(&s))) }).collect();
+        for h in hs {
+            assert_eq!(h.join().unwrap().unwrap(), 2);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
