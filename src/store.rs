@@ -306,7 +306,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(dead_code)] // PR polling, Task 8
     pub fn set_pr_state(&self, task_id: i64, root: &str, state: PrState, reviewers: &str) -> Result<bool> {
         let changed = self.conn.execute(
             "UPDATE prs SET state=?3, reviewers=?4 WHERE task_id=?1 AND root=?2 AND (state!=?3 OR reviewers!=?4)",

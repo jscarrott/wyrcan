@@ -8,17 +8,6 @@ use serde_json::{json, Value};
 
 const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. | next | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] | drop TASK_ID | export";
 
-// Task 8 moves this to pr.rs.
-pub fn pr_exists(url: &str) -> bool {
-    std::process::Command::new("gh")
-        .args(["pr", "view", url])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
 pub fn run(args: &[String], cfg: &Config) -> Result<i32> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     if !matches!(a.first(), Some(&("add" | "next" | "claim" | "register-pen" | "status" | "gate" | "drop" | "export"))) {
@@ -27,7 +16,7 @@ pub fn run(args: &[String], cfg: &Config) -> Result<i32> {
     }
     std::fs::create_dir_all(&cfg.state_dir)?;
     let store = Store::open(&cfg.db_path())?;
-    let (code, text) = match exec(&store, &a, cfg, &pr_exists) {
+    let (code, text) = match exec(&store, &a, cfg, &crate::pr::exists) {
         Ok(v) => v,
         Err(e) if e.downcast_ref::<Usage>().is_some() => (2, format!("{e}\n{USAGE}")),
         Err(e) => return Err(e),

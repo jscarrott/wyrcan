@@ -2,7 +2,7 @@
 use crate::app::{App, CardKey, Effect, Prompt};
 use crate::config::Config;
 use crate::gate::{self, PrVerifier};
-use crate::model::{AgentState, SessionKind, Stage, Task};
+use crate::model::{AgentState, Refusal, SessionKind, Stage, Task};
 use crate::store::{NewTask, Store};
 use crate::zellij::{Runner, Zellij};
 use anyhow::{bail, Context, Result};
@@ -35,6 +35,11 @@ impl Panes {
     }
 }
 
+/// `Store::transition` with the real gate; the board's UI thread and its review worker both come through here.
+pub fn transition(store: &Store, cfg: &Config, id: i64, to: Stage, verify: &PrVerifier) -> Result<Result<(), Refusal>> {
+    store.transition(id, to, cfg.max_active, &|s, t| gate::evaluate(s, t, &cfg.gate_checks(&t.kind), verify))
+}
+
 impl Ctx<'_> {
     fn task(&self, id: i64) -> Result<Task> {
         self.store.task(id)?.context("No such task.")
@@ -42,8 +47,7 @@ impl Ctx<'_> {
 
     /// The one way the board changes a stage; a refusal goes to the footer verbatim.
     fn move_to(&self, id: i64, to: Stage, app: &mut App) -> Result<bool> {
-        let gate = |s: &Store, t: &Task| gate::evaluate(s, t, &self.cfg.gate_checks(&t.kind), self.verify);
-        match self.store.transition(id, to, self.cfg.max_active, &gate)? {
+        match transition(self.store, self.cfg, id, to, self.verify)? {
             Ok(()) => Ok(true),
             Err(r) => {
                 app.message = Some(r.to_string());
