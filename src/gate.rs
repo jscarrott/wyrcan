@@ -1,4 +1,3 @@
-#![allow(dead_code)] // later workstream tasks use these types
 use crate::model::{Pr, PrState, Task};
 use crate::store::Store;
 

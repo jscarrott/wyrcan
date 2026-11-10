@@ -1,86 +1,16 @@
-use crate::state::{AgentRecord, AgentState};
 use crate::model::Session;
 use anyhow::{bail, Context, Result};
 
-#[derive(Debug, PartialEq)]
-pub enum Jump {
-    Focus(String),
-    Resume { session: String, cwd: String },
-    Elsewhere,
-    NoAgent,
-}
-
-pub fn current_session() -> Option<String> {
-    std::env::var_os("ZELLIJ")?;
-    std::env::var("ZELLIJ_SESSION_NAME").ok()
-}
-
-pub fn jump_target(agent: Option<&AgentRecord>, current: Option<&str>) -> Jump {
-    let Some(a) = agent else { return Jump::NoAgent };
-    if a.agent == AgentState::Ended {
-        return Jump::Resume { session: a.session.clone(), cwd: a.cwd.clone() };
-    }
-    match (&a.zellij_pane, &a.zellij_session) {
-        (Some(p), Some(s)) if Some(s.as_str()) == current => Jump::Focus(p.clone()),
-        _ => Jump::Elsewhere,
-    }
-}
-
-/// The pane is started by the zellij server, not us, so the Claude dir is passed explicitly.
-pub fn new_tab_cmd(name: &str, cwd: &str, claude_dir: &str, claude_args: &[&str]) -> Vec<String> {
-    let dir = format!("CLAUDE_CONFIG_DIR={claude_dir}");
-    let mut v: Vec<String> = ["zellij", "action", "new-tab", "-n", name, "-c", cwd, "--", "env", &dir, "claude"]
-        .into_iter()
-        .map(String::from)
-        .collect();
-    v.extend(claude_args.iter().map(|s| s.to_string()));
-    v
-}
-
-pub fn focus_cmd(pane: &str) -> Vec<String> {
-    ["zellij", "action", "focus-pane-id", pane].map(String::from).to_vec()
-}
-
-pub fn back_cmd() -> Vec<String> {
-    ["zellij", "action", "go-to-previous-tab"].map(String::from).to_vec()
-}
-
-pub fn run(cmd: &[String]) -> Result<()> {
-    let (prog, args) = cmd.split_first().context("empty command")?;
-    let out = std::process::Command::new(prog).args(args).output().with_context(|| format!("running {prog}"))?;
-    if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(())
-}
-
-fn spawn_claude_in(current: Option<&str>, name: &str, cwd: &str, claude_dir: &str, args: &[&str]) -> Result<()> {
-    if current.is_none() {
-        bail!("not inside zellij");
-    }
-    run(&new_tab_cmd(name, cwd, claude_dir, args))?;
-    run(&back_cmd())
-}
-
-pub fn spawn_claude(name: &str, cwd: &str, claude_dir: &str, args: &[&str]) -> Result<()> {
-    spawn_claude_in(current_session().as_deref(), name, cwd, claude_dir, args)
-}
-
-// The items below are used by Task 6 (the workstream board); the old TUI above still uses the older ones.
-
 /// shortcut: unverified against a live zellij client; Task 10's run-through must check Alt b.
-#[allow(dead_code)] // used by Task 6
 pub const RETURN_KEYBIND: &str = r#"shared_except "locked" {
     bind "Alt b" { ToggleFocusFullscreen; MoveFocus "Left"; }
 }"#;
 
-#[allow(dead_code)] // used by Task 6
 pub trait Runner {
     /// Runs the command and returns its stdout.
     fn run(&self, cmd: &[String]) -> Result<String>;
 }
 
-#[allow(dead_code)] // used by Task 6
 pub struct ShellRunner;
 
 impl Runner for ShellRunner {
@@ -94,7 +24,6 @@ impl Runner for ShellRunner {
     }
 }
 
-#[allow(dead_code)] // used by Task 6
 pub struct Zellij {
     pub session: Option<String>,
     pub board_pane: Option<String>,
@@ -104,7 +33,6 @@ fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
-#[allow(dead_code)] // used by Task 6
 impl Zellij {
     pub fn from_env() -> Zellij {
         let inside = std::env::var_os("ZELLIJ").is_some();
@@ -112,7 +40,8 @@ impl Zellij {
         Zellij { session: var("ZELLIJ_SESSION_NAME"), board_pane: var("ZELLIJ_PANE_ID").map(|n| format!("terminal_{n}")) }
     }
 
-    fn board(&self) -> Result<&str> {
+    /// The board's pane; errors "not inside zellij" when there's none.
+    pub fn board(&self) -> Result<&str> {
         match (&self.session, &self.board_pane) {
             (Some(_), Some(b)) => Ok(b),
             _ => bail!("not inside zellij"),
@@ -164,6 +93,9 @@ impl Zellij {
         run.push("--".into());
         run.extend_from_slice(cmd);
         let id = r.run(&run)?.trim().to_string();
+        if id.is_empty() {
+            bail!("zellij run returned no pane id");
+        }
         if !stack.is_empty() {
             let mut sp = argv(&["zellij", "action", "stack-panes", "--"]);
             sp.extend(stack.iter().cloned());
@@ -205,67 +137,6 @@ impl Zellij {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Kind;
-
-    fn rec(agent: AgentState, session: Option<&str>, pane: Option<&str>) -> AgentRecord {
-        AgentRecord {
-            session: "sid".into(),
-            cwd: "/w".into(),
-            task: None,
-            kind: Kind::Task,
-            agent,
-            state_at: 0,
-            zellij_session: session.map(Into::into),
-            zellij_pane: pane.map(Into::into),
-            repos: vec![],
-        }
-    }
-
-    #[test]
-    fn jump_focus_same_session() {
-        let a = rec(AgentState::Working, Some("s"), Some("terminal_3"));
-        assert_eq!(jump_target(Some(&a), Some("s")), Jump::Focus("terminal_3".into()));
-    }
-
-    #[test]
-    fn jump_elsewhere_other_session() {
-        let a = rec(AgentState::Working, Some("s"), Some("terminal_3"));
-        assert_eq!(jump_target(Some(&a), Some("o")), Jump::Elsewhere);
-        assert_eq!(jump_target(Some(&a), None), Jump::Elsewhere);
-    }
-
-    #[test]
-    fn jump_elsewhere_no_pane() {
-        let a = rec(AgentState::Waiting, Some("s"), None);
-        assert_eq!(jump_target(Some(&a), Some("s")), Jump::Elsewhere);
-    }
-
-    #[test]
-    fn jump_resume_when_ended() {
-        let a = rec(AgentState::Ended, Some("s"), Some("terminal_3"));
-        assert_eq!(jump_target(Some(&a), Some("s")), Jump::Resume { session: "sid".into(), cwd: "/w".into() });
-    }
-
-    #[test]
-    fn jump_no_agent() {
-        assert_eq!(jump_target(None, Some("s")), Jump::NoAgent);
-    }
-
-    #[test]
-    fn new_tab_cmd_shape() {
-        let want: Vec<String> =
-            ["zellij", "action", "new-tab", "-n", "next", "-c", "/home/x", "--", "env", "CLAUDE_CONFIG_DIR=/c", "claude", "/next"]
-                .map(String::from)
-                .to_vec();
-        assert_eq!(new_tab_cmd("next", "/home/x", "/c", &["/next"]), want);
-    }
-
-    #[test]
-    fn outside_zellij_is_refused() {
-        let e = spawn_claude_in(None, "n", "/", "/c", &[]).unwrap_err();
-        assert!(e.to_string().contains("not inside zellij"));
-    }
-
     use crate::model::{AgentState as MAgent, Session, SessionKind};
     use std::cell::RefCell;
 
@@ -325,6 +196,14 @@ mod tests {
         assert_eq!(c[0], format!("zellij run --name {} --cwd /w --no-focus -- env CLAUDE_CONFIG_DIR=/c claude", "n".repeat(30)));
         assert_eq!(c[1], "zellij action stack-panes -- terminal_1 terminal_2 terminal_5");
         assert_eq!(c[2], "zellij action focus-pane-id terminal_0");
+    }
+
+    #[test]
+    fn open_without_pane_id_fails_before_stacking() {
+        let r = Rec(Default::default(), "\n".into());
+        let e = zj().open(&r, "t", "/w", "/c", &[], &["terminal_1".into()]).unwrap_err();
+        assert_eq!(e.to_string(), "zellij run returned no pane id");
+        assert_eq!(r.calls().len(), 1);
     }
 
     #[test]

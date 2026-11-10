@@ -1,4 +1,4 @@
-use crate::board::SectionIds;
+#![allow(dead_code)] // used by Task 9 sync
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
 use std::time::Duration;
@@ -16,6 +16,12 @@ pub struct Task {
     pub child_order: i64,
 }
 
+pub struct SectionIds {
+    pub up_next: String,
+    pub in_progress: String,
+    pub needs_review: String,
+}
+
 #[derive(Deserialize)]
 struct Page<T> {
     results: Vec<T>,
@@ -27,7 +33,6 @@ fn parse<T: serde::de::DeserializeOwned>(body: &str) -> anyhow::Result<(Vec<T>, 
     Ok((p.results, p.next_cursor))
 }
 
-#[allow(dead_code)] // only exercised by tests
 pub fn parse_page(body: &str) -> anyhow::Result<(Vec<Task>, Option<String>)> {
     parse(body)
 }

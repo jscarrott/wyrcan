@@ -1,0 +1,438 @@
+//! Carries out the app's effects: stage changes (always through `Store::transition`) and zellij panes.
+use crate::app::{App, CardKey, Effect, Prompt};
+use crate::config::Config;
+use crate::gate::{self, PrVerifier};
+use crate::model::{AgentState, SessionKind, Stage, Task};
+use crate::store::{NewTask, Store};
+use crate::zellij::{Runner, Zellij};
+use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
+
+pub struct Ctx<'a> {
+    pub store: &'a Store,
+    pub cfg: &'a Config,
+    pub zj: &'a Zellij,
+    pub run: &'a dyn Runner,
+    pub verify: &'a PrVerifier,
+    /// Where pen sessions start.
+    pub cwd: &'a str,
+}
+
+/// What the board knows about zellij panes between effects.
+pub struct Panes {
+    /// The latest `list-panes` result.
+    live: Vec<String>,
+    /// Panes opened for tasks whose session hasn't reported its pane yet.
+    opened: HashMap<i64, String>,
+    /// Board start: the tick only closes panes of streams that left Active after it,
+    /// so a pane id reused after a zellij restart is never closed for a stale session.
+    since: i64,
+}
+
+impl Panes {
+    pub fn new(since: i64) -> Panes {
+        Panes { live: vec![], opened: HashMap::new(), since }
+    }
+}
+
+impl Ctx<'_> {
+    fn task(&self, id: i64) -> Result<Task> {
+        self.store.task(id)?.context("No such task.")
+    }
+
+    /// The one way the board changes a stage; a refusal goes to the footer verbatim.
+    fn move_to(&self, id: i64, to: Stage, app: &mut App) -> Result<bool> {
+        let gate = |s: &Store, t: &Task| gate::evaluate(s, t, &self.cfg.gate_checks(&t.kind), self.verify);
+        match self.store.transition(id, to, self.cfg.max_active, &gate)? {
+            Ok(()) => Ok(true),
+            Err(r) => {
+                app.message = Some(r.to_string());
+                Ok(false)
+            }
+        }
+    }
+
+    fn refresh(&self, p: &mut Panes) -> Result<()> {
+        p.live = self.zj.live_panes(self.run)?;
+        let live = &p.live;
+        p.opened.retain(|_, x| live.contains(x));
+        Ok(())
+    }
+
+    /// The task's pane, if it's in the latest `live`: its current session's, else the one we opened for it.
+    fn pane(&self, p: &Panes, id: i64) -> Result<Option<String>> {
+        let s = self.store.current_session(id)?;
+        if let Some(x) = s.as_ref().and_then(|s| self.zj.pane_of(s, &p.live)) {
+            return Ok(Some(x.to_string()));
+        }
+        Ok(p.opened.get(&id).filter(|x| p.live.contains(x)).cloned())
+    }
+
+    fn live_pane(&self, p: &mut Panes, id: i64) -> Result<String> {
+        self.refresh(p)?;
+        self.pane(p, id)?.context("No live session. Resume it first.")
+    }
+
+    /// Live panes of streams and pen sessions, which new panes join.
+    fn stack(&self, p: &Panes) -> Result<Vec<String>> {
+        let ours = self.store.sessions()?;
+        let ours = ours.iter().filter(|s| s.task_id.is_some() || s.kind == SessionKind::Pen);
+        let mut v: Vec<String> = ours.filter_map(|s| self.zj.pane_of(s, &p.live)).map(String::from).chain(p.opened.values().cloned()).collect();
+        v.retain(|x| Some(x.as_str()) != self.zj.board_pane.as_deref());
+        v.sort();
+        v.dedup();
+        Ok(v)
+    }
+
+    fn claude_dir(&self) -> String {
+        self.cfg.claude_dir.to_string_lossy().into_owned()
+    }
+}
+
+/// Runs effects in order; the first error goes to the footer and drops the rest. True means quit.
+pub fn run_all(effects: Vec<Effect>, c: &Ctx, p: &mut Panes, app: &mut App) -> bool {
+    for e in effects {
+        if e == Effect::Quit {
+            return true;
+        }
+        if let Err(err) = handle(e, c, p, app) {
+            app.message = Some(format!("{err:#}"));
+            break;
+        }
+    }
+    false
+}
+
+pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
+    match e {
+        Effect::Start(id) => open(c, p, app, id, false)?,
+        Effect::Resume(id) => open(c, p, app, id, true)?,
+        Effect::SetDir { id, dir } => {
+            let dir = match dir.strip_prefix("~/") {
+                Some(rest) => crate::config::home().join(rest).to_string_lossy().into_owned(),
+                None => dir,
+            };
+            if !std::path::Path::new(&dir).is_dir() {
+                bail!("No such directory: {dir}");
+            }
+            let t = c.task(id)?;
+            c.store.update_task(id, &t.title, &t.description, Some(&dir), &t.labels)?;
+        }
+        Effect::Park(id) => {
+            // Parking works outside zellij too; there's just no pane to close.
+            if c.move_to(id, Stage::Parked, app)? && c.zj.board().is_ok() {
+                if let Ok(x) = c.live_pane(p, id) {
+                    c.zj.close(c.run, &x)?;
+                }
+            }
+        }
+        Effect::Requeue(id) => _ = c.move_to(id, Stage::Queue, app)?,
+        Effect::ToReview(id) => _ = c.move_to(id, Stage::Review, app)?,
+        Effect::Done(id) => _ = c.move_to(id, Stage::Done, app)?,
+        Effect::Drop(id) => _ = c.move_to(id, Stage::Dropped, app)?,
+        Effect::Adopt { session, title } => {
+            let s = c.store.session(&session)?.context("That session is gone.")?;
+            let id = c.store.add_task(NewTask { title: &title, description: "", dir: Some(&s.cwd), labels: &[], todoist_id: None })?;
+            if !c.move_to(id, Stage::Active, app)? {
+                c.store.delete_task(id)?;
+                return Ok(());
+            }
+            c.store.link_session(&session, id, &s.cwd)?;
+            app.selected = Some(CardKey::Task(id));
+        }
+        Effect::Show(id) => {
+            // Moving through the list outside zellij, or onto a card without a pane, is fine.
+            if c.zj.board().is_ok() {
+                if let Ok(x) = c.live_pane(p, id) {
+                    c.zj.show(c.run, &x)?;
+                }
+            }
+        }
+        Effect::Enter(id) => c.zj.enter(c.run, &c.live_pane(p, id)?)?,
+        Effect::Fullscreen(id) => c.zj.fullscreen(c.run, &c.live_pane(p, id)?)?,
+        Effect::ToggleBoardWide => c.zj.toggle_board_fullscreen(c.run)?,
+        Effect::Wrap(id) => {
+            c.zj.type_line(c.run, &c.live_pane(p, id)?, "/wrap")?;
+            app.message = Some("Asked it to wrap up.".into());
+        }
+        Effect::SpawnPen => {
+            c.refresh(p)?;
+            c.zj.open(c.run, "pen", c.cwd, &c.claude_dir(), &["/pen"], &c.stack(p)?)?;
+        }
+        Effect::OpenExplainer(id) => xdg_open(&c.task(id)?.explainer.context("No explainer yet.")?)?,
+        Effect::OpenPr(id) => {
+            let urls: Vec<String> = c.store.prs(id)?.into_iter().filter_map(|p| p.url).collect();
+            if urls.is_empty() {
+                bail!("No PR yet.");
+            }
+            for u in urls {
+                xdg_open(&u)?;
+            }
+        }
+        Effect::Add { title, dir, labels } => {
+            c.store.add_task(NewTask { title: &title, description: "", dir: dir.as_deref(), labels: &labels, todoist_id: None })?;
+        }
+        Effect::Quit => {}
+    }
+    Ok(())
+}
+
+/// Start (`/next <id>`) or resume (`--resume <session>`) a stream in a new pane beside the board.
+fn open(c: &Ctx, p: &mut Panes, app: &mut App, id: i64, resume: bool) -> Result<()> {
+    let t = c.task(id)?;
+    let session = c.store.current_session(id)?.filter(|_| resume);
+    // A resumed session has to run where it was started.
+    let cwd = session.as_ref().map(|s| s.cwd.clone()).filter(|d| !d.is_empty()).or(t.dir.clone());
+    let Some(cwd) = cwd else {
+        let mut dirs: Vec<Task> = c.store.tasks()?.into_iter().filter(|o| o.id != id && o.dir.is_some()).collect();
+        dirs.sort_by_key(|o| -o.stage_at);
+        let recent = dirs.into_iter().next().and_then(|o| o.dir).unwrap_or_default();
+        app.prompt = Some(Prompt::dir(id, resume, &t.title, recent));
+        return Ok(());
+    };
+    // Checked before the stage changes, so a board outside zellij can't start what it can't open.
+    c.zj.board()?;
+    if t.stage != Stage::Active && !c.move_to(id, Stage::Active, app)? {
+        return Ok(());
+    }
+    c.refresh(p)?;
+    if let Some(x) = c.pane(p, id)? {
+        return c.zj.show(c.run, &x);
+    }
+    let next = format!("/next {id}");
+    let args = match &session {
+        Some(s) => vec!["--resume", s.id.as_str()],
+        None => vec![next.as_str()],
+    };
+    let x = c.zj.open(c.run, &t.title, &cwd, &c.claude_dir(), &args, &c.stack(p)?)?;
+    p.opened.insert(id, x.clone());
+    p.live.push(x);
+    Ok(())
+}
+
+/// Detached: Command::output() would block until the browser closes its inherited pipes.
+// shortcut: the child is never waited on (zombie until exit), fine for a short-lived TUI.
+fn xdg_open(target: &str) -> Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("running xdg-open")?;
+    Ok(())
+}
+
+/// Every second: refresh the live panes and close the panes of streams that left Active, once their agent isn't working.
+pub fn tick(c: &Ctx, p: &mut Panes) -> Result<()> {
+    if c.zj.board().is_err() {
+        return Ok(());
+    }
+    c.refresh(p)?;
+    let sessions = c.store.sessions()?;
+    for t in c.store.tasks()?.iter().filter(|t| t.stage != Stage::Active && t.stage_at >= p.since) {
+        let Some(s) = sessions.iter().find(|s| s.task_id == Some(t.id) && s.current) else { continue };
+        if s.state == AgentState::Working {
+            continue;
+        }
+        // pane_of confirms the pane is live and in this zellij session.
+        if let Some(x) = c.zj.pane_of(s, &p.live).filter(|x| Some(*x) != c.zj.board_pane.as_deref()) {
+            c.zj.close(c.run, x)?;
+            p.live.retain(|l| l != x);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{add, app, cfg, session};
+    use crate::store::SessionUpdate;
+    use std::cell::RefCell;
+
+    /// Records every command; `list-panes` answers with `live`, `zellij run` with "terminal_9".
+    struct Rec {
+        calls: RefCell<Vec<String>>,
+        live: Vec<&'static str>,
+    }
+    impl Runner for Rec {
+        fn run(&self, cmd: &[String]) -> Result<String> {
+            let line = cmd.join(" ");
+            self.calls.borrow_mut().push(line.clone());
+            Ok(if line.ends_with("list-panes") {
+                self.live.iter().map(|p| format!("{p} terminal x\n")).collect()
+            } else if line.starts_with("zellij run") {
+                "terminal_9\n".into()
+            } else {
+                String::new()
+            })
+        }
+    }
+    fn rec(live: &[&'static str]) -> Rec {
+        Rec { calls: RefCell::new(vec![]), live: live.to_vec() }
+    }
+    fn inside() -> Zellij {
+        Zellij { session: Some("z".into()), board_pane: Some("terminal_0".into()) }
+    }
+    fn ctx<'a>(s: &'a Store, c: &'a Config, zj: &'a Zellij, r: &'a Rec) -> Ctx<'a> {
+        Ctx { store: s, cfg: c, zj, run: r, verify: &|_| true, cwd: "/home" }
+    }
+    fn stage(s: &Store, id: i64) -> Stage {
+        s.task(id).unwrap().unwrap().stage
+    }
+    /// Puts session `sid` of task `id` in zellij session "z", pane `pane`.
+    fn pane(s: &Store, sid: &str, pane: &str, state: AgentState) {
+        s.touch_session(SessionUpdate { id: sid, cwd: "/w", state, zellij_session: Some("z"), zellij_pane: Some(pane) }, false).unwrap();
+    }
+
+    #[test]
+    fn start_at_cap_is_refused_and_opens_nothing() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(1), inside(), rec(&[]));
+        add(&s, "busy", Stage::Active);
+        let q = add(&s, "next", Stage::Queue);
+        let mut ap = app(&s, &c);
+        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert!(r.calls.borrow().is_empty(), "{:?}", r.calls.borrow());
+        assert_eq!(ap.message.as_deref(), Some("All 1 active slots are in use. Park or finish a stream first."));
+        assert_eq!(stage(&s, q), Stage::Queue);
+    }
+
+    #[test]
+    fn start_outside_zellij_says_so_and_changes_nothing() {
+        let (s, c, r) = (Store::open_in_memory(), cfg(3), rec(&[]));
+        let zj = Zellij { session: None, board_pane: None };
+        let q = add(&s, "next", Stage::Queue);
+        let mut ap = app(&s, &c);
+        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert_eq!(ap.message.as_deref(), Some("not inside zellij"));
+        assert_eq!(stage(&s, q), Stage::Queue);
+        assert!(r.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn start_opens_a_pane_and_remembers_it() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&["terminal_0", "terminal_9"]));
+        let q = add(&s, "next", Stage::Queue);
+        let mut ap = app(&s, &c);
+        let mut p = Panes::new(0);
+        assert!(!run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap));
+        assert_eq!(stage(&s, q), Stage::Active);
+        assert!(r.calls.borrow().iter().any(|l| l.ends_with(&format!("--direction right -- env CLAUDE_CONFIG_DIR=/c claude /next {q}"))));
+        // The session hasn't reported its pane yet, but Enter already finds it.
+        r.calls.borrow_mut().clear();
+        run_all(vec![Effect::Enter(q)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
+        assert_eq!(r.calls.borrow().last().unwrap(), "zellij action focus-pane-id terminal_9");
+    }
+
+    #[test]
+    fn start_without_dir_asks_for_one() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&["terminal_0", "terminal_9"]));
+        let q = s.add_task(NewTask { title: "t", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        let mut ap = app(&s, &c);
+        let mut p = Panes::new(0);
+        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
+        assert_eq!(ap.prompt.as_ref().unwrap().label, "Directory for 't':");
+        assert_eq!(stage(&s, q), Stage::Queue);
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        run_all(vec![Effect::SetDir { id: q, dir: dir.clone() }, Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
+        assert_eq!(s.task(q).unwrap().unwrap().dir.as_deref(), Some(dir.as_str()));
+        assert_eq!(stage(&s, q), Stage::Active);
+    }
+
+    #[test]
+    fn move_right_from_active_hits_the_gate() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&[]));
+        let id = add(&s, "a", Stage::Active);
+        let mut ap = app(&s, &c);
+        let e = ap.on_key_event(crate::app::tests::key('L'));
+        run_all(e, &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert_eq!(ap.message.as_deref(), Some("Not ready for review: no explainer"));
+        assert_eq!(stage(&s, id), Stage::Active);
+    }
+
+    #[test]
+    fn move_right_from_review_needs_merge() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&[]));
+        let id = add(&s, "a", Stage::Review);
+        s.set_pr(id, "/r/app", Some("u"), None).unwrap();
+        s.set_pr_state(id, "/r/app", crate::model::PrState::Waiting, "").unwrap();
+        let mut ap = app(&s, &c);
+        let e = ap.on_key_event(crate::app::tests::key('L'));
+        assert_eq!(e, [Effect::Done(id)]);
+        run_all(e, &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert_eq!(ap.message.as_deref(), Some("Not merged yet. Drop it if you want to abandon it."));
+        assert_eq!(stage(&s, id), Stage::Review);
+    }
+
+    #[test]
+    fn adopt_links_or_is_refused_at_the_cap() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(1), inside(), rec(&[]));
+        session(&s, "u1", None, AgentState::Waiting);
+        let mut ap = app(&s, &c);
+        let adopt = || vec![Effect::Adopt { session: "u1".into(), title: "proj".into() }];
+        run_all(adopt(), &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        let t = s.tasks().unwrap();
+        assert_eq!((t.len(), t[0].stage, t[0].title.as_str(), t[0].dir.as_deref()), (1, Stage::Active, "proj", Some("/w/proj")));
+        assert_eq!(s.session("u1").unwrap().unwrap().task_id, Some(t[0].id));
+        // Full now: a second adopt adds nothing.
+        session(&s, "u2", None, AgentState::Waiting);
+        run_all(vec![Effect::Adopt { session: "u2".into(), title: "x".into() }], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert_eq!(ap.message.as_deref(), Some("All 1 active slots are in use. Park or finish a stream first."));
+        assert_eq!(s.tasks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn park_closes_the_live_pane() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&["terminal_0", "terminal_4"]));
+        let id = add(&s, "a", Stage::Active);
+        session(&s, "s1", Some(id), AgentState::Waiting);
+        pane(&s, "s1", "terminal_4", AgentState::Waiting);
+        let mut ap = app(&s, &c);
+        run_all(vec![Effect::Park(id)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert_eq!(stage(&s, id), Stage::Parked);
+        assert_eq!(r.calls.borrow().last().unwrap(), "zellij action close-pane --pane-id terminal_4");
+    }
+
+    #[test]
+    fn wrap_types_into_the_pane_or_says_why_not() {
+        let (s, c, zj) = (Store::open_in_memory(), cfg(3), inside());
+        let id = add(&s, "a", Stage::Active);
+        session(&s, "s1", Some(id), AgentState::Waiting);
+        pane(&s, "s1", "terminal_4", AgentState::Waiting);
+        let mut ap = app(&s, &c);
+        let gone = rec(&["terminal_0"]);
+        run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &gone), &mut Panes::new(0), &mut ap);
+        assert_eq!(ap.message.as_deref(), Some("No live session. Resume it first."));
+        let r = rec(&["terminal_0", "terminal_4"]);
+        run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert!(r.calls.borrow().contains(&"zellij action write-chars --pane-id terminal_4 /wrap".to_string()));
+    }
+
+    #[test]
+    fn tick_closes_idle_panes_of_streams_that_left_active() {
+        let (s, c, zj) = (Store::open_in_memory(), cfg(3), inside());
+        let r = rec(&["terminal_0", "terminal_1", "terminal_2", "terminal_3", "terminal_4"]);
+        let mk = |stage: Stage, sid: &str, pane_id: &str, state| {
+            let id = add(&s, sid, Stage::Active);
+            session(&s, sid, Some(id), state);
+            pane(&s, sid, pane_id, state);
+            if stage != Stage::Active {
+                s.transition(id, stage, 9, &|_, _| vec![]).unwrap().unwrap();
+            }
+        };
+        mk(Stage::Review, "idle", "terminal_1", AgentState::Waiting);
+        mk(Stage::Parked, "busy", "terminal_2", AgentState::Working);
+        mk(Stage::Active, "active", "terminal_3", AgentState::Waiting);
+        // A stale session whose recorded pane id is now someone else's: other zellij session.
+        mk(Stage::Review, "stale", "terminal_4", AgentState::Waiting);
+        s.touch_session(SessionUpdate { id: "stale", cwd: "/w", state: AgentState::Waiting, zellij_session: Some("old"), zellij_pane: None }, false).unwrap();
+        tick(&ctx(&s, &c, &zj, &r), &mut Panes::new(0)).unwrap();
+        let closes: Vec<String> = r.calls.borrow().iter().filter(|l| l.contains("close-pane")).cloned().collect();
+        assert_eq!(closes, ["zellij action close-pane --pane-id terminal_1"]);
+        // Streams that left Active before the board started are left alone.
+        let r2 = rec(&["terminal_0", "terminal_1"]);
+        tick(&ctx(&s, &c, &zj, &r2), &mut Panes::new(i64::MAX)).unwrap();
+        assert!(!r2.calls.borrow().iter().any(|l| l.contains("close-pane")));
+    }
+}

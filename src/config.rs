@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
 pub struct Config {
+    #[allow(dead_code)] // used by Task 9 sync
     pub token_file: PathBuf,
+    #[allow(dead_code)] // used by Task 9 sync
     pub project: String,
     pub state_dir: PathBuf,
     /// Claude Code config dir: hooks, skills and settings.json live here.
     pub claude_dir: PathBuf,
-    #[allow(dead_code)] // read by later workstream tasks
     /// Cap on tasks in the Active stage.
     pub max_active: usize,
     /// Raw config file text, for keys read on demand.
@@ -65,7 +66,6 @@ impl Config {
     }
 
     /// Review-gate checks for a task kind: `gate_<kind>` in the file, comma-separated.
-    #[allow(dead_code)] // used by later workstream tasks
     pub fn gate_checks(&self, kind: &str) -> Vec<String> {
         let v = file_value(&self.file, &format!("gate_{kind}")).unwrap_or_else(|| "pr,explainer".into());
         v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
@@ -75,11 +75,11 @@ impl Config {
         self.state_dir.join("board.db")
     }
 
-    #[allow(dead_code)] // used by later workstream tasks
     pub fn explainer_dir(&self) -> PathBuf {
         self.state_dir.join("explainers")
     }
 
+    #[allow(dead_code)] // used by Task 9 sync
     pub fn token(&self) -> anyhow::Result<String> {
         use anyhow::Context;
         let t = std::fs::read_to_string(&self.token_file)

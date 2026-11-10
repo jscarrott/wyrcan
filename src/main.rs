@@ -1,22 +1,20 @@
 mod app;
-mod board;
 mod cli;
 mod config;
+mod effects;
 mod gate;
 mod hook;
 mod install;
 mod model;
-mod state;
 mod store;
 mod todoist;
 mod ui;
 mod zellij;
 
 use anyhow::{Context, Result};
-use app::{App, Effect};
+use app::App;
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use ratatui::crossterm::execute;
-use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
@@ -38,66 +36,35 @@ fn main() -> Result<()> {
 
 fn tui() -> Result<()> {
     let cfg = config::Config::from_env();
-    let client = Arc::new(todoist::Client::new(cfg.token()?));
+    let store = store::Store::open(&cfg.db_path())?;
     // ratatui::init also installs a panic hook that restores the terminal.
     let mut term = ratatui::init();
     // shortcut: a panic skips DisableMouseCapture; run `reset` if the terminal then echoes mouse codes.
     execute!(std::io::stdout(), EnableMouseCapture)?;
-    let res = run(&mut term, &cfg, client);
+    let res = run(&mut term, &cfg, &store);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
 }
 
-fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, client: Arc<todoist::Client>) -> Result<()> {
-    let (pid, ids) = match client.resolve(&cfg.project) {
-        Ok(v) => v,
-        Err(e) => {
-            // Show the failure full-screen; any key quits.
-            term.draw(|f| f.render_widget(format!("{e:#}\n\nPress any key to quit."), f.area()))?;
-            while !matches!(event::read()?, Event::Key(_)) {}
-            return Ok(());
-        }
-    };
-
-    let (task_tx, task_rx) = mpsc::channel();
-    let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
-    {
-        let client = client.clone();
-        std::thread::spawn(move || loop {
-            if task_tx.send(client.tasks(&pid)).is_err() {
-                return;
-            }
-            // Wakes on a refresh request, or after 20 s.
-            if let Err(mpsc::RecvTimeoutError::Disconnected) = refresh_rx.recv_timeout(Duration::from_secs(20)) {
-                return;
-            }
-        });
-    }
-
-    let (upd_tx, upd_rx) = mpsc::channel::<Update>();
-    let ctx = Ctx {
-        client,
-        cwd: std::env::current_dir().context("cwd")?.to_string_lossy().into_owned(),
-        claude_dir: cfg.claude_dir.to_string_lossy().into_owned(),
-        refresh: refresh_tx,
-        upd: upd_tx,
-    };
-    let mut app = App::new(ids, zellij::current_session());
-    app.on_agents(state::read_dir(&cfg.state_dir));
+fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, store: &store::Store) -> Result<()> {
+    let zj = zellij::Zellij::from_env();
+    let cwd = std::env::current_dir().context("cwd")?.to_string_lossy().into_owned();
+    // shortcut: the gate's `gh pr view` runs on the UI thread when a card is moved into Review by key; Task 8 adds the background poller.
+    let ctx = effects::Ctx { store, cfg, zj: &zj, run: &zellij::ShellRunner, verify: &cli::pr_exists, cwd: &cwd };
+    let mut panes = effects::Panes::new(store::now());
+    let mut app = App::new(app::snapshot(store, cfg)?);
     let mut last_read = Instant::now();
 
     loop {
-        while let Ok(r) = task_rx.try_recv() {
-            app.on_tasks(r);
-        }
-        while let Ok(u) = upd_rx.try_recv() {
-            u(&mut app);
-        }
         if last_read.elapsed() >= Duration::from_secs(1) {
-            app.on_agents(state::read_dir(&cfg.state_dir));
+            if let Err(e) = effects::tick(&ctx, &mut panes) {
+                app.message = Some(format!("{e:#}"));
+            }
+            refresh(&mut app, store, cfg);
             last_read = Instant::now();
         }
+        app.wide = term.size()?.width >= ui::WIDE_MIN;
         let mut hits = vec![];
         term.draw(|f| hits = ui::draw(f, &app))?;
         app.hits = hits;
@@ -109,78 +76,19 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, client: Arc<to
             Event::Mouse(m) => app.on_mouse(m),
             _ => continue,
         };
-        for e in effects {
-            if matches!(e, Effect::Quit) {
-                return Ok(());
-            }
-            if let Err(err) = handle(e, &ctx) {
-                app.message = Some(format!("{err:#}"));
-            }
+        if effects.is_empty() {
+            continue;
         }
+        if effects::run_all(effects, &ctx, &mut panes, &mut app) {
+            return Ok(());
+        }
+        refresh(&mut app, store, cfg);
     }
 }
 
-/// A change to the app computed off the UI thread.
-type Update = Box<dyn FnOnce(&mut App) + Send>;
-
-struct Ctx {
-    client: Arc<todoist::Client>,
-    cwd: String,
-    claude_dir: String,
-    refresh: mpsc::Sender<()>,
-    upd: mpsc::Sender<Update>,
-}
-
-/// Runs a Todoist call on its own thread so a slow API never freezes the board.
-/// Errors land in the footer; `refresh` re-fetches afterwards (which also undoes a failed move).
-fn background(ctx: &Ctx, refresh: bool, work: impl FnOnce(&todoist::Client) -> Result<Update> + Send + 'static) {
-    let (client, upd, tx) = (ctx.client.clone(), ctx.upd.clone(), ctx.refresh.clone());
-    std::thread::spawn(move || {
-        let u = work(&client).unwrap_or_else(|e| {
-            let m = format!("{e:#}");
-            Box::new(move |a: &mut App| a.message = Some(m))
-        });
-        let _ = upd.send(u);
-        if refresh {
-            let _ = tx.send(());
-        }
-    });
-}
-
-fn handle(e: Effect, ctx: &Ctx) -> Result<()> {
-    let dir = ctx.claude_dir.as_str();
-    match e {
-        Effect::SpawnNext(id) => zellij::spawn_claude("next", &ctx.cwd, dir, &[&format!("/next {id}")])?,
-        Effect::SpawnPen => zellij::spawn_claude("pen", &ctx.cwd, dir, &["/pen"])?,
-        Effect::Resume { session, cwd } => zellij::spawn_claude("resume", &cwd, dir, &["--resume", &session])?,
-        Effect::Jump(zellij::Jump::Focus(pane)) => zellij::run(&zellij::focus_cmd(&pane))?,
-        Effect::Jump(_) | Effect::Quit => {}
-        Effect::OpenInTodoist(id) => {
-            // Detached: Command::output() would block until the browser closes its inherited pipes.
-            // shortcut: the child is never waited on (zombie until exit), fine for a short-lived TUI.
-            std::process::Command::new("xdg-open")
-                .arg(format!("https://app.todoist.com/app/task/{id}"))
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .context("running xdg-open")?;
-        }
-        Effect::Complete { task_id, .. } => background(ctx, true, move |c| {
-            c.complete(&task_id)?;
-            Ok(Box::new(|_| {}))
-        }),
-        Effect::Move { task_id, section_id } => background(ctx, true, move |c| {
-            c.move_task(&task_id, &section_id)?;
-            Ok(Box::new(|_| {}))
-        }),
-        Effect::LoadComment(id) => background(ctx, false, move |c| {
-            let comment = c.latest_comment(&id)?;
-            Ok(Box::new(move |a: &mut App| a.on_comment(id, comment)))
-        }),
-        Effect::Refresh => {
-            let _ = ctx.refresh.send(());
-        }
+fn refresh(app: &mut App, store: &store::Store, cfg: &config::Config) {
+    match app::snapshot(store, cfg) {
+        Ok(s) => app.set_snapshot(s),
+        Err(e) => app.message = Some(format!("{e:#}")),
     }
-    Ok(())
 }

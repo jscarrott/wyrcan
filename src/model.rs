@@ -1,4 +1,3 @@
-#![allow(dead_code)] // later workstream tasks use these types
 use std::fmt;
 
 macro_rules! str_enum {
@@ -6,6 +5,7 @@ macro_rules! str_enum {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum $name { $($v),+ }
         impl $name {
+            #[allow(dead_code)] // tests walk every value
             pub const ALL: &'static [$name] = &[$($name::$v),+];
             pub fn as_str(self) -> &'static str { match self { $($name::$v => $s),+ } }
             pub fn from_str(s: &str) -> Option<$name> { match s { $($s => Some($name::$v),)+ _ => None } }
@@ -42,11 +42,14 @@ pub struct Task {
     pub description: String,
     pub kind: String,
     pub stage: Stage,
+    #[allow(dead_code)] // queue order from Todoist, Task 9
     pub position: f64,
     pub dir: Option<String>,
     pub labels: Vec<String>,
     pub explainer: Option<String>,
+    #[allow(dead_code)] // Task 9 sync
     pub todoist_id: Option<String>,
+    #[allow(dead_code)] // task view, Task 7
     pub created_at: i64,
     pub stage_at: i64,
 }
@@ -61,19 +64,14 @@ pub struct Session {
     pub state_at: i64,
     pub zellij_session: Option<String>,
     pub zellij_pane: Option<String>,
+    #[allow(dead_code)] // mirrors the column; only SQL reads it
     pub edited: bool,
     pub current: bool,
 }
 
 #[derive(Clone, Debug)]
-pub struct Repo {
-    pub session_id: String,
-    pub root: String,
-    pub git_ref: String,
-}
-
-#[derive(Clone, Debug)]
 pub struct Pr {
+    #[allow(dead_code)] // mirrors the column
     pub task_id: i64,
     pub root: String,
     pub url: Option<String>,
@@ -82,6 +80,7 @@ pub struct Pr {
     pub reviewers: String,
 }
 
+#[allow(dead_code)] // task view, Task 7
 #[derive(Clone, Debug)]
 pub struct Event {
     pub task_id: i64,

@@ -1,4 +1,3 @@
-#![allow(dead_code)] // later workstream tasks use the rest of the store
 use crate::gate;
 use crate::model::{AgentState, Event, Pr, PrState, Refusal, Session, SessionKind, Stage, Task};
 use anyhow::{Context, Result};
@@ -86,6 +85,7 @@ impl Store {
         Ok(Store { conn })
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> Store {
         let conn = Connection::open_in_memory().expect("in-memory sqlite");
         conn.execute_batch(SCHEMA).expect("schema");
@@ -122,6 +122,13 @@ impl Store {
         Ok(())
     }
 
+    /// Only for undoing an add that was refused straight away (adopting at the cap).
+    pub fn delete_task(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM tasks WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // queue order from Todoist, Task 9
     pub fn set_position(&self, id: i64, position: f64) -> Result<()> {
         self.conn.execute("UPDATE tasks SET position=?1 WHERE id=?2", params![position, id])?;
         Ok(())
@@ -220,6 +227,10 @@ impl Store {
         Ok(self.query_sessions("WHERE id=?1", [id])?.pop())
     }
 
+    pub fn current_session(&self, task_id: i64) -> Result<Option<Session>> {
+        Ok(self.query_sessions("WHERE task_id=?1 AND current=1", [task_id])?.pop())
+    }
+
     pub fn sessions(&self) -> Result<Vec<Session>> {
         self.query_sessions("", [])
     }
@@ -287,6 +298,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)] // PR polling, Task 8
     pub fn set_pr_state(&self, task_id: i64, root: &str, state: PrState, reviewers: &str) -> Result<bool> {
         let changed = self.conn.execute(
             "UPDATE prs SET state=?3, reviewers=?4 WHERE task_id=?1 AND root=?2 AND (state!=?3 OR reviewers!=?4)",
@@ -333,6 +345,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)] // task view, Task 7
     pub fn events(&self, task_id: i64) -> Result<Vec<Event>> {
         let mut q = self.conn.prepare("SELECT task_id,at,kind,detail FROM events WHERE task_id=?1 ORDER BY id")?;
         let rows = q
