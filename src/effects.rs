@@ -52,14 +52,20 @@ impl Ctx<'_> {
         }
     }
 
+    /// Re-reads the live panes. An opened pane is forgotten once it's gone, or once another task's session reports it.
     fn refresh(&self, p: &mut Panes) -> Result<()> {
         p.live = self.zj.live_panes(self.run)?;
+        let sessions = self.store.sessions()?;
         let live = &p.live;
-        p.opened.retain(|_, x| live.contains(x));
+        p.opened.retain(|id, x| {
+            live.contains(x) && !sessions.iter().any(|s| s.task_id != Some(*id) && self.zj.pane_of(s, live) == Some(x.as_str()))
+        });
         Ok(())
     }
 
     /// The task's pane, if it's in the latest `live`: its current session's, else the one we opened for it.
+    /// A reused pane id is caught once a Claude session in it reports (touch_session hands the pane over).
+    // shortcut: a plain shell in a reused pane id still looks like the old session's pane; needs pane identity zellij doesn't give.
     fn pane(&self, p: &Panes, id: i64) -> Result<Option<String>> {
         let s = self.store.current_session(id)?;
         if let Some(x) = s.as_ref().and_then(|s| self.zj.pane_of(s, &p.live)) {
@@ -380,6 +386,41 @@ mod tests {
         run_all(vec![Effect::Adopt { session: "u2".into(), title: "x".into() }], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
         assert_eq!(ap.message.as_deref(), Some("All 1 active slots are in use. Park or finish a stream first."));
         assert_eq!(s.tasks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resume_after_pane_id_reuse_opens_its_own_pane() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&["terminal_0", "terminal_2"]));
+        let parked = add(&s, "parked", Stage::Parked);
+        session(&s, "old", Some(parked), AgentState::Waiting);
+        pane(&s, "old", "terminal_2", AgentState::Waiting);
+        // zellij restarted under the same name; another stream's session now sits in terminal_2.
+        let other = add(&s, "other", Stage::Active);
+        session(&s, "new", Some(other), AgentState::Working);
+        pane(&s, "new", "terminal_2", AgentState::Working);
+        let mut ap = app(&s, &c);
+        let mut p = Panes::new(0);
+        run_all(vec![Effect::Resume(parked)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
+        assert_eq!(ap.message, None);
+        assert_eq!(stage(&s, parked), Stage::Active);
+        let calls = r.calls.borrow();
+        assert!(calls.iter().any(|l| l.starts_with("zellij run") && l.ends_with("claude --resume old")), "{calls:?}");
+        assert!(!calls.iter().any(|l| l.ends_with("focus-pane-id terminal_2")), "{calls:?}");
+    }
+
+    #[test]
+    fn opened_pane_is_dropped_once_another_session_claims_it() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&["terminal_0", "terminal_9"]));
+        let a = add(&s, "a", Stage::Active);
+        let b = add(&s, "b", Stage::Active);
+        session(&s, "sb", Some(b), AgentState::Working);
+        pane(&s, "sb", "terminal_9", AgentState::Working);
+        let mut ap = app(&s, &c);
+        let mut p = Panes::new(0);
+        p.opened.insert(a, "terminal_9".into());
+        run_all(vec![Effect::Wrap(a)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
+        assert_eq!(ap.message.as_deref(), Some("No live session. Resume it first."));
+        assert!(!r.calls.borrow().iter().any(|l| l.contains("write-chars")));
     }
 
     #[test]

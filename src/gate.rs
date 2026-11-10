@@ -173,6 +173,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_belongs_to_its_latest_reporter() {
+        let s = Store::open_in_memory();
+        let u = |id, zs, zp| SessionUpdate { id, cwd: "/c", state: AgentState::Waiting, zellij_session: zs, zellij_pane: zp };
+        s.touch_session(u("old", Some("z"), Some("terminal_2")), true).unwrap();
+        s.touch_session(u("other", Some("y"), Some("terminal_2")), true).unwrap();
+        s.touch_session(u("new", Some("z"), Some("terminal_2")), true).unwrap();
+        let pane = |id| {
+            let x = s.session(id).unwrap().unwrap();
+            (x.zellij_session, x.zellij_pane)
+        };
+        assert_eq!(pane("old"), (None, None));
+        assert_eq!(pane("other"), (Some("y".into()), Some("terminal_2".into())));
+        assert_eq!(pane("new"), (Some("z".into()), Some("terminal_2".into())));
+        // An event without zellij info doesn't take the pane back.
+        s.touch_session(u("old", None, None), false).unwrap();
+        assert_eq!(pane("new").1.as_deref(), Some("terminal_2"));
+    }
+
+    #[test]
     fn untracked_lists_only_edited_unlinked_live_sessions() {
         let s = Store::open_in_memory();
         for n in ["edited", "plain", "ended", "pen"] {

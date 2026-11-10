@@ -249,6 +249,14 @@ impl Store {
                 params![u.id, u.cwd, u.state.as_str(), n, u.zellij_session, u.zellij_pane],
             )?;
         }
+        // A pane belongs to the session that last reported it: zellij reuses pane ids after a restart,
+        // so an older row still naming this pane must not lead the board to it.
+        if let (Some(zs), Some(zp)) = (u.zellij_session, u.zellij_pane) {
+            self.conn.execute(
+                "UPDATE sessions SET zellij_session=NULL, zellij_pane=NULL WHERE id!=?1 AND zellij_session=?2 AND zellij_pane=?3",
+                params![u.id, zs, zp],
+            )?;
+        }
         Ok(changed > 0 || create)
     }
 
