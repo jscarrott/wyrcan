@@ -78,7 +78,7 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, client: Arc<to
         if k.kind != KeyEventKind::Press {
             continue;
         }
-        for e in app.on_key(k.code) {
+        for e in app.on_key_event(k) {
             if matches!(e, Effect::Quit) {
                 return Ok(());
             }
@@ -91,7 +91,7 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, client: Arc<to
 
 fn handle(e: Effect, client: &todoist::Client, cwd: &str, refresh: &mpsc::Sender<()>) -> Result<()> {
     match e {
-        Effect::SpawnNext => zellij::spawn_claude("next", cwd, &["/next"])?,
+        Effect::SpawnNext(id) => zellij::spawn_claude("next", cwd, &[&format!("/next {id}")])?,
         Effect::SpawnPen => zellij::spawn_claude("pen", cwd, &["/pen"])?,
         Effect::Resume { session, cwd } => zellij::spawn_claude("resume", &cwd, &["--resume", &session])?,
         Effect::Jump(zellij::Jump::Focus(pane)) => zellij::run(&zellij::focus_cmd(&pane))?,

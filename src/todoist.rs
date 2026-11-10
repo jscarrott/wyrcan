@@ -33,7 +33,7 @@ pub fn parse_page(body: &str) -> anyhow::Result<(Vec<Task>, Option<String>)> {
     parse(body)
 }
 
-/// Follows next_cursor until null; `fetch` gets the cursor and returns one page.
+/// Follows next_cursor until null or empty; `fetch` gets the cursor and returns one page.
 fn paginate<T>(mut fetch: impl FnMut(Option<&str>) -> anyhow::Result<(Vec<T>, Option<String>)>) -> anyhow::Result<Vec<T>> {
     let mut all = Vec::new();
     let mut cursor: Option<String> = None;
@@ -41,8 +41,8 @@ fn paginate<T>(mut fetch: impl FnMut(Option<&str>) -> anyhow::Result<(Vec<T>, Op
         let (mut items, next) = fetch(cursor.as_deref())?;
         all.append(&mut items);
         match next {
-            Some(c) => cursor = Some(c),
-            None => return Ok(all),
+            Some(c) if !c.is_empty() => cursor = Some(c),
+            _ => return Ok(all),
         }
     }
 }
@@ -169,6 +169,18 @@ mod tests {
         .unwrap();
         assert_eq!(all.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!(seen, [None, Some("c1".to_string())]);
+    }
+
+    #[test]
+    fn paginate_stops_on_empty_cursor() {
+        let mut calls = 0;
+        let all: Vec<Task> = paginate(|_| {
+            calls += 1;
+            assert!(calls < 3, "looped on empty cursor");
+            parse(r#"{"results":[{"id":"a","content":"x","section_id":null}],"next_cursor":""}"#)
+        })
+        .unwrap();
+        assert_eq!((all.len(), calls), (1, 1));
     }
 
     #[test]

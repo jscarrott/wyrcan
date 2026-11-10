@@ -2,11 +2,11 @@ use crate::board::{self, Board, Row, Section, SectionIds};
 use crate::state::{AgentRecord, AgentState};
 use crate::todoist::Task;
 use crate::zellij::{self, Jump};
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, PartialEq)]
 pub enum Effect {
-    SpawnNext,
+    SpawnNext(String),
     SpawnPen,
     Jump(Jump),
     Resume { session: String, cwd: String },
@@ -33,6 +33,8 @@ pub struct App {
     agents: Vec<AgentRecord>,
     ids: SectionIds,
     current_session: Option<String>,
+    /// Up next tasks already handed to a spawned /next session that has not claimed them yet.
+    spawned: Vec<String>,
 }
 
 const SECTIONS: [Section; 3] = [Section::UpNext, Section::InProgress, Section::NeedsReview];
@@ -49,6 +51,7 @@ impl App {
             agents: vec![],
             ids,
             current_session,
+            spawned: vec![],
         }
     }
 
@@ -64,10 +67,13 @@ impl App {
         self.rows(self.selected.0).get(self.selected.1)
     }
 
+    /// Rebuilds the board, keeping the cursor on the same task (rows reorder on every refresh).
     fn rebuild(&mut self) {
+        let id = self.selected_row().map(|r| r.task.id.clone());
         self.board = board::build(&self.tasks, &self.ids, &self.agents);
-        let len = self.rows(self.selected.0).len();
-        self.selected.1 = self.selected.1.min(len.saturating_sub(1));
+        let rows = self.rows(self.selected.0);
+        let i = id.and_then(|id| rows.iter().position(|r| r.task.id == id));
+        self.selected.1 = i.unwrap_or(self.selected.1.min(rows.len().saturating_sub(1)));
     }
 
     pub fn on_tasks(&mut self, r: anyhow::Result<Vec<Task>>) {
@@ -76,6 +82,9 @@ impl App {
                 self.tasks = t;
                 self.fetch_error = None;
                 self.rebuild();
+                // shortcut: a spawned session that dies before claiming leaves its task skipped until restart.
+                let up = &self.board.up_next;
+                self.spawned.retain(|id| up.iter().any(|r| &r.task.id == id));
             }
             Err(e) => self.fetch_error = Some(format!("{e:#}")),
         }
@@ -98,6 +107,14 @@ impl App {
         self.selected.1 = (self.selected.1 as isize + d).clamp(0, max) as usize;
     }
 
+    /// Raw mode swallows SIGINT, so Ctrl-C arrives as a key.
+    pub fn on_key_event(&mut self, k: KeyEvent) -> Vec<Effect> {
+        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+            return vec![Effect::Quit];
+        }
+        self.on_key(k.code)
+    }
+
     pub fn on_key(&mut self, key: KeyCode) -> Vec<Effect> {
         if let Some(p) = self.confirm.take() {
             return if key == KeyCode::Char('y') { vec![p.effect] } else { vec![] };
@@ -108,8 +125,7 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => self.shift_section(1),
             KeyCode::Up | KeyCode::Char('k') => self.shift_row(-1),
             KeyCode::Down | KeyCode::Char('j') => self.shift_row(1),
-            KeyCode::Char('n') if self.board.up_next.is_empty() => self.message = Some("Up next is empty".into()),
-            KeyCode::Char('n') => return vec![Effect::SpawnNext],
+            KeyCode::Char('n') => return self.next(),
             KeyCode::Char('p') => return vec![Effect::SpawnPen],
             KeyCode::Char('r') => return vec![Effect::Refresh],
             KeyCode::Char('q') => return vec![Effect::Quit],
@@ -129,10 +145,21 @@ impl App {
         self.confirm = Some(Pending { prompt, effect });
     }
 
+    fn next(&mut self) -> Vec<Effect> {
+        let free = self.board.up_next.iter().find(|r| !self.spawned.contains(&r.task.id));
+        let Some(id) = free.map(|r| r.task.id.clone()) else {
+            self.message = Some("Up next is empty".into());
+            return vec![];
+        };
+        self.spawned.push(id.clone());
+        vec![Effect::SpawnNext(id)]
+    }
+
     fn enter(&mut self) -> Vec<Effect> {
         let Some(row) = self.selected_row() else { return vec![] };
+        let title = row.task.content.clone();
         match zellij::jump_target(row.agent.as_ref(), self.current_session.as_deref()) {
-            Jump::Resume { session, cwd } => self.ask("Resume session? y/n".into(), Effect::Resume { session, cwd }),
+            Jump::Resume { session, cwd } => self.ask(format!("Resume '{title}'? y/n"), Effect::Resume { session, cwd }),
             Jump::Elsewhere => self.message = Some("running elsewhere".into()),
             Jump::NoAgent => self.message = Some("no agent".into()),
             j @ Jump::Focus(_) => return vec![Effect::Jump(j)],
@@ -149,7 +176,8 @@ impl App {
         match row.agent.as_ref().map(|a| a.agent) {
             Some(s @ (AgentState::Working | AgentState::Blocked)) => {
                 let s = format!("{s:?}").to_lowercase();
-                self.ask(format!("Agent is {s} — complete anyway? y/n"), effect);
+                let title = &row.task.content;
+                self.ask(format!("Complete '{title}'? Agent is {s} — y/n"), effect);
                 vec![]
             }
             _ => vec![effect],
@@ -203,7 +231,7 @@ mod tests {
     fn complete_working_agent_asks_first() {
         let mut app = app_with(AgentState::Working);
         assert!(app.on_key(KeyCode::Char('x')).is_empty());
-        assert!(app.confirm.is_some());
+        assert_eq!(app.confirm.as_ref().unwrap().prompt, "Complete 't1'? Agent is working — y/n");
         assert_eq!(
             app.on_key(KeyCode::Char('y')),
             vec![Effect::Complete { task_id: "t1".into(), session: Some("sid".into()) }]
@@ -221,7 +249,7 @@ mod tests {
     fn enter_on_ended_asks_to_resume() {
         let mut app = app_with(AgentState::Ended);
         assert!(app.on_key(KeyCode::Enter).is_empty());
-        assert_eq!(app.confirm.as_ref().unwrap().prompt, "Resume session? y/n");
+        assert_eq!(app.confirm.as_ref().unwrap().prompt, "Resume 't1'? y/n");
         assert_eq!(app.on_key(KeyCode::Char('y')), vec![Effect::Resume { session: "sid".into(), cwd: "/w".into() }]);
     }
 
@@ -264,5 +292,44 @@ mod tests {
         app.selected = (Section::UpNext, 2);
         app.on_tasks(Ok(vec![Task { section_id: Some("u".into()), ..task("0") }]));
         assert_eq!(app.selected, (Section::UpNext, 0));
+    }
+
+    fn up(ids: &[&str]) -> Vec<Task> {
+        ids.iter().enumerate().map(|(i, id)| Task { section_id: Some("u".into()), child_order: i as i64, ..task(id) }).collect()
+    }
+
+    #[test]
+    fn selection_follows_task_across_reorder() {
+        let mut app = App::new(ids(), None);
+        app.on_tasks(Ok(up(&["a", "b", "c"])));
+        app.selected = (Section::UpNext, 1);
+        app.on_tasks(Ok(up(&["c", "a", "b"])));
+        assert_eq!(app.selected, (Section::UpNext, 2));
+        assert_eq!(app.on_key(KeyCode::Char('o')), vec![Effect::OpenInTodoist("b".into())]);
+    }
+
+    #[test]
+    fn double_next_spawns_different_tasks() {
+        let mut app = App::new(ids(), None);
+        app.on_tasks(Ok(up(&["a", "b"])));
+        assert_eq!(app.on_key(KeyCode::Char('n')), vec![Effect::SpawnNext("a".into())]);
+        assert_eq!(app.on_key(KeyCode::Char('n')), vec![Effect::SpawnNext("b".into())]);
+        assert!(app.on_key(KeyCode::Char('n')).is_empty());
+        assert_eq!(app.message.as_deref(), Some("Up next is empty"));
+        // A refresh before "a" is claimed must not hand it out again.
+        app.on_tasks(Ok(up(&["a", "b"])));
+        assert!(app.on_key(KeyCode::Char('n')).is_empty());
+        // Once "a" leaves Up next it stops being tracked.
+        app.on_tasks(Ok(up(&["b", "c"])));
+        assert_eq!(app.on_key(KeyCode::Char('n')), vec![Effect::SpawnNext("c".into())]);
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_while_confirming() {
+        let mut app = app_with(AgentState::Working);
+        app.on_key(KeyCode::Char('x'));
+        let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.on_key_event(k), vec![Effect::Quit]);
+        assert!(app.on_key_event(KeyCode::Char('c').into()).is_empty());
     }
 }
