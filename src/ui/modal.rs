@@ -20,7 +20,8 @@ fn date(ts: i64) -> String {
 }
 
 /// The task view: title, description and thread on the left, the facts in a side panel on the right.
-pub fn draw_task(f: &mut Frame, area: Rect, v: &mut TaskView, now: i64) {
+/// `gate` is what the card shows for the review gate; empty leaves the field out.
+pub fn draw_task(f: &mut Frame, area: Rect, v: &mut TaskView, gate: Vec<String>, now: i64) {
     f.render_widget(Clear, area);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -54,7 +55,11 @@ pub fn draw_task(f: &mut Frame, area: Rect, v: &mut TaskView, now: i64) {
         let pad = when.len() + 1;
         for (i, l) in wrap(&format!("{when} {}: {}", e.kind, e.detail), w.saturating_sub(pad)).into_iter().enumerate() {
             lines.push(match i {
-                0 => Line::from(vec![Span::styled(when.clone(), theme::dim()), Span::raw(l[when.len()..].to_string())]),
+                // A pane narrower than the age hard-splits it, so the line may not start with it.
+                0 => match l.strip_prefix(when.as_str()) {
+                    Some(rest) => Line::from(vec![Span::styled(when.clone(), theme::dim()), Span::raw(rest.to_string())]),
+                    None => Line::raw(l),
+                },
                 _ => Line::raw(format!("{:pad$}{l}", "")),
             });
         }
@@ -85,6 +90,9 @@ pub fn draw_task(f: &mut Frame, area: Rect, v: &mut TaskView, now: i64) {
     });
     field("PRs", prs.collect());
     field("Explainer", t.explainer.iter().map(|p| home_short(p)).collect());
+    if !gate.is_empty() {
+        field("Gate", gate);
+    }
     field("Session", d.session.iter().map(|s| format!("{} · {}", s.id, s.state)).collect());
     field("Created", vec![date(t.created_at)]);
     // Both sides scroll together, as far as the longer one needs.
@@ -143,7 +151,8 @@ pub fn draw_quick_add(f: &mut Frame, area: Rect, q: &Input) {
 #[cfg(test)]
 mod tests {
     use crate::app::tests::{add, app, cfg, key, session};
-    use crate::app::{detail, App};
+    use crate::app::{detail, App, Prompt};
+    use ratatui::crossterm::event::KeyCode;
     use crate::model::{AgentState, PrState, Stage};
     use crate::store::Store;
     use ratatui::{backend::TestBackend, Terminal};
@@ -191,6 +200,52 @@ mod tests {
         }
         // The thread is oldest first.
         assert!(t.find("pr: delta").unwrap() < t.find("summary: Refreshed").unwrap(), "{t}");
+    }
+
+    /// The task view, quick add and the prompt box survive tiny terminals (a crash in raw mode wrecks the terminal).
+    #[test]
+    fn overlays_draw_at_tiny_sizes() {
+        let s = Store::open_in_memory();
+        let id = add(&s, "Fix auth timeout", Stage::Active);
+        s.add_event(id, "summary", "Refreshed tokens").unwrap();
+        for (w, h) in [(10, 5), (20, 10), (25, 10), (1, 1)] {
+            let mut ap = app(&s, &cfg(3));
+            ap.on_key_event(key(' '));
+            ap.modal.as_mut().unwrap().detail = detail(&s, id).unwrap();
+            text(&mut ap, w, h);
+            let mut ap = app(&s, &cfg(3));
+            ap.on_key_event(key('+'));
+            for c in "a long title @label #~/x".chars() {
+                ap.on_key_event(key(c));
+            }
+            ap.on_key_event(KeyCode::Left.into());
+            text(&mut ap, w, h);
+            let mut ap = app(&s, &cfg(3));
+            ap.prompt = Some(Prompt::dir(id, false, "Fix auth timeout", "/some/long/directory".into()));
+            text(&mut ap, w, h);
+        }
+    }
+
+    #[test]
+    fn task_view_shows_gate_status() {
+        let s = Store::open_in_memory();
+        let id = add(&s, "a", Stage::Active);
+        let mut ap = app(&s, &cfg(3));
+        ap.on_key_event(key(' '));
+        ap.modal.as_mut().unwrap().detail = detail(&s, id).unwrap();
+        let t = text(&mut ap, 140, 40);
+        assert!(t.contains("Gate") && t.contains("no explainer"), "{t}");
+        // The gate wants the explainer on disk; no repos edited means no PR is needed.
+        s.set_explainer(id, &std::env::temp_dir().to_string_lossy()).unwrap();
+        ap.set_snapshot(crate::app::snapshot(&s, &cfg(3)).unwrap());
+        ap.modal.as_mut().unwrap().detail = detail(&s, id).unwrap();
+        assert!(text(&mut ap, 140, 40).contains("ready for review"));
+        let r = add(&s, "r", Stage::Review);
+        let mut ap = app(&s, &cfg(3));
+        ap.selected = Some(crate::app::CardKey::Task(r));
+        ap.on_key_event(key(' '));
+        ap.modal.as_mut().unwrap().detail = detail(&s, r).unwrap();
+        assert!(text(&mut ap, 140, 40).contains("passed"));
     }
 
     #[test]

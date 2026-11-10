@@ -102,10 +102,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else if let Some(p) = &app.prompt {
         modal::draw_prompt(f, input, &p.label, &p.text, p.text.chars().count());
     }
+    // The gate status the card carries: what an Active stream still lacks, or that a Review one passed.
+    let gate = match app.selected_card() {
+        Some(c) if c.task.as_ref().is_some_and(|t| t.stage == crate::model::Stage::Review) => vec!["passed".into()],
+        Some(c) if c.task.as_ref().is_some_and(|t| t.stage == crate::model::Stage::Active) && c.missing.is_empty() => vec!["ready for review".into()],
+        Some(c) => c.missing.clone(),
+        None => vec![],
+    };
     if let Some(v) = app.modal.as_mut() {
         let [mid] = Layout::vertical([Constraint::Percentage(80)]).flex(Flex::Center).areas(area);
         let [mid] = Layout::horizontal([Constraint::Percentage(80)]).flex(Flex::Center).areas(mid);
-        modal::draw_task(f, mid, v, now);
+        modal::draw_task(f, mid, v, gate, now);
         // The board under the view takes no clicks.
         hits.clear();
     }
