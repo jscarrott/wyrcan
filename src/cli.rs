@@ -140,7 +140,7 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
                 }
             }
             let checks = cfg.gate_checks(&t.kind);
-            match store.transition(t.id, Stage::Review, cfg.max_active, &|s, t| gate::evaluate(s, t, &checks, verify))? {
+            match gate::to_review(&store, t.id, cfg.max_active, &checks, verify)? {
                 Ok(()) => ok("In review.".into()),
                 Err(Refusal::Gate(m)) => Ok((1, format!("Not ready for review. Missing:\n- {}", m.join("\n- ")))),
                 Err(r) => refused(r),

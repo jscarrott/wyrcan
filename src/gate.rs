@@ -1,8 +1,8 @@
-use crate::model::{Pr, PrState, Task};
+use crate::model::{Pr, PrState, Refusal, Stage, Task};
 use crate::store::Store;
 
 /// url → does the PR exist; production runs `gh pr view <url>`.
-pub type PrVerifier = dyn Fn(&str) -> bool;
+pub type PrVerifier<'a> = dyn Fn(&str) -> bool + 'a;
 
 pub fn basename(root: &str) -> &str {
     root.trim_end_matches('/').rsplit('/').next().unwrap_or(root)
@@ -51,6 +51,14 @@ pub fn evaluate(store: &Store, task: &Task, checks: &[String], verify_pr: &PrVer
 }
 
 /// The worst state across repos; waived rows count as merged.
+/// The one way into Review. `verify_pr` does network I/O, so it runs on every PR url before the
+/// transaction opens; the gate inside only checks membership and the write lock is held for local work.
+/// A PR recorded after the pre-check is not in the set and fails closed.
+pub fn to_review(store: &Store, id: i64, max_active: usize, checks: &[String], verify_pr: &PrVerifier) -> anyhow::Result<Result<(), Refusal>> {
+    let verified: Vec<String> = store.prs(id)?.into_iter().filter(|p| !waived(p)).filter_map(|p| p.url).filter(|u| verify_pr(u)).collect();
+    store.transition(id, Stage::Review, max_active, &|s, t| evaluate(s, t, checks, &|u| verified.iter().any(|v| v == u)))
+}
+
 pub fn worst(prs: &[Pr]) -> Option<PrState> {
     prs.iter().map(|p| if waived(p) { PrState::Merged } else { p.state }).max_by_key(|s| s.badness())
 }
@@ -62,7 +70,7 @@ pub fn ready_to_close(prs: &[Pr]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentState, Refusal, Stage};
+    use crate::model::AgentState;
     use crate::store::{NewTask, SessionUpdate};
 
     fn setup() -> (Store, i64) {
@@ -110,6 +118,29 @@ mod tests {
         s.set_pr(id, "/x/a", None, Some("docs only")).unwrap();
         explainer(&s, id);
         assert!(eval(&s, id, false).is_empty());
+    }
+
+    #[test]
+    fn to_review_verifies_before_taking_the_write_lock() {
+        let path = std::env::temp_dir().join(format!("cb-gate-lock-{}/board.db", std::process::id()));
+        let s = Store::open(&path).unwrap();
+        let id = s.add_task(NewTask { title: "t", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        s.link_session("s1", id, "/a").unwrap();
+        s.mark_edited("s1", "/x/a", "main").unwrap();
+        s.set_pr(id, "/x/a", Some("https://x/pr/1"), None).unwrap();
+        s.conn.execute("UPDATE tasks SET stage='active'", []).unwrap();
+        // If the verifier ran inside BEGIN IMMEDIATE, this second connection's write would time out.
+        let p2 = path.clone();
+        let verify = move |_: &str| {
+            let other = Store::open_with_timeout(&p2, 50).unwrap();
+            other.set_pr(id, "/x/b", None, Some("probe")).is_ok()
+        };
+        assert_eq!(to_review(&s, id, 3, &["pr".to_string()], &verify).unwrap(), Ok(()));
+        // An unverified PR still refuses.
+        s.conn.execute("UPDATE tasks SET stage='active'", []).unwrap();
+        let r = to_review(&s, id, 3, &["pr".to_string()], &|_| false).unwrap();
+        assert!(matches!(r, Err(Refusal::Gate(m)) if m == ["couldn't verify PR https://x/pr/1"]));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

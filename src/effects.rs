@@ -13,7 +13,7 @@ pub struct Ctx<'a> {
     pub cfg: &'a Config,
     pub zj: &'a Zellij,
     pub run: &'a dyn Runner,
-    pub verify: &'a PrVerifier,
+    pub verify: &'a PrVerifier<'a>,
     /// Where pen sessions start.
     pub cwd: &'a str,
 }
@@ -37,6 +37,10 @@ impl Panes {
 
 /// `Store::transition` with the real gate; the board's UI thread and its review worker both come through here.
 pub fn transition(store: &Store, cfg: &Config, id: i64, to: Stage, verify: &PrVerifier) -> Result<Result<(), Refusal>> {
+    if to == Stage::Review {
+        let kind = store.task(id)?.context("No such task.")?.kind;
+        return gate::to_review(store, id, cfg.max_active, &cfg.gate_checks(&kind), verify);
+    }
     store.transition(id, to, cfg.max_active, &|s, t| gate::evaluate(s, t, &cfg.gate_checks(&t.kind), verify))
 }
 
