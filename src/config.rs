@@ -9,6 +9,8 @@ pub struct Config {
     #[allow(dead_code)] // read by later workstream tasks
     /// Cap on tasks in the Active stage.
     pub max_active: usize,
+    /// Raw config file text, for keys read on demand.
+    file: String,
 }
 
 pub fn home() -> PathBuf {
@@ -58,7 +60,15 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home().join(".claude")),
             max_active: file_value(&file, "max_active").and_then(|v| v.parse().ok()).unwrap_or(3),
+            file,
         }
+    }
+
+    /// Review-gate checks for a task kind: `gate_<kind>` in the file, comma-separated.
+    #[allow(dead_code)] // used by later workstream tasks
+    pub fn gate_checks(&self, kind: &str) -> Vec<String> {
+        let v = file_value(&self.file, &format!("gate_{kind}")).unwrap_or_else(|| "pr,explainer".into());
+        v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
     }
 
     #[allow(dead_code)] // used by later workstream tasks
@@ -95,5 +105,14 @@ mod tests {
         let tilde = file_value("claude_dir = \"~/.claude-work\"", "claude_dir").unwrap();
         assert_eq!(PathBuf::from(tilde), home().join(".claude-work"));
         assert_eq!(file_value("max_active = 5", "max_active").and_then(|v| v.parse::<usize>().ok()), Some(5));
+    }
+
+    #[test]
+    fn gate_checks_default_and_override() {
+        let mut c = Config::from_env();
+        c.file = "gate_spike = \"pr, explainer ,\"\ngate_bug = \"explainer\"".into();
+        assert_eq!(c.gate_checks("task"), ["pr", "explainer"]);
+        assert_eq!(c.gate_checks("bug"), ["explainer"]);
+        assert_eq!(c.gate_checks("spike"), ["pr", "explainer"]);
     }
 }

@@ -1,5 +1,6 @@
 #![allow(dead_code)] // later workstream tasks use the rest of the store
-use crate::model::{Event, Refusal, Stage, Task};
+use crate::gate;
+use crate::model::{AgentState, Event, Pr, PrState, Refusal, Session, SessionKind, Stage, Task};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -30,6 +31,14 @@ pub struct NewTask<'a> {
     pub dir: Option<&'a str>,
     pub labels: &'a [String],
     pub todoist_id: Option<&'a str>,
+}
+
+pub struct SessionUpdate<'a> {
+    pub id: &'a str,
+    pub cwd: &'a str,
+    pub state: AgentState,
+    pub zellij_session: Option<&'a str>,
+    pub zellij_pane: Option<&'a str>,
 }
 
 pub struct Store {
@@ -167,12 +176,7 @@ impl Store {
             }
         }
         if to == Done {
-            let open: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM prs WHERE task_id=?1 AND state!='merged' AND waiver IS NULL",
-                [id],
-                |r| r.get(0),
-            )?;
-            if open > 0 {
+            if !gate::ready_to_close(&self.prs(id)?) {
                 return Ok(Err(Refusal::NotMerged));
             }
         }
@@ -186,6 +190,139 @@ impl Store {
         )?;
         self.add_event(id, "stage", &format!("{from} → {to}"))?;
         Ok(Ok(()))
+    }
+
+    fn session_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
+        let (kind, state): (String, String) = (r.get(2)?, r.get(4)?);
+        Ok(Session {
+            id: r.get(0)?,
+            task_id: r.get(1)?,
+            kind: SessionKind::from_str(&kind).unwrap_or(SessionKind::Task),
+            cwd: r.get(3)?,
+            state: AgentState::from_str(&state).unwrap_or(AgentState::Working),
+            state_at: r.get(5)?,
+            zellij_session: r.get(6)?,
+            zellij_pane: r.get(7)?,
+            edited: r.get(8)?,
+            current: r.get(9)?,
+        })
+    }
+
+    fn query_sessions(&self, filter: &str, p: impl rusqlite::Params) -> Result<Vec<Session>> {
+        let mut q = self.conn.prepare(&format!(
+            "SELECT id,task_id,kind,cwd,state,state_at,zellij_session,zellij_pane,edited,current FROM sessions {filter} ORDER BY id"
+        ))?;
+        let rows = q.query_map(p, Self::session_row)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn session(&self, id: &str) -> Result<Option<Session>> {
+        Ok(self.query_sessions("WHERE id=?1", [id])?.pop())
+    }
+
+    pub fn sessions(&self) -> Result<Vec<Session>> {
+        self.query_sessions("", [])
+    }
+
+    /// False if the session is absent and `create` is not set. `state_at` moves only when the state does.
+    pub fn touch_session(&self, u: SessionUpdate, create: bool) -> Result<bool> {
+        let n = now();
+        let changed = self.conn.execute(
+            "UPDATE sessions SET cwd=?2, state_at=CASE WHEN state!=?3 THEN ?4 ELSE state_at END, state=?3,
+               zellij_session=COALESCE(?5,zellij_session), zellij_pane=COALESCE(?6,zellij_pane) WHERE id=?1",
+            params![u.id, u.cwd, u.state.as_str(), n, u.zellij_session, u.zellij_pane],
+        )?;
+        if changed == 0 && create {
+            self.conn.execute(
+                "INSERT INTO sessions(id,cwd,state,state_at,zellij_session,zellij_pane) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![u.id, u.cwd, u.state.as_str(), n, u.zellij_session, u.zellij_pane],
+            )?;
+        }
+        Ok(changed > 0 || create)
+    }
+
+    /// The session becomes the task's current one; any other session of the task stops being current.
+    pub fn link_session(&self, session: &str, task_id: i64, cwd: &str) -> Result<()> {
+        self.conn.execute("UPDATE sessions SET current=0 WHERE task_id=?1", [task_id])?;
+        self.conn.execute(
+            "INSERT INTO sessions(id,task_id,cwd,state_at,current) VALUES(?1,?2,?3,?4,1)
+             ON CONFLICT(id) DO UPDATE SET task_id=?2, kind='task', current=1",
+            params![session, task_id, cwd, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn register_pen(&self, session: &str, cwd: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions(id,kind,cwd,state_at) VALUES(?1,'pen',?2,?3) ON CONFLICT(id) DO UPDATE SET kind='pen'",
+            params![session, cwd, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_edited(&self, session: &str, root: &str, git_ref: &str) -> Result<()> {
+        self.conn.execute("UPDATE sessions SET edited=1 WHERE id=?1", [session])?;
+        self.conn.execute(
+            "INSERT INTO repos(session_id,root,git_ref) VALUES(?1,?2,?3)
+             ON CONFLICT(session_id,root) DO UPDATE SET git_ref=?3",
+            params![session, root, git_ref],
+        )?;
+        Ok(())
+    }
+
+    pub fn task_repos(&self, task_id: i64) -> Result<Vec<String>> {
+        let mut q = self.conn.prepare(
+            "SELECT DISTINCT r.root FROM repos r JOIN sessions s ON s.id=r.session_id WHERE s.task_id=?1 ORDER BY r.root",
+        )?;
+        let rows = q.query_map([task_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_pr(&self, task_id: i64, root: &str, url: Option<&str>, waiver: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO prs(task_id,root,url,waiver) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(task_id,root) DO UPDATE SET url=?3, waiver=?4",
+            params![task_id, root, url, waiver],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_pr_state(&self, task_id: i64, root: &str, state: PrState, reviewers: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE prs SET state=?3, reviewers=?4 WHERE task_id=?1 AND root=?2 AND (state!=?3 OR reviewers!=?4)",
+            params![task_id, root, state.as_str(), reviewers],
+        )? > 0;
+        if changed {
+            self.add_event(task_id, "pr", &format!("{}: {state}", gate::basename(root)))?;
+        }
+        Ok(changed)
+    }
+
+    pub fn prs(&self, task_id: i64) -> Result<Vec<Pr>> {
+        let mut q = self.conn.prepare("SELECT root,url,waiver,state,reviewers FROM prs WHERE task_id=?1 ORDER BY root")?;
+        let rows = q
+            .query_map([task_id], |r| {
+                let state: String = r.get(3)?;
+                Ok(Pr {
+                    task_id,
+                    root: r.get(0)?,
+                    url: r.get(1)?,
+                    waiver: r.get(2)?,
+                    state: PrState::from_str(&state).unwrap_or(PrState::Unknown),
+                    reviewers: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_explainer(&self, task_id: i64, path: &str) -> Result<()> {
+        self.conn.execute("UPDATE tasks SET explainer=?1 WHERE id=?2", params![path, task_id])?;
+        Ok(())
+    }
+
+    pub fn untracked(&self) -> Result<Vec<Session>> {
+        self.query_sessions("WHERE kind='task' AND task_id IS NULL AND edited=1 AND state!='ended'", [])
     }
 
     pub fn add_event(&self, task_id: i64, kind: &str, detail: &str) -> Result<()> {

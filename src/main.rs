@@ -1,6 +1,7 @@
 mod app;
 mod board;
 mod config;
+mod gate;
 mod install;
 mod model;
 mod state;
