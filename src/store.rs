@@ -23,6 +23,22 @@ CREATE TABLE IF NOT EXISTS prs(
 CREATE TABLE IF NOT EXISTS events(
     id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');";
 
+/// Switching a file to WAL needs a lock the busy timeout doesn't reliably wait for, so retry
+/// within the caller's budget; failing that, carry on in the current journal mode.
+fn enable_wal(conn: &Connection, ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        let mode: rusqlite::Result<String> = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0));
+        if mode.is_ok_and(|m| m == "wal") || conn.pragma_update(None, "journal_mode", "WAL").is_ok() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Brings any database (new, or created at user_version 1) to version 2.
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -107,7 +123,7 @@ impl Store {
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_millis(ms))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        enable_wal(&conn, ms);
         migrate(&conn)?;
         Ok(Store { conn })
     }
@@ -669,7 +685,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cb-race-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = v1_db(&dir);
-        let hs: Vec<_> = (0..2).map(|_| { let p = path.clone(); std::thread::spawn(move || Store::open(&p).map(|s| version(&s))) }).collect();
+        let hs: Vec<_> = (0..4).map(|_| { let p = path.clone(); std::thread::spawn(move || Store::open(&p).map(|s| version(&s))) }).collect();
         for h in hs {
             assert_eq!(h.join().unwrap().unwrap(), 2);
         }
