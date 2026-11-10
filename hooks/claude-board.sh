@@ -20,6 +20,9 @@ IN_PROGRESS="In progress"
 NEEDS_REVIEW="Needs review"
 UP_NEXT="Up next"
 
+# Stdin-reading (hook) modes consume stdin before any early exit, or the writer gets SIGPIPE.
+[[ $action =~ ^(claim|register-pen|close|add|next)$ ]] || input=$(cat)
+
 if [[ ! -r $TOKEN_FILE ]]; then
   echo "claude-board: no Todoist token at $TOKEN_FILE" >&2
   [[ $action =~ ^(next|claim|add)$ ]] && exit 1
@@ -33,7 +36,7 @@ case "$action" in
   register-pen|close) input=$(jq -nc --arg s "${2:-}" '{session_id:$s}') ;;
   add) input='{"session_id":"add"}' ;;  # no session; "add" is just a lock name
   next) input='{"session_id":"next"}' ;;  # no session; "next" is just a lock name
-  *) input=$(cat) ;;
+  *) ;;  # input already read above
 esac
 
 session=$(jq -r '.session_id // empty' <<<"$input")
