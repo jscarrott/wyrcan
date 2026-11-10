@@ -1,4 +1,4 @@
-#![allow(dead_code)] // used by Task 9 sync
+use crate::sync::{Remote, Sections};
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
 use std::time::Duration;
@@ -16,12 +16,6 @@ pub struct Task {
     pub child_order: i64,
 }
 
-pub struct SectionIds {
-    pub up_next: String,
-    pub in_progress: String,
-    pub needs_review: String,
-}
-
 #[derive(Deserialize)]
 struct Page<T> {
     results: Vec<T>,
@@ -33,6 +27,7 @@ fn parse<T: serde::de::DeserializeOwned>(body: &str) -> anyhow::Result<(Vec<T>, 
     Ok((p.results, p.next_cursor))
 }
 
+#[cfg(test)]
 pub fn parse_page(body: &str) -> anyhow::Result<(Vec<Task>, Option<String>)> {
     parse(body)
 }
@@ -55,6 +50,7 @@ pub struct Client {
     agent: ureq::Agent,
     base: String,
     token: String,
+    project_id: String,
 }
 
 impl Client {
@@ -67,7 +63,7 @@ impl Client {
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "https://api.todoist.com/api/v1".into());
-        Client { agent, base, token }
+        Client { agent, base, token, project_id: String::new() }
     }
 
     fn get(&self, path: &str, query: &[(&str, &str)]) -> anyhow::Result<String> {
@@ -102,7 +98,7 @@ impl Client {
         Ok(items.into_iter().find(|i| i.name == name).map(|i| i.id))
     }
 
-    pub fn resolve(&self, project: &str) -> anyhow::Result<(String, SectionIds)> {
+    fn resolve(&self, project: &str) -> anyhow::Result<(String, Sections)> {
         let hint = "create the project in Todoist";
         let pid = self
             .find_id("/projects", &[], project)?
@@ -111,16 +107,13 @@ impl Client {
             self.find_id("/sections", &[("project_id", &pid)], n)?
                 .ok_or_else(|| anyhow!("section {n:?} not found in {project:?}; {hint}"))
         };
-        let ids = SectionIds {
-            up_next: sec("Up next")?,
-            in_progress: sec("In progress")?,
-            needs_review: sec("Needs review")?,
+        let (up_next, in_progress, needs_review) = (sec("Up next")?, sec("In progress")?, sec("Needs review")?);
+        // The board's own section: made on demand.
+        let parked = match self.find_id("/sections", &[("project_id", &pid)], "Parked")? {
+            Some(id) => id,
+            None => self.create("/sections", serde_json::json!({ "name": "Parked", "project_id": pid }))?,
         };
-        Ok((pid, ids))
-    }
-
-    pub fn tasks(&self, project_id: &str) -> anyhow::Result<Vec<Task>> {
-        self.list("/tasks", &[("project_id", project_id)])
+        Ok((pid, Sections { up_next, in_progress, needs_review, parked }))
     }
 
     fn post(&self, path: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
@@ -129,26 +122,53 @@ impl Client {
             .header("Authorization", format!("Bearer {}", self.token))
     }
 
-    pub fn complete(&self, task_id: &str) -> anyhow::Result<()> {
-        self.post(&format!("/tasks/{task_id}/close")).send_empty().context("closing task")?;
-        Ok(())
+    /// POSTs JSON and returns the new object's id.
+    fn create(&self, path: &str, body: serde_json::Value) -> anyhow::Result<String> {
+        let mut resp = self.post(path).send_json(body).with_context(|| format!("POST {path}"))?;
+        #[derive(Deserialize)]
+        struct Created {
+            id: String,
+        }
+        Ok(resp.body_mut().read_json::<Created>()?.id)
+    }
+}
+
+/// Resolves the project and its sections (creating "Parked" if missing).
+pub fn connect(cfg: &crate::config::Config) -> anyhow::Result<(Client, Sections)> {
+    let mut c = Client::new(cfg.token()?);
+    let (pid, sections) = c.resolve(&cfg.project)?;
+    c.project_id = pid;
+    Ok((c, sections))
+}
+
+impl Remote for Client {
+    fn tasks(&self) -> anyhow::Result<Vec<Task>> {
+        self.list("/tasks", &[("project_id", &self.project_id)])
     }
 
-    pub fn move_task(&self, task_id: &str, section_id: &str) -> anyhow::Result<()> {
-        self.post(&format!("/tasks/{task_id}/move"))
+    fn create_task(&self, title: &str, description: &str, labels: &[String], section_id: Option<&str>) -> anyhow::Result<String> {
+        let mut body = serde_json::json!({ "content": title, "description": description, "labels": labels, "project_id": self.project_id });
+        if let Some(s) = section_id {
+            body["section_id"] = s.into();
+        }
+        self.create("/tasks", body)
+    }
+
+    fn move_task(&self, id: &str, section_id: &str) -> anyhow::Result<()> {
+        self.post(&format!("/tasks/{id}/move"))
             .send_json(serde_json::json!({ "section_id": section_id }))
             .context("moving task")?;
         Ok(())
     }
 
-    /// Comments come oldest first.
-    pub fn latest_comment(&self, task_id: &str) -> anyhow::Result<Option<String>> {
-        #[derive(Deserialize)]
-        struct Comment {
-            content: String,
-        }
-        let mut cs: Vec<Comment> = self.list("/comments", &[("task_id", task_id)])?;
-        Ok(cs.pop().map(|c| c.content))
+    fn complete(&self, id: &str) -> anyhow::Result<()> {
+        self.post(&format!("/tasks/{id}/close")).send_empty().context("closing task")?;
+        Ok(())
+    }
+
+    fn add_comment(&self, id: &str, text: &str) -> anyhow::Result<()> {
+        self.create("/comments", serde_json::json!({ "task_id": id, "content": text }))?;
+        Ok(())
     }
 }
 
@@ -207,13 +227,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn live_resolve_finds_board() {
-        let cfg = crate::config::Config::from_env();
-        let c = Client::new(cfg.token().unwrap());
-        let (pid, ids) = c.resolve(&cfg.project).unwrap();
-        assert!(!pid.is_empty() && !ids.up_next.is_empty());
-        assert!(!ids.in_progress.is_empty() && !ids.needs_review.is_empty());
-        c.tasks(&pid).unwrap();
+    #[ignore] // talks to the real account; run only with the user present
+    fn live_connect_finds_board() {
+        let (c, ids) = connect(&crate::config::Config::from_env()).unwrap();
+        assert!(!ids.up_next.is_empty() && !ids.parked.is_empty());
+        c.tasks().unwrap();
     }
 }

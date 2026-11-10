@@ -640,6 +640,7 @@ pub(crate) mod tests {
         Config {
             token_file: "/nonexistent/token".into(),
             project: "Claude Board".into(),
+            todoist: false,
             state_dir: "/nonexistent/state".into(),
             claude_dir: "/c".into(),
             max_active: max,

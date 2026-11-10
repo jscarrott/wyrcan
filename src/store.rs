@@ -21,8 +21,30 @@ CREATE TABLE IF NOT EXISTS prs(
     task_id INTEGER NOT NULL, root TEXT NOT NULL, url TEXT, waiver TEXT,
     state TEXT NOT NULL DEFAULT 'unknown', reviewers TEXT NOT NULL DEFAULT '', UNIQUE(task_id, root));
 CREATE TABLE IF NOT EXISTS events(
-    id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
-PRAGMA user_version = 1;";
+    id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');";
+
+/// Brings any database (new, or created at user_version 1) to version 2.
+fn migrate(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    let version = |c: &Connection| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0));
+    if version(conn)? >= 2 {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // Another process may have migrated while we waited for the lock.
+    let r = (|| -> Result<()> {
+        if version(conn)? < 2 {
+            conn.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN synced_stage TEXT;
+                 CREATE UNIQUE INDEX IF NOT EXISTS tasks_todoist_id ON tasks(todoist_id) WHERE todoist_id IS NOT NULL;
+                 PRAGMA user_version = 2;",
+            )?;
+        }
+        Ok(())
+    })();
+    conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    r
+}
 
 pub struct NewTask<'a> {
     pub title: &'a str,
@@ -48,7 +70,7 @@ pub(crate) fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
-const TASK_COLS: &str = "id,title,description,kind,stage,position,dir,labels,explainer,todoist_id,created_at,stage_at";
+const TASK_COLS: &str = "id,title,description,kind,stage,position,dir,labels,explainer,todoist_id,created_at,stage_at,synced_stage";
 
 fn task_row(r: &rusqlite::Row) -> rusqlite::Result<Task> {
     let stage: String = r.get(4)?;
@@ -66,6 +88,7 @@ fn task_row(r: &rusqlite::Row) -> rusqlite::Result<Task> {
         todoist_id: r.get(9)?,
         created_at: r.get(10)?,
         stage_at: r.get(11)?,
+        synced_stage: r.get(12)?,
     })
 }
 
@@ -81,14 +104,14 @@ impl Store {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_millis(ms))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Store { conn })
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Store {
         let conn = Connection::open_in_memory().expect("in-memory sqlite");
-        conn.execute_batch(SCHEMA).expect("schema");
+        migrate(&conn).expect("schema");
         Store { conn }
     }
 
@@ -128,7 +151,23 @@ impl Store {
         Ok(())
     }
 
-    #[allow(dead_code)] // queue order from Todoist, Task 9
+    /// A task that came from Todoist: `stage` is where it lands, `synced` what Todoist is known to hold.
+    pub fn add_imported(&self, t: NewTask, stage: Stage, synced: Option<&str>) -> Result<i64> {
+        let id = self.add_task(t)?;
+        self.conn.execute("UPDATE tasks SET stage=?1, synced_stage=?2 WHERE id=?3", params![stage.as_str(), synced, id])?;
+        Ok(id)
+    }
+
+    pub fn set_todoist_id(&self, id: i64, todoist_id: &str) -> Result<()> {
+        self.conn.execute("UPDATE tasks SET todoist_id=?1 WHERE id=?2", params![todoist_id, id])?;
+        Ok(())
+    }
+
+    pub fn set_synced_stage(&self, id: i64, stage: Stage) -> Result<()> {
+        self.conn.execute("UPDATE tasks SET synced_stage=?1 WHERE id=?2", params![stage.as_str(), id])?;
+        Ok(())
+    }
+
     pub fn set_position(&self, id: i64, position: f64) -> Result<()> {
         self.conn.execute("UPDATE tasks SET position=?1 WHERE id=?2", params![position, id])?;
         Ok(())
@@ -524,5 +563,44 @@ mod tests {
             assert!(v[k].is_array(), "{k}");
         }
         assert_eq!(v["tasks"][0]["labels"][0], "l");
+    }
+
+    fn v1_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("board.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute_batch("PRAGMA user_version = 1; INSERT INTO tasks(title,created_at,stage_at,stage) VALUES('old',1,1,'review')").unwrap();
+        path
+    }
+
+    fn version(s: &Store) -> i64 {
+        s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn v1_database_upgrades_keeping_rows_and_twice_is_a_noop() {
+        let dir = std::env::temp_dir().join(format!("cb-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = v1_db(&dir);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(version(&s), 2);
+        let t = s.tasks().unwrap();
+        assert_eq!((t.len(), t[0].title.as_str(), t[0].stage, t[0].synced_stage.clone()), (1, "old", Stage::Review, None));
+        s.set_synced_stage(t[0].id, Stage::Review).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!((version(&s), s.tasks().unwrap()[0].synced_stage.as_deref()), (2, Some("review")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_database_is_v2_and_todoist_ids_are_unique() {
+        let s = Store::open_in_memory();
+        assert_eq!(version(&s), 2);
+        let mk = |tid| s.add_task(NewTask { title: "x", description: "", dir: None, labels: &[], todoist_id: tid });
+        mk(None).unwrap();
+        mk(None).unwrap();
+        mk(Some("a")).unwrap();
+        assert!(mk(Some("a")).is_err());
     }
 }

@@ -214,6 +214,7 @@ mod tests {
             labels: vec!["delta".into(), "api".into()],
             explainer: None,
             todoist_id: None,
+            synced_stage: None,
             created_at: 0,
             stage_at: 0,
         };

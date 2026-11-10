@@ -6,16 +6,19 @@ use crate::store::{NewTask, Store};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. | next | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] | drop TASK_ID | export";
+const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. | next | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] | drop TASK_ID | export | sync";
 
 pub fn run(args: &[String], cfg: &Config) -> Result<i32> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    if !matches!(a.first(), Some(&("add" | "next" | "claim" | "register-pen" | "status" | "gate" | "drop" | "export"))) {
+    if !matches!(a.first(), Some(&("add" | "next" | "claim" | "register-pen" | "status" | "gate" | "drop" | "export" | "sync"))) {
         eprintln!("{USAGE}");
         return Ok(2);
     }
     std::fs::create_dir_all(&cfg.state_dir)?;
     let store = Store::open(&cfg.db_path())?;
+    if a[0] == "sync" {
+        return sync(&store, cfg);
+    }
     let (code, text) = match exec(&store, &a, cfg, &crate::pr::exists) {
         Ok(v) => v,
         Err(e) if e.downcast_ref::<Usage>().is_some() => (2, format!("{e}\n{USAGE}")),
@@ -27,6 +30,17 @@ pub fn run(args: &[String], cfg: &Config) -> Result<i32> {
         eprintln!("{text}");
     }
     Ok(code)
+}
+
+fn sync(store: &Store, cfg: &Config) -> Result<i32> {
+    if !cfg.todoist {
+        eprintln!("Todoist sync is off (set todoist = true in ~/.config/claude-board/config.toml)");
+        return Ok(1);
+    }
+    let (client, sections) = crate::todoist::connect(cfg)?;
+    let r = crate::sync::sync_once(store, &client, &sections)?;
+    println!("imported {}, pushed {}, missing remotely {}", r.imported, r.pushed, r.missing);
+    Ok(0)
 }
 
 #[derive(Debug)]

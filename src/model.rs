@@ -42,13 +42,13 @@ pub struct Task {
     pub description: String,
     pub kind: String,
     pub stage: Stage,
-    #[allow(dead_code)] // queue order from Todoist, Task 9
     pub position: f64,
     pub dir: Option<String>,
     pub labels: Vec<String>,
     pub explainer: Option<String>,
-    #[allow(dead_code)] // Task 9 sync
     pub todoist_id: Option<String>,
+    /// The stage last pushed to Todoist.
+    pub synced_stage: Option<String>,
     pub created_at: i64,
     pub stage_at: i64,
 }

@@ -8,6 +8,7 @@ mod install;
 mod model;
 mod pr;
 mod store;
+mod sync;
 mod todoist;
 mod ui;
 mod zellij;
@@ -60,6 +61,7 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, store: &store:
     let (tx, rx) = mpsc::channel::<(i64, Option<String>)>();
     let mut checking: HashSet<i64> = HashSet::new();
     spawn_poller();
+    sync::spawn(cfg, tx.clone());
 
     loop {
         let mut done = false;

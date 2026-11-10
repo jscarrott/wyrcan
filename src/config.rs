@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 pub struct Config {
-    #[allow(dead_code)] // used by Task 9 sync
     pub token_file: PathBuf,
-    #[allow(dead_code)] // used by Task 9 sync
     pub project: String,
+    /// `todoist = true` in the file turns the sync on.
+    pub todoist: bool,
     pub state_dir: PathBuf,
     /// Claude Code config dir: hooks, skills and settings.json live here.
     pub claude_dir: PathBuf,
@@ -56,7 +56,10 @@ impl Config {
             token_file: var("CLAUDE_BOARD_TOKEN_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home().join(".config/todoist/token")),
-            project: var("CLAUDE_BOARD_PROJECT").unwrap_or_else(|| "Claude Board".into()),
+            project: var("CLAUDE_BOARD_PROJECT")
+                .or_else(|| file_value(&file, "todoist_project"))
+                .unwrap_or_else(|| "Claude Board".into()),
+            todoist: file_value(&file, "todoist").is_some_and(|v| v == "true"),
             state_dir: var("CLAUDE_BOARD_STATE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home().join(".local/state/claude-board")),
@@ -83,7 +86,6 @@ impl Config {
         self.state_dir.join("explainers")
     }
 
-    #[allow(dead_code)] // used by Task 9 sync
     pub fn token(&self) -> anyhow::Result<String> {
         use anyhow::Context;
         let t = std::fs::read_to_string(&self.token_file)
