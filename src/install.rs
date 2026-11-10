@@ -125,7 +125,7 @@ pub fn run(repo_root: &Path, claude: &Path, bin_dir: &Path) -> Result<()> {
         std::fs::rename(&tmp, &settings_path).context("replacing settings.json")?;
         println!("updated {}", settings_path.display());
     }
-    println!("zellij keybinding: to be defined with the board screen (not installed yet)");
+    println!("Add this to the `keybinds` block of your zellij config (not edited for you):\n{}", crate::zellij::RETURN_KEYBIND);
     Ok(())
 }
 
