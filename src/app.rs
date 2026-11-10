@@ -95,7 +95,10 @@ pub fn snapshot(store: &Store, cfg: &Config) -> anyhow::Result<Snapshot> {
     };
     groups[0].1.sort_by_key(rank);
     groups[4].1 = store.untracked()?.into_iter().map(|s| Card { task: None, session: Some(s), prs: vec![], missing: vec![], flag: None }).collect();
-    let writers: Vec<Session> = sessions.into_iter().filter(|s| s.kind == SessionKind::Pen && s.state != AgentState::Ended).collect();
+    // A pen session whose SessionEnd never came would otherwise stay on the Pen line forever.
+    let stale = crate::store::now() - 24 * 3600;
+    let writers: Vec<Session> =
+        sessions.into_iter().filter(|s| s.kind == SessionKind::Pen && s.state != AgentState::Ended && s.state_at >= stale).collect();
     let blocked = groups
         .iter()
         .flat_map(|g| &g.1)
@@ -131,6 +134,8 @@ pub enum Effect {
     Done(i64),
     Drop(i64),
     Adopt { session: String, title: String },
+    /// Marks an untracked session ended; it comes back if it reports again.
+    Dismiss(String),
     /// Saves the directory typed into the prompt; the Start/Resume after it then goes ahead.
     SetDir { id: i64, dir: String },
     Show(i64),
@@ -520,6 +525,8 @@ impl App {
             KeyCode::Char('D') => {
                 if let Some((t, _)) = self.task() {
                     self.ask(format!("Drop '{}'? y/n", t.title), Effect::Drop(t.id));
+                } else if let Some(s) = self.selected_card().and_then(|c| c.session.clone()) {
+                    self.ask(format!("Dismiss '{}'? y/n", gate::basename(&s.cwd)), Effect::Dismiss(s.id));
                 }
                 vec![]
             }
@@ -825,6 +832,27 @@ pub(crate) mod tests {
         }
         assert_eq!(ap.on_key_event(KeyCode::Enter.into()), [Effect::Adopt { session: "u1".into(), title: "proj-x".into() }]);
         assert!(ap.prompt.is_none());
+    }
+
+    #[test]
+    fn untracked_card_can_be_dismissed() {
+        let s = Store::open_in_memory();
+        session(&s, "u1", None, AgentState::Waiting);
+        s.mark_edited("u1", "/w/proj", "git main").unwrap();
+        let mut ap = app(&s, &cfg(3));
+        assert!(ap.on_key_event(key('D')).is_empty());
+        assert_eq!(ap.confirm.as_ref().unwrap().prompt, "Dismiss 'proj'? y/n");
+        assert_eq!(ap.on_key_event(key('y')), [Effect::Dismiss("u1".into())]);
+    }
+
+    #[test]
+    fn stale_pen_writers_drop_off() {
+        let s = Store::open_in_memory();
+        s.register_pen("fresh", "/w").unwrap();
+        s.register_pen("stale", "/w").unwrap();
+        s.conn.execute("UPDATE sessions SET state_at=state_at-25*3600 WHERE id='stale'", []).unwrap();
+        let w: Vec<String> = snapshot(&s, &cfg(3)).unwrap().writers.into_iter().map(|x| x.id).collect();
+        assert_eq!(w, ["fresh"]);
     }
 
     #[test]

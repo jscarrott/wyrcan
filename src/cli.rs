@@ -29,6 +29,12 @@ pub fn run(args: &[String], cfg: &Config) -> Result<i32> {
     } else {
         eprintln!("{text}");
     }
+    // Here, not in exec, so tests stay offline: the board shows PR state now instead of after the next poll.
+    if code == 0 && a[0] == "gate" {
+        if let Some(t) = gate_task(&store, &a)? {
+            crate::pr::refresh(&store, t.id);
+        }
+    }
     Ok(code)
 }
 
@@ -87,6 +93,16 @@ fn session_task(store: &Store, session: &str) -> Result<Option<Task>> {
     }
 }
 
+const GATE_FLAGS: &[&str] = &["--pr", "--no-pr", "--explainer", "--summary"];
+
+/// The task a `gate` command line is about.
+fn gate_task(store: &Store, a: &[&str]) -> Result<Option<Task>> {
+    match parse(&a[1..], GATE_FLAGS)?.0[..] {
+        [session] => session_task(store, session),
+        _ => Ok(None),
+    }
+}
+
 fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<(i32, String)> {
     let ok = |s: String| Ok((0, s));
     let rest = &a[1..];
@@ -132,7 +148,7 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
             ok(json!({"task": task_json(&t), "repos": store.task_repos(t.id)?, "prs": prs, "missing": missing}).to_string())
         }
         "gate" => {
-            let (pos, fl) = parse(rest, &["--pr", "--no-pr", "--explainer", "--summary"])?;
+            let (pos, fl) = parse(rest, GATE_FLAGS)?;
             let [session] = pos[..] else { return usage("gate takes one SESSION") };
             let Some(t) = session_task(store, session)? else { return Ok((1, "This session has no task.".into())) };
             for (k, v) in &fl {
@@ -311,6 +327,17 @@ mod tests {
         assert_eq!(stage(&s, id), Stage::Active);
         assert_eq!(go(&s, &c, &["gate", "s", "--no-pr", "/w=dotfiles only"], true), (0, "In review.".into()));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gate_task_finds_the_sessions_task() {
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        let id = claimed(&s, &c);
+        let t = |a: &[&str]| gate_task(&s, a).unwrap().map(|t| t.id);
+        assert_eq!(t(&["gate", "s", "--summary", "x"]), Some(id));
+        assert_eq!(t(&["gate", "--no-pr", "/r=-s", "s"]), Some(id));
+        assert_eq!(t(&["gate", "nobody"]), None);
     }
 
     #[test]

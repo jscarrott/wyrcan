@@ -279,10 +279,11 @@ impl Store {
     }
 
     /// False if the session is absent and `create` is not set. `state_at` moves only when the state does.
+    /// `cwd` is set once: Bash `cd` moves the reported cwd, but `claude --resume` must run where the session began.
     pub fn touch_session(&self, u: SessionUpdate, create: bool) -> Result<bool> {
         let n = now();
         let changed = self.conn.execute(
-            "UPDATE sessions SET cwd=?2, state_at=CASE WHEN state!=?3 THEN ?4 ELSE state_at END, state=?3,
+            "UPDATE sessions SET cwd=CASE WHEN cwd='' THEN ?2 ELSE cwd END, state_at=CASE WHEN state!=?3 THEN ?4 ELSE state_at END, state=?3,
                zellij_session=COALESCE(?5,zellij_session), zellij_pane=COALESCE(?6,zellij_pane) WHERE id=?1",
             params![u.id, u.cwd, u.state.as_str(), n, u.zellij_session, u.zellij_pane],
         )?;
@@ -380,6 +381,12 @@ impl Store {
 
     pub fn set_explainer(&self, task_id: i64, path: &str) -> Result<()> {
         self.conn.execute("UPDATE tasks SET explainer=?1 WHERE id=?2", params![path, task_id])?;
+        Ok(())
+    }
+
+    /// For a session whose SessionEnd never came; its next report brings it back.
+    pub fn end_session(&self, id: &str) -> Result<()> {
+        self.conn.execute("UPDATE sessions SET state='ended', state_at=?2 WHERE id=?1", params![id, now()])?;
         Ok(())
     }
 
@@ -558,6 +565,17 @@ mod tests {
         assert_eq!(Refusal::Gate(vec!["a".into(), "b".into()]).to_string(), "Not ready for review: a; b");
         assert_eq!(Refusal::NotAllowed { from: Stage::Done, to: Stage::Active }.to_string(), "Can't move from done to active.");
         assert_eq!(Refusal::NotMerged.to_string(), "Not merged yet. Drop it if you want to abandon it.");
+    }
+
+    #[test]
+    fn session_keeps_its_launch_cwd() {
+        let s = Store::open_in_memory();
+        let u = |cwd| SessionUpdate { id: "s", cwd, state: AgentState::Working, zellij_session: None, zellij_pane: None };
+        s.touch_session(u(""), true).unwrap();
+        s.touch_session(u("/w"), false).unwrap();
+        s.touch_session(u("/w/sub"), false).unwrap();
+        s.touch_session(u(""), false).unwrap();
+        assert_eq!(s.session("s").unwrap().unwrap().cwd, "/w");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 const KEYS: &[&str] = &[
-    "↑↓ card", "←→ group", "space view", "+ add", "n next", "s start", "P park", "w wrap", "H/L move", "x done", "D drop",
+    "↑↓ card", "←→ group", "space view", "+ add", "n next", "s start", "P park", "w wrap", "H/L move", "x done", "D drop/dismiss",
     "a adopt", "⏎ go to", "f full", "v wide", "p pen", "e explainer", "o PR", "q quit",
 ];
 const VIEW_KEYS: &[&str] = &["↑↓ scroll", "e explainer", "o PR", "w wrap", "P park", "x done", "D drop", "esc close"];

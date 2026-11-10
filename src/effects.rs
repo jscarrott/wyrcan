@@ -6,7 +6,7 @@ use crate::model::{AgentState, Refusal, SessionKind, Stage, Task};
 use crate::store::{NewTask, Store};
 use crate::zellij::{Runner, Zellij};
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct Ctx<'a> {
     pub store: &'a Store,
@@ -27,11 +27,13 @@ pub struct Panes {
     /// Board start: the tick only closes panes of streams that left Active after it,
     /// so a pane id reused after a zellij restart is never closed for a stale session.
     since: i64,
+    /// (task, stage_at) the tick has already dealt with: it closes at most once per stage entry.
+    settled: HashSet<(i64, i64)>,
 }
 
 impl Panes {
     pub fn new(since: i64) -> Panes {
-        Panes { live: vec![], opened: HashMap::new(), since }
+        Panes { live: vec![], opened: HashMap::new(), since, settled: HashSet::new() }
     }
 }
 
@@ -149,6 +151,7 @@ pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
             c.store.link_session(&session, id, &s.cwd)?;
             app.selected = Some(CardKey::Task(id));
         }
+        Effect::Dismiss(session) => c.store.end_session(&session)?,
         Effect::Show(id) => {
             // Moving through the list outside zellij, or onto a card without a pane, is fine.
             if c.zj.board().is_ok() {
@@ -161,6 +164,15 @@ pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
         Effect::Fullscreen(id) => c.zj.fullscreen(c.run, &c.live_pane(p, id)?)?,
         Effect::ToggleBoardWide => c.zj.toggle_board_fullscreen(c.run)?,
         Effect::Wrap(id) => {
+            // Enter would answer a permission prompt, or rerun an ended pane's command.
+            match c.store.current_session(id)?.map(|s| s.state) {
+                Some(AgentState::Waiting) => {}
+                Some(s) => {
+                    app.message = Some(format!("Agent is {s}; answer it first."));
+                    return Ok(());
+                }
+                None => bail!("No live session. Resume it first."),
+            }
             c.zj.type_line(c.run, &c.live_pane(p, id)?, "/wrap")?;
             app.message = Some("Asked it to wrap up.".into());
         }
@@ -246,6 +258,7 @@ fn xdg_open(target: &str) -> Result<()> {
 
 /// Every second: refresh the live panes and close the panes of streams that left Active, once their agent is idle.
 /// Working or Blocked (say, a wrapped-up agent on a permission prompt) keeps its pane.
+/// Once per stage entry: a stream later resumed by hand outside Active is only flagged.
 pub fn tick(c: &Ctx, p: &mut Panes) -> Result<()> {
     if c.zj.board().is_err() {
         return Ok(());
@@ -254,7 +267,7 @@ pub fn tick(c: &Ctx, p: &mut Panes) -> Result<()> {
     let sessions = c.store.sessions()?;
     for t in c.store.tasks()?.iter().filter(|t| t.stage != Stage::Active && t.stage_at >= p.since) {
         let Some(s) = sessions.iter().find(|s| s.task_id == Some(t.id) && s.current) else { continue };
-        if !matches!(s.state, AgentState::Waiting | AgentState::Ended) {
+        if !matches!(s.state, AgentState::Waiting | AgentState::Ended) || !p.settled.insert((t.id, t.stage_at)) {
             continue;
         }
         // pane_of confirms the pane is live and in this zellij session.
@@ -434,9 +447,9 @@ mod tests {
         let mut ap = app(&s, &c);
         let mut p = Panes::new(0);
         p.opened.insert(a, "terminal_9".into());
-        run_all(vec![Effect::Wrap(a)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
+        run_all(vec![Effect::Enter(a)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
         assert_eq!(ap.message.as_deref(), Some("No live session. Resume it first."));
-        assert!(!r.calls.borrow().iter().any(|l| l.contains("write-chars")));
+        assert!(!r.calls.borrow().iter().any(|l| l.contains("focus-pane-id terminal_9")));
     }
 
     #[test]
@@ -464,6 +477,33 @@ mod tests {
         let r = rec(&["terminal_0", "terminal_4"]);
         run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
         assert!(r.calls.borrow().contains(&"zellij action write-chars --pane-id terminal_4 /wrap".to_string()));
+    }
+
+    #[test]
+    fn wrap_only_types_into_a_waiting_agent() {
+        let (s, c, zj) = (Store::open_in_memory(), cfg(3), inside());
+        let id = add(&s, "a", Stage::Active);
+        session(&s, "s1", Some(id), AgentState::Waiting);
+        for (state, msg) in [(AgentState::Blocked, "Agent is blocked; answer it first."), (AgentState::Ended, "Agent is ended; answer it first."), (AgentState::Working, "Agent is working; answer it first.")] {
+            pane(&s, "s1", "terminal_4", state);
+            let r = rec(&["terminal_0", "terminal_4"]);
+            let mut ap = app(&s, &c);
+            run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+            assert_eq!(ap.message.as_deref(), Some(msg));
+            assert!(!r.calls.borrow().iter().any(|l| l.contains("write")), "{:?}", r.calls.borrow());
+        }
+    }
+
+    #[test]
+    fn dismiss_ends_an_untracked_session_until_it_reports_again() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&[]));
+        session(&s, "u1", None, AgentState::Waiting);
+        s.mark_edited("u1", "/w/proj", "git main").unwrap();
+        let mut ap = app(&s, &c);
+        run_all(vec![Effect::Dismiss("u1".into())], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert!(s.untracked().unwrap().is_empty());
+        session(&s, "u1", None, AgentState::Working);
+        assert_eq!(s.untracked().unwrap().len(), 1);
     }
 
     /// Draws the wide board, then drags `id`'s card onto the `to` column and runs what that asks for.
@@ -545,13 +585,22 @@ mod tests {
         mk(Stage::Review, "asking", "terminal_5", AgentState::Blocked);
         mk(Stage::Parked, "gone", "terminal_6", AgentState::Ended);
         mk(Stage::Active, "active", "terminal_3", AgentState::Waiting);
+        // Ended with its pane already gone: nothing to close, but the decision is made.
+        mk(Stage::Parked, "nopane", "terminal_8", AgentState::Ended);
         // A stale session whose recorded pane id is now someone else's: other zellij session.
         mk(Stage::Review, "stale", "terminal_4", AgentState::Waiting);
         s.touch_session(SessionUpdate { id: "stale", cwd: "/w", state: AgentState::Waiting, zellij_session: Some("old"), zellij_pane: None }, false).unwrap();
-        tick(&ctx(&s, &c, &zj, &r), &mut Panes::new(0)).unwrap();
+        let mut p = Panes::new(0);
+        tick(&ctx(&s, &c, &zj, &r), &mut p).unwrap();
         let mut closes: Vec<String> = r.calls.borrow().iter().filter(|l| l.contains("close-pane")).cloned().collect();
         closes.sort();
         assert_eq!(closes, ["zellij action close-pane --pane-id terminal_1", "zellij action close-pane --pane-id terminal_6"]);
+        // Resumed by hand in the user's own pane afterwards: flagged, never closed again.
+        pane(&s, "idle", "terminal_7", AgentState::Waiting);
+        pane(&s, "nopane", "terminal_8", AgentState::Waiting);
+        let r3 = rec(&["terminal_0", "terminal_7", "terminal_8"]);
+        tick(&ctx(&s, &c, &zj, &r3), &mut p).unwrap();
+        assert!(!r3.calls.borrow().iter().any(|l| l.contains("close-pane")), "{:?}", r3.calls.borrow());
         // Streams that left Active before the board started are left alone.
         let r2 = rec(&["terminal_0", "terminal_1"]);
         tick(&ctx(&s, &c, &zj, &r2), &mut Panes::new(i64::MAX)).unwrap();
