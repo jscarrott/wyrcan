@@ -1,5 +1,11 @@
 #[allow(dead_code)] // Config is consumed by later tasks
 mod config;
+#[allow(dead_code)] // consumed by Task 6
+mod board;
+#[allow(dead_code)]
+mod state;
+#[allow(dead_code)]
+mod todoist;
 mod install;
 
 fn main() -> anyhow::Result<()> {
