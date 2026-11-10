@@ -86,6 +86,8 @@ The board runs in a zellij pane and uses zellij for the Claude sessions. It does
 └──────────────────────────┘
 ```
 
+The sketch above is the board's **narrow form**, used beside a session. See "Look and feel" below for the full-width form, which is the home screen.
+
 - **Left: the board**, a narrow single list grouped by stage (Active, Review, Parked, Queue, Untracked). Cards show their **full title, wrapped**, never cut off, with the agent's state and how long it's been in it, repo labels, PR state, and any missing gate checks. Blocked agents stand out and the header counts them.
 - **Right: each stream's Claude session is a real zellij pane**, in a stack. Selecting a card brings that stream's pane to the front of the stack. One key makes it full screen; one key gets back to the board.
 - **Expand a card** (kept from the current build): title, description, session, directory, repos, PR link and state, gate status, history of stage changes.
@@ -96,6 +98,37 @@ The board runs in a zellij pane and uses zellij for the Claude sessions. It does
 - **Add to the queue** from the board: type a title (and optionally a directory), or start a `/pen` writer session as today.
 - **Open the explainer** or the PR in the browser with one key each.
 - **Untracked**: Claude sessions started outside the board. **(call)** A session appears here once it has edited a file (question-only sessions stay off the board, as today). I can adopt one as a stream; it then counts against the cap. The board can't stop me running `claude` by hand, but those sessions are visible instead of invisible.
+
+### Look and feel: like Todoist (user's decision)
+
+The UI should be much richer than the current build and look like Todoist. The board has two forms, like Todoist's board and list views, switched with one key:
+
+**Full width** — the home screen, for deciding what to do:
+
+```
+ Claude Board                                        2/3 active · 1 blocked
+ ──────────────────────────────────────────────────────────────────────────────────────
+  Active  2/3              Review  1                Parked  2               Queue  5
+ ╭──────────────────────╮ ╭──────────────────────╮ ╭──────────────────────╮ ╭────────────────────╮
+ │ ◉ Fix auth timeout   │ │ ○ Pcap parser drops  │ │ ○ Tidy ingest retry  │ │ ○ Rate-limit the   │
+ │   on token refresh   │ │   truncated frames   │ │   logic              │ │   export endpoint  │
+ │   ● working · 4m     │ │   ⧗ waiting on Sam   │ │   parked 2d          │ │   delta            │
+ │   delta   api        │ │   delta   #12692     │ │   delta              │ ╰────────────────────╯
+ ╰──────────────────────╯ ╰──────────────────────╯ ╰──────────────────────╯ ╭────────────────────╮
+ ╭──────────────────────╮                                                   │ ○ …                │
+ │ ◉ Ingest drops events│                                                   ╰────────────────────╯
+ │   ■ blocked · 12m    │                                                    + Add task
+ │   pipeline           │
+ ╰──────────────────────╯
+```
+
+**Narrow list** — the same cards in one grouped column, beside a Claude session (the first sketch).
+
+- **Cards** have a rounded border and space around them: full title, a status line, labels as coloured chips. The circle at the left is coloured by state: red blocked, green working, yellow waiting on me.
+- **Column headers with counts**, and a quiet "+ Add task" at the foot of the Queue.
+- **Quick add**: a one-line box; type a title with `@label` and `#directory` inline, parsed as I type.
+- **Task view is a modal** like Todoist's: title and description on the left with a thread underneath (stage changes, the agent's wrap-up summary, PR events, comments); a side panel on the right with stage, repos, PRs, explainer, session and dates.
+- **Restrained**: one accent colour, dim secondary text, thin dividers rather than heavy boxes.
 
 ### Directory for a new stream
 
