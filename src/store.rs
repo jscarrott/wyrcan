@@ -341,10 +341,13 @@ impl Store {
         Ok(rows)
     }
 
+    /// A different url or waiver is a different PR, so its known state starts over.
     pub fn set_pr(&self, task_id: i64, root: &str, url: Option<&str>, waiver: Option<&str>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO prs(task_id,root,url,waiver) VALUES(?1,?2,?3,?4)
-             ON CONFLICT(task_id,root) DO UPDATE SET url=?3, waiver=?4",
+             ON CONFLICT(task_id,root) DO UPDATE SET url=?3, waiver=?4,
+               state=CASE WHEN url IS ?3 AND waiver IS ?4 THEN state ELSE 'unknown' END,
+               reviewers=CASE WHEN url IS ?3 AND waiver IS ?4 THEN reviewers ELSE '' END",
             params![task_id, root, url, waiver],
         )?;
         Ok(())
@@ -400,6 +403,12 @@ impl Store {
             params![task_id, now(), kind, detail],
         )?;
         Ok(())
+    }
+
+    /// Adds an event, dropping the task's earlier events of the same kind.
+    pub fn replace_event(&self, task_id: i64, kind: &str, detail: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM events WHERE task_id=?1 AND kind=?2", params![task_id, kind])?;
+        self.add_event(task_id, kind, detail)
     }
 
     pub fn events(&self, task_id: i64) -> Result<Vec<Event>> {
@@ -576,6 +585,21 @@ mod tests {
         s.touch_session(u("/w/sub"), false).unwrap();
         s.touch_session(u(""), false).unwrap();
         assert_eq!(s.session("s").unwrap().unwrap().cwd, "/w");
+    }
+
+    #[test]
+    fn new_pr_value_resets_its_state() {
+        let s = Store::open_in_memory();
+        let st = |s: &Store| { let p = &s.prs(1).unwrap()[0]; (p.state, p.reviewers.clone()) };
+        s.set_pr(1, "/a", Some("https://x/1"), None).unwrap();
+        s.set_pr_state(1, "/a", PrState::Merged, "sam").unwrap();
+        s.set_pr(1, "/a", Some("https://x/1"), None).unwrap();
+        assert_eq!(st(&s), (PrState::Merged, "sam".into()));
+        s.set_pr(1, "/a", Some("https://x/2"), None).unwrap();
+        assert_eq!(st(&s), (PrState::Unknown, String::new()));
+        s.set_pr_state(1, "/a", PrState::Merged, "sam").unwrap();
+        s.set_pr(1, "/a", Some("https://x/2"), Some("no code")).unwrap();
+        assert_eq!(st(&s), (PrState::Unknown, String::new()));
     }
 
     #[test]

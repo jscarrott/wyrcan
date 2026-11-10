@@ -86,7 +86,8 @@ impl Zellij {
     fn open_with(&self, r: &dyn Runner, name: &str, cwd: &str, cmd: &[String], stack: &[String]) -> Result<String> {
         let board = self.board()?.to_string();
         let name: String = name.chars().take(30).collect();
-        let mut run = argv(&["zellij", "run", "--name", &name, "--cwd", cwd, "--no-focus"]);
+        // `--name=` keeps a title starting with `-` from being read as a flag.
+        let mut run = argv(&["zellij", "run", &format!("--name={name}"), "--cwd", cwd, "--no-focus"]);
         if stack.is_empty() {
             run.extend(argv(&["--direction", "right"]));
         }
@@ -129,7 +130,7 @@ impl Zellij {
     }
 
     pub fn type_line(&self, r: &dyn Runner, pane: &str, text: &str) -> Result<()> {
-        self.act(r, &["write-chars", "--pane-id", pane, text])?;
+        self.act(r, &["write-chars", "--pane-id", pane, "--", text])?;
         self.act(r, &["write", "--pane-id", pane, "13"]).map(drop)
     }
 }
@@ -181,7 +182,7 @@ mod tests {
         assert_eq!(
             r.calls(),
             [
-                "zellij run --name t --cwd /w --no-focus --direction right -- env CLAUDE_CONFIG_DIR=/c claude /next",
+                "zellij run --name=t --cwd /w --no-focus --direction right -- env CLAUDE_CONFIG_DIR=/c claude /next",
                 "zellij action focus-pane-id terminal_0",
             ]
         );
@@ -193,7 +194,7 @@ mod tests {
         let stack = ["terminal_1".to_string(), "terminal_2".to_string()];
         zj().open(&r, &"n".repeat(40), "/w", "/c", &[], &stack).unwrap();
         let c = r.calls();
-        assert_eq!(c[0], format!("zellij run --name {} --cwd /w --no-focus -- env CLAUDE_CONFIG_DIR=/c claude", "n".repeat(30)));
+        assert_eq!(c[0], format!("zellij run --name={} --cwd /w --no-focus -- env CLAUDE_CONFIG_DIR=/c claude", "n".repeat(30)));
         assert_eq!(c[1], "zellij action stack-panes -- terminal_1 terminal_2 terminal_5");
         assert_eq!(c[2], "zellij action focus-pane-id terminal_0");
     }
@@ -238,7 +239,7 @@ mod tests {
         zj().type_line(&r, "terminal_1", "/wrap").unwrap();
         assert_eq!(
             r.calls(),
-            ["zellij action write-chars --pane-id terminal_1 /wrap", "zellij action write --pane-id terminal_1 13"]
+            ["zellij action write-chars --pane-id terminal_1 -- /wrap", "zellij action write --pane-id terminal_1 13"]
         );
     }
 

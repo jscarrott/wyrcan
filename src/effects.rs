@@ -187,6 +187,9 @@ pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
                 bail!("No PR yet.");
             }
             for u in urls {
+                if !u.starts_with("https://") {
+                    bail!("Not opening {u}: not an https URL.");
+                }
                 xdg_open(&u)?;
             }
         }
@@ -476,7 +479,7 @@ mod tests {
         assert_eq!(ap.message.as_deref(), Some("No live session. Resume it first."));
         let r = rec(&["terminal_0", "terminal_4"]);
         run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
-        assert!(r.calls.borrow().contains(&"zellij action write-chars --pane-id terminal_4 /wrap".to_string()));
+        assert!(r.calls.borrow().contains(&"zellij action write-chars --pane-id terminal_4 -- /wrap".to_string()));
     }
 
     #[test]
@@ -504,6 +507,16 @@ mod tests {
         assert!(s.untracked().unwrap().is_empty());
         session(&s, "u1", None, AgentState::Working);
         assert_eq!(s.untracked().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_pr_refuses_a_non_https_value() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&[]));
+        let id = add(&s, "a", Stage::Review);
+        s.set_pr(id, "/r/app", Some("--help"), None).unwrap();
+        let mut ap = app(&s, &c);
+        run_all(vec![Effect::OpenPr(id)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        assert_eq!(ap.message.as_deref(), Some("Not opening --help: not an https URL."));
     }
 
     /// Draws the wide board, then drags `id`'s card onto the `to` column and runs what that asks for.

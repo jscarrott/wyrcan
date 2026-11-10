@@ -110,6 +110,9 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
         "add" => {
             let (pos, fl) = parse(rest, &["--desc", "--dir", "--label"])?;
             let [title] = pos[..] else { return usage("add takes one TITLE") };
+            if title.trim().is_empty() {
+                return usage("TITLE can't be blank");
+            }
             let val = |k| fl.iter().rev().find(|f| f.0 == k).map(|f| f.1);
             let labels: Vec<String> = fl.iter().filter(|f| f.0 == "--label").map(|f| f.1.to_string()).collect();
             let id = store.add_task(NewTask { title, description: val("--desc").unwrap_or(""), dir: val("--dir"), labels: &labels, todoist_id: None })?;
@@ -155,6 +158,10 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
                 match *k {
                     "--pr" | "--no-pr" => {
                         let Some((root, val)) = v.split_once('=') else { return usage(&format!("{k} wants ROOT=VALUE")) };
+                        // The board hands a PR value to xdg-open.
+                        if *k == "--pr" && !val.starts_with("https://") {
+                            return usage(&format!("--pr wants an https:// URL, got {val}"));
+                        }
                         let (url, waiver) = if *k == "--pr" { (Some(val), None) } else { (None, Some(val)) };
                         store.set_pr(t.id, root, url, waiver)?;
                     }
@@ -296,8 +303,8 @@ mod tests {
         assert!(msg.contains("no PR for app") && msg.contains("no explainer"), "{msg}");
         assert_eq!(stage(&s, id), Stage::Active);
         // An unverifiable PR is refused too.
-        let (code, msg) = go(&s, &c, &["gate", "s", "--pr", "/r/app=u"], false);
-        assert!(code == 1 && msg.contains("couldn't verify PR u"), "{msg}");
+        let (code, msg) = go(&s, &c, &["gate", "s", "--pr", "/r/app=https://x/u"], false);
+        assert!(code == 1 && msg.contains("couldn't verify PR https://x/u"), "{msg}");
     }
 
     #[test]
@@ -338,6 +345,26 @@ mod tests {
         assert_eq!(t(&["gate", "s", "--summary", "x"]), Some(id));
         assert_eq!(t(&["gate", "--no-pr", "/r=-s", "s"]), Some(id));
         assert_eq!(t(&["gate", "nobody"]), None);
+    }
+
+    #[test]
+    fn gate_refuses_a_pr_that_is_not_https() {
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        claimed(&s, &c);
+        let e = exec(&s, &["gate", "s", "--pr", "/r/app=--help"], &c, &|_| true).unwrap_err();
+        assert!(e.downcast_ref::<Usage>().is_some(), "{e}");
+        assert!(s.prs(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_refuses_a_blank_title() {
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        for t in ["", "  "] {
+            assert!(exec(&s, &["add", t], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
+        }
+        assert!(s.tasks().unwrap().is_empty());
     }
 
     #[test]

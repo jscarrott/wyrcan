@@ -523,8 +523,12 @@ impl App {
             KeyCode::Char('P') => self.guarded("Park", Effect::Park),
             KeyCode::Char('x') => self.guarded("Done", Effect::Done),
             KeyCode::Char('D') => {
-                if let Some((t, _)) = self.task() {
-                    self.ask(format!("Drop '{}'? y/n", t.title), Effect::Drop(t.id));
+                if let Some((t, state)) = self.task() {
+                    let busy = match state {
+                        Some(s @ (AgentState::Working | AgentState::Blocked)) => format!(" Agent is {s} —"),
+                        _ => String::new(),
+                    };
+                    self.ask(format!("Drop '{}'?{busy} y/n", t.title), Effect::Drop(t.id));
                 } else if let Some(s) = self.selected_card().and_then(|c| c.session.clone()) {
                     self.ask(format!("Dismiss '{}'? y/n", gate::basename(&s.cwd)), Effect::Dismiss(s.id));
                 }
@@ -769,6 +773,16 @@ pub(crate) mod tests {
         assert!(ap.confirm.is_none());
         ap.on_key_event(key('D'));
         assert_eq!(ap.on_key_event(key('y')), [Effect::Drop(id)]);
+    }
+
+    #[test]
+    fn drop_says_when_the_agent_is_busy() {
+        let s = Store::open_in_memory();
+        let id = add(&s, "busy", Stage::Active);
+        session(&s, "s1", Some(id), AgentState::Blocked);
+        let mut ap = app(&s, &cfg(3));
+        ap.on_key_event(key('D'));
+        assert_eq!(ap.confirm.as_ref().unwrap().prompt, "Drop 'busy'? Agent is blocked — y/n");
     }
 
     #[test]

@@ -74,7 +74,8 @@ pub fn apply(store: &Store, event: &str, input: &Value, zellij: (Option<&str>, O
     if event == "waiting" {
         let msg = input["last_assistant_message"].as_str().unwrap_or("");
         if let (Some(task), false) = (store.session(id)?.and_then(|s| s.task_id), msg.is_empty()) {
-            store.add_event(task, "summary", tail(msg, 1500))?;
+            // Every Stop writes one; keeping only the newest stops them burying stage and PR events.
+            store.replace_event(task, "turn", tail(msg, 1500))?;
         }
     }
     Ok(())
@@ -155,10 +156,23 @@ mod tests {
         }
         let ev = s.events(t).unwrap();
         assert_eq!(ev.len(), 1);
-        assert_eq!(ev[0].kind, "summary");
+        assert_eq!(ev[0].kind, "turn");
         assert!(ev[0].detail.len() <= 1500 && !ev[0].detail.is_empty());
         let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn only_the_latest_turn_summary_is_kept() {
+        let s = Store::open_in_memory();
+        let t = s.add_task(crate::store::NewTask { title: "t", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        s.link_session("lk", t, "/w").unwrap();
+        s.add_event(t, "summary", "wrap-up").unwrap();
+        for m in ["first", "second"] {
+            apply(&s, "waiting", &json!({"session_id": "lk", "cwd": "/w", "last_assistant_message": m}), (None, None)).unwrap();
+        }
+        let ev: Vec<(String, String)> = s.events(t).unwrap().into_iter().map(|e| (e.kind, e.detail)).collect();
+        assert_eq!(ev, [("summary".into(), "wrap-up".into()), ("turn".into(), "second".into())]);
     }
 
     #[test]

@@ -84,7 +84,7 @@ pub struct Event {
     #[allow(dead_code)] // mirrors the column
     pub task_id: i64,
     pub at: i64,
-    /// "stage", "summary", "pr", "comment" or "flag".
+    /// "stage", "summary" (the wrap-up), "turn" (the latest Stop's message), "pr", "comment" or "flag".
     pub kind: String,
     pub detail: String,
 }

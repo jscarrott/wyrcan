@@ -85,11 +85,13 @@ pub fn run(repo_root: &Path, claude: &Path, bin_dir: &Path) -> Result<()> {
     let root = repo_root.canonicalize()?;
     // Validate before touching anything under the target dirs.
     anyhow::ensure!(root.join("skills").exists(), "skills not found in {}", root.display());
+    let target = root.join("target/release/claude-board");
+    anyhow::ensure!(target.exists(), "{} is missing; build first: cargo build --release", target.display());
     let claude = claude.to_path_buf();
     let bin = bin_dir.join("claude-board");
     std::fs::create_dir_all(bin_dir)?;
     std::fs::create_dir_all(claude.join("skills"))?;
-    symlink(&claude, &root.join("target/release/claude-board"), &bin)?;
+    symlink(&claude, &target, &bin)?;
     // The bash hook is gone; its link would dangle.
     let stale = claude.join("hooks/claude-board.sh");
     if std::fs::symlink_metadata(&stale).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -154,13 +156,28 @@ mod tests {
     }
 
     #[test]
+    fn run_refuses_an_unbuilt_binary_without_touching_target() {
+        let t = std::env::temp_dir().join(format!("cb-unbuilt-{}", std::process::id()));
+        let (root, claude) = (t.join("root"), t.join("claude"));
+        std::fs::create_dir_all(root.join("skills/next")).unwrap();
+        std::fs::create_dir_all(&claude).unwrap();
+        let e = run(&root, &claude, &t.join("bin")).unwrap_err();
+        assert!(e.to_string().contains("build first: cargo build --release"), "{e}");
+        assert!(!claude.join("skills").exists() && !t.join("bin").exists());
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
     fn run_keeps_settings_key_order_and_backs_up() {
         let t = std::env::temp_dir().join(format!("cb-order-{}", std::process::id()));
-        let claude = t.join("claude");
+        let (root, claude) = (t.join("root"), t.join("claude"));
+        std::fs::create_dir_all(root.join("skills/next")).unwrap();
+        std::fs::create_dir_all(root.join("target/release")).unwrap();
+        std::fs::write(root.join("target/release/claude-board"), "").unwrap();
         std::fs::create_dir_all(&claude).unwrap();
         let orig = r#"{"zeta": 1, "alpha": {"y": 1, "b": 2}}"#;
         std::fs::write(claude.join("settings.json"), orig).unwrap();
-        run(Path::new(env!("CARGO_MANIFEST_DIR")), &claude, &t.join("bin")).unwrap();
+        run(&root, &claude, &t.join("bin")).unwrap();
         let out = std::fs::read_to_string(claude.join("settings.json")).unwrap();
         let pos = |k: &str| out.find(k).unwrap();
         assert!(pos("zeta") < pos("alpha") && pos("alpha") < pos("hooks") && pos("\"y\"") < pos("\"b\""), "{out}");
