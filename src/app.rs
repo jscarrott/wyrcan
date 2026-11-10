@@ -2,7 +2,9 @@ use crate::board::{self, Board, Row, Section, SectionIds};
 use crate::state::{AgentRecord, AgentState};
 use crate::todoist::Task;
 use crate::zellij::{self, Jump};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
+use std::collections::HashMap;
 
 #[derive(Debug, PartialEq)]
 pub enum Effect {
@@ -11,6 +13,8 @@ pub enum Effect {
     Jump(Jump),
     Resume { session: String, cwd: String },
     Complete { task_id: String, session: Option<String> },
+    Move { task_id: String, section_id: String },
+    LoadComment(String),
     OpenInTodoist(String),
     Refresh,
     Quit,
@@ -23,12 +27,30 @@ pub struct Pending {
     effect: Effect,
 }
 
+/// A clickable area from the last frame: a card (index) or a column's empty space (None).
+#[derive(Debug, Clone, Copy)]
+pub struct Hit {
+    pub rect: Rect,
+    pub section: Section,
+    pub index: Option<usize>,
+}
+
 pub struct App {
     pub board: Board,
     pub selected: (Section, usize),
     pub message: Option<String>,
     pub confirm: Option<Pending>,
     pub fetch_error: Option<String>,
+    /// The detail view of the selected card is open.
+    pub expanded: bool,
+    pub scroll: u16,
+    /// Latest comment per task id; missing = not loaded yet.
+    pub comments: HashMap<String, Option<String>>,
+    /// Column a mouse drag started in, and the column it is over.
+    pub drag: Option<Section>,
+    pub hover: Option<Section>,
+    /// Cards before columns, so a card wins over its column.
+    pub hits: Vec<Hit>,
     tasks: Vec<Task>,
     agents: Vec<AgentRecord>,
     ids: SectionIds,
@@ -47,6 +69,12 @@ impl App {
             message: None,
             confirm: None,
             fetch_error: None,
+            expanded: false,
+            scroll: 0,
+            comments: HashMap::new(),
+            drag: None,
+            hover: None,
+            hits: vec![],
             tasks: vec![],
             agents: vec![],
             ids,
@@ -63,7 +91,7 @@ impl App {
         }
     }
 
-    fn selected_row(&self) -> Option<&Row> {
+    pub fn selected_row(&self) -> Option<&Row> {
         self.rows(self.selected.0).get(self.selected.1)
     }
 
@@ -100,11 +128,94 @@ impl App {
         let s = SECTIONS[(i + d).clamp(0, 2) as usize];
         let len = self.rows(s).len();
         self.selected = (s, self.selected.1.min(len.saturating_sub(1)));
+        self.scroll = 0;
     }
 
     fn shift_row(&mut self, d: isize) {
         let max = self.rows(self.selected.0).len().saturating_sub(1) as isize;
         self.selected.1 = (self.selected.1 as isize + d).clamp(0, max) as usize;
+        self.scroll = 0;
+    }
+
+    fn section_id(&self, s: Section) -> &str {
+        match s {
+            Section::UpNext => &self.ids.up_next,
+            Section::InProgress => &self.ids.in_progress,
+            Section::NeedsReview => &self.ids.needs_review,
+        }
+    }
+
+    /// Moves the selected card one column; past Needs review means complete.
+    fn move_by(&mut self, d: isize) -> Vec<Effect> {
+        let i = SECTIONS.iter().position(|s| *s == self.selected.0).unwrap_or(0) as isize + d;
+        match i {
+            ..0 => vec![],
+            3.. => self.complete(),
+            _ => self.move_to(SECTIONS[i as usize]),
+        }
+    }
+
+    /// Moves locally at once (the cursor follows the card), then in Todoist.
+    fn move_to(&mut self, s: Section) -> Vec<Effect> {
+        let Some(id) = self.selected_row().map(|r| r.task.id.clone()) else { return vec![] };
+        if s == self.selected.0 {
+            return vec![];
+        }
+        let sid = self.section_id(s).to_string();
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+            t.section_id = Some(sid.clone());
+        }
+        self.selected.0 = s;
+        self.rebuild();
+        vec![Effect::Move { task_id: id, section_id: sid }]
+    }
+
+    fn expand(&mut self) -> Vec<Effect> {
+        let Some(id) = self.selected_row().map(|r| r.task.id.clone()) else { return vec![] };
+        self.expanded = true;
+        self.scroll = 0;
+        vec![Effect::LoadComment(id)]
+    }
+
+    pub fn on_comment(&mut self, task_id: String, c: Option<String>) {
+        self.comments.insert(task_id, c);
+    }
+
+    fn hit(&self, x: u16, y: u16) -> Option<Hit> {
+        self.hits.iter().copied().find(|h| h.rect.contains(Position { x, y }))
+    }
+
+    pub fn on_mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
+        if self.confirm.is_some() {
+            return vec![];
+        }
+        let hit = self.hit(m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(h) = hit else { return vec![] };
+                self.message = None;
+                self.expanded = false;
+                let len = self.rows(h.section).len();
+                let i = h.index.unwrap_or(self.selected.1).min(len.saturating_sub(1));
+                self.selected = (h.section, i);
+                self.drag = h.index.map(|_| h.section);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.hover = self.drag.and(hit.map(|h| h.section)),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.hover = None;
+                if let (Some(from), Some(h)) = (self.drag.take(), hit) {
+                    if h.section != from {
+                        return self.move_to(h.section);
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown if self.expanded => self.scroll = self.scroll.saturating_add(1),
+            MouseEventKind::ScrollUp if self.expanded => self.scroll = self.scroll.saturating_sub(1),
+            MouseEventKind::ScrollDown => self.shift_row(1),
+            MouseEventKind::ScrollUp => self.shift_row(-1),
+            _ => {}
+        }
+        vec![]
     }
 
     /// Raw mode swallows SIGINT, so Ctrl-C arrives as a key.
@@ -112,7 +223,11 @@ impl App {
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             return vec![Effect::Quit];
         }
-        self.on_key(k.code)
+        match (k.modifiers.contains(KeyModifiers::SHIFT), k.code) {
+            (true, KeyCode::Left) => self.on_key(KeyCode::Char('H')),
+            (true, KeyCode::Right) => self.on_key(KeyCode::Char('L')),
+            (_, c) => self.on_key(c),
+        }
     }
 
     pub fn on_key(&mut self, key: KeyCode) -> Vec<Effect> {
@@ -120,11 +235,33 @@ impl App {
             return if key == KeyCode::Char('y') { vec![p.effect] } else { vec![] };
         }
         self.message = None;
+        if self.expanded {
+            match key {
+                KeyCode::Esc | KeyCode::Char(' ') | KeyCode::Char('e') => {
+                    self.expanded = false;
+                    return vec![];
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll = self.scroll.saturating_sub(1);
+                    return vec![];
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll = self.scroll.saturating_add(1);
+                    return vec![];
+                }
+                // The view stays on its card; close it to change cards.
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => return vec![],
+                _ => {}
+            }
+        }
         match key {
             KeyCode::Left | KeyCode::Char('h') => self.shift_section(-1),
             KeyCode::Right | KeyCode::Char('l') => self.shift_section(1),
             KeyCode::Up | KeyCode::Char('k') => self.shift_row(-1),
             KeyCode::Down | KeyCode::Char('j') => self.shift_row(1),
+            KeyCode::Char('H') => return self.move_by(-1),
+            KeyCode::Char('L') => return self.move_by(1),
+            KeyCode::Char(' ') | KeyCode::Char('e') => return self.expand(),
             KeyCode::Char('n') => return self.next(),
             KeyCode::Char('p') => return vec![Effect::SpawnPen],
             KeyCode::Char('r') => return vec![Effect::Refresh],
@@ -331,5 +468,53 @@ mod tests {
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(app.on_key_event(k), vec![Effect::Quit]);
         assert!(app.on_key_event(KeyCode::Char('c').into()).is_empty());
+    }
+
+    #[test]
+    fn move_card_across_columns() {
+        let mut app = App::new(ids(), None);
+        app.on_tasks(Ok(up(&["a", "b"])));
+        app.selected = (Section::UpNext, 1);
+        assert!(app.on_key(KeyCode::Char('H')).is_empty(), "nothing left of Up next");
+        assert_eq!(app.on_key(KeyCode::Char('L')), vec![Effect::Move { task_id: "b".into(), section_id: "p".into() }]);
+        assert_eq!(app.selected, (Section::InProgress, 0));
+        assert_eq!(app.board.up_next.len(), 1);
+        let shift_right = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(app.on_key_event(shift_right), vec![Effect::Move { task_id: "b".into(), section_id: "r".into() }]);
+        // Past Needs review completes (no agent, so no confirm).
+        assert_eq!(app.on_key(KeyCode::Char('L')), vec![Effect::Complete { task_id: "b".into(), session: None }]);
+    }
+
+    #[test]
+    fn mouse_drag_moves_card() {
+        use ratatui::crossterm::event::KeyModifiers as M;
+        let mut app = App::new(ids(), None);
+        app.on_tasks(Ok(up(&["a"])));
+        app.hits = vec![
+            Hit { rect: Rect::new(0, 0, 10, 3), section: Section::UpNext, index: Some(0) },
+            Hit { rect: Rect::new(0, 0, 10, 20), section: Section::UpNext, index: None },
+            Hit { rect: Rect::new(10, 0, 10, 20), section: Section::InProgress, index: None },
+        ];
+        let ev = |kind, column| MouseEvent { kind, column, row: 1, modifiers: M::NONE };
+        assert!(app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 2)).is_empty());
+        app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 12));
+        assert_eq!(app.hover, Some(Section::InProgress));
+        let e = app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 12));
+        assert_eq!(e, vec![Effect::Move { task_id: "a".into(), section_id: "p".into() }]);
+        assert_eq!((app.drag, app.hover), (None, None));
+        // A press on a column's empty space never starts a drag.
+        app.on_mouse(MouseEvent { row: 10, ..ev(MouseEventKind::Down(MouseButton::Left), 2) });
+        assert_eq!(app.drag, None);
+    }
+
+    #[test]
+    fn expand_loads_comment_and_esc_closes() {
+        let mut app = app_with(AgentState::Waiting);
+        assert_eq!(app.on_key(KeyCode::Char(' ')), vec![Effect::LoadComment("t1".into())]);
+        assert!(app.expanded);
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!((app.scroll, app.selected.1), (1, 0));
+        app.on_key(KeyCode::Esc);
+        assert!(!app.expanded);
     }
 }

@@ -89,3 +89,11 @@ Writer (`/pen`) sessions register themselves with a state file `kind: "pen"` and
 - The `/pen` skill's wording and how it phrases proposed tasks.
 - How the TUI picks the cwd for a new `/next` pane (its own cwd is a fine default).
 - Tests: unit tests for state parsing, sorting and the hook state transitions; keep the Todoist smoke test.
+
+## Revision 2026-11-10: Claude dir and kanban UX
+
+- **Claude dir** comes from `CLAUDE_CONFIG_DIR`, then `claude_dir = "..."` in `~/.config/claude-board/config.toml` (`~/` allowed), then `~/.claude`. `install` links into it; the TUI calls the hook there and starts new agents with `CLAUDE_CONFIG_DIR` set, since zellij panes don't inherit the TUI's env. Skills use `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`.
+- **Cards** wrap their full title; agent state, a `≡` if there's a description, and labels go underneath.
+- **Expand** (space or `e`): a detail view with title, labels, agent session/cwd/repos, description and the latest comment (fetched on open). ↑↓ scroll, esc closes.
+- **Move**: `H`/`L` or Shift+←/→ shift a card a column; past Needs review completes it (same confirm as `x`). Mouse drag a card onto another column does the same, with the target column highlighted. Moving into In progress never starts an agent; `n` still does. Moves show at once and are sent to Todoist in the background; a failed move is undone by the follow-up refresh.
+- Todoist writes (move, complete, comments) now run off the UI thread.

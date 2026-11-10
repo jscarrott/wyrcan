@@ -9,13 +9,18 @@ mod zellij;
 
 use anyhow::{Context, Result};
 use app::{App, Effect};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use ratatui::crossterm::execute;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
-        Some("install") => install::run(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &config::home().join(".claude-work")),
+        Some("install") => {
+            let dir = config::Config::from_env().claude_dir;
+            println!("installing into {}", dir.display());
+            install::run(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &dir)
+        }
         None => tui(),
         _ => anyhow::bail!("usage: claude-board [install]"),
     }
@@ -26,7 +31,10 @@ fn tui() -> Result<()> {
     let client = Arc::new(todoist::Client::new(cfg.token()?));
     // ratatui::init also installs a panic hook that restores the terminal.
     let mut term = ratatui::init();
+    // shortcut: a panic skips DisableMouseCapture; run `reset` if the terminal then echoes mouse codes.
+    execute!(std::io::stdout(), EnableMouseCapture)?;
     let res = run(&mut term, &cfg, client);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
 }
@@ -57,7 +65,15 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, client: Arc<to
         });
     }
 
-    let cwd = std::env::current_dir().context("cwd")?.to_string_lossy().into_owned();
+    let (upd_tx, upd_rx) = mpsc::channel::<Update>();
+    let ctx = Ctx {
+        client,
+        cwd: std::env::current_dir().context("cwd")?.to_string_lossy().into_owned(),
+        claude_dir: cfg.claude_dir.to_string_lossy().into_owned(),
+        hook: cfg.hook(),
+        refresh: refresh_tx,
+        upd: upd_tx,
+    };
     let mut app = App::new(ids, zellij::current_session());
     app.on_agents(state::read_dir(&cfg.state_dir));
     let mut last_read = Instant::now();
@@ -66,34 +82,69 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, client: Arc<to
         while let Ok(r) = task_rx.try_recv() {
             app.on_tasks(r);
         }
+        while let Ok(u) = upd_rx.try_recv() {
+            u(&mut app);
+        }
         if last_read.elapsed() >= Duration::from_secs(1) {
             app.on_agents(state::read_dir(&cfg.state_dir));
             last_read = Instant::now();
         }
-        term.draw(|f| ui::draw(f, &app))?;
+        let mut hits = vec![];
+        term.draw(|f| hits = ui::draw(f, &app))?;
+        app.hits = hits;
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else { continue };
-        if k.kind != KeyEventKind::Press {
-            continue;
-        }
-        for e in app.on_key_event(k) {
+        let effects = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key_event(k),
+            Event::Mouse(m) => app.on_mouse(m),
+            _ => continue,
+        };
+        for e in effects {
             if matches!(e, Effect::Quit) {
                 return Ok(());
             }
-            if let Err(err) = handle(e, &client, &cwd, &refresh_tx) {
+            if let Err(err) = handle(e, &ctx) {
                 app.message = Some(format!("{err:#}"));
             }
         }
     }
 }
 
-fn handle(e: Effect, client: &todoist::Client, cwd: &str, refresh: &mpsc::Sender<()>) -> Result<()> {
+/// A change to the app computed off the UI thread.
+type Update = Box<dyn FnOnce(&mut App) + Send>;
+
+struct Ctx {
+    client: Arc<todoist::Client>,
+    cwd: String,
+    claude_dir: String,
+    hook: std::path::PathBuf,
+    refresh: mpsc::Sender<()>,
+    upd: mpsc::Sender<Update>,
+}
+
+/// Runs a Todoist call on its own thread so a slow API never freezes the board.
+/// Errors land in the footer; `refresh` re-fetches afterwards (which also undoes a failed move).
+fn background(ctx: &Ctx, refresh: bool, work: impl FnOnce(&todoist::Client) -> Result<Update> + Send + 'static) {
+    let (client, upd, tx) = (ctx.client.clone(), ctx.upd.clone(), ctx.refresh.clone());
+    std::thread::spawn(move || {
+        let u = work(&client).unwrap_or_else(|e| {
+            let m = format!("{e:#}");
+            Box::new(move |a: &mut App| a.message = Some(m))
+        });
+        let _ = upd.send(u);
+        if refresh {
+            let _ = tx.send(());
+        }
+    });
+}
+
+fn handle(e: Effect, ctx: &Ctx) -> Result<()> {
+    let dir = ctx.claude_dir.as_str();
     match e {
-        Effect::SpawnNext(id) => zellij::spawn_claude("next", cwd, &[&format!("/next {id}")])?,
-        Effect::SpawnPen => zellij::spawn_claude("pen", cwd, &["/pen"])?,
-        Effect::Resume { session, cwd } => zellij::spawn_claude("resume", &cwd, &["--resume", &session])?,
+        Effect::SpawnNext(id) => zellij::spawn_claude("next", &ctx.cwd, dir, &[&format!("/next {id}")])?,
+        Effect::SpawnPen => zellij::spawn_claude("pen", &ctx.cwd, dir, &["/pen"])?,
+        Effect::Resume { session, cwd } => zellij::spawn_claude("resume", &cwd, dir, &["--resume", &session])?,
         Effect::Jump(zellij::Jump::Focus(pane)) => zellij::run(&zellij::focus_cmd(&pane))?,
         Effect::Jump(_) | Effect::Quit => {}
         Effect::OpenInTodoist(id) => {
@@ -108,15 +159,25 @@ fn handle(e: Effect, client: &todoist::Client, cwd: &str, refresh: &mpsc::Sender
                 .context("running xdg-open")?;
         }
         Effect::Complete { task_id, session } => {
-            client.complete(&task_id)?;
-            if let Some(s) = session {
-                let hook = config::home().join(".claude-work/hooks/claude-board.sh");
-                zellij::run(&[hook.to_string_lossy().into_owned(), "close".into(), s])?;
-            }
-            let _ = refresh.send(());
+            let hook = ctx.hook.to_string_lossy().into_owned();
+            background(ctx, true, move |c| {
+                c.complete(&task_id)?;
+                if let Some(s) = session {
+                    zellij::run(&[hook, "close".into(), s])?;
+                }
+                Ok(Box::new(|_| {}))
+            });
         }
+        Effect::Move { task_id, section_id } => background(ctx, true, move |c| {
+            c.move_task(&task_id, &section_id)?;
+            Ok(Box::new(|_| {}))
+        }),
+        Effect::LoadComment(id) => background(ctx, false, move |c| {
+            let comment = c.latest_comment(&id)?;
+            Ok(Box::new(move |a: &mut App| a.on_comment(id, comment)))
+        }),
         Effect::Refresh => {
-            let _ = refresh.send(());
+            let _ = ctx.refresh.send(());
         }
     }
     Ok(())

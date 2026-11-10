@@ -1,10 +1,10 @@
-use crate::app::App;
+use crate::app::{App, Hit};
 use crate::board::{age, Row, Section};
 use crate::state::{AgentRecord, AgentState};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 fn now() -> i64 {
@@ -28,16 +28,104 @@ fn state_style(s: AgentState) -> (&'static str, Color) {
     }
 }
 
-fn row_item(r: &Row) -> ListItem<'static> {
-    let mut spans = vec![Span::raw(r.task.content.clone())];
+/// Word-wraps to `width` columns, hard-splitting words that don't fit.
+// shortcut: counts chars, not display width; wide glyphs (CJK, emoji) can overrun by a column.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let (mut out, mut cur) = (vec![], String::new());
+    for mut w in s.split_whitespace() {
+        loop {
+            let (cl, wl) = (cur.chars().count(), w.chars().count());
+            if cl == 0 && wl <= width || cl > 0 && cl + 1 + wl <= width {
+                if cl > 0 {
+                    cur.push(' ');
+                }
+                cur.push_str(w);
+                break;
+            }
+            if cl > 0 {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            let cut = w.char_indices().nth(width).map_or(w.len(), |(i, _)| i);
+            out.push(w[..cut].to_string());
+            w = &w[cut..];
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Full title, then agent state and labels, then a blank gap line.
+fn card(r: &Row, width: usize) -> ListItem<'static> {
+    let mut lines: Vec<Line> = wrap(&r.task.content, width)
+        .into_iter()
+        .map(|l| Line::styled(l, Style::new().add_modifier(Modifier::BOLD)))
+        .collect();
+    let mut meta = vec![];
     if let Some(a) = &r.agent {
         let (name, color) = state_style(a.agent);
-        spans.push(Span::styled(format!("  {name} {}", age_str(a.state_at)), Style::new().fg(color)));
+        meta.push(Span::styled(format!("{name} {}", age_str(a.state_at)), Style::new().fg(color)));
+    }
+    if !r.task.description.is_empty() {
+        meta.push(Span::styled("  ≡", Style::new().fg(Color::DarkGray)));
+    }
+    if !meta.is_empty() {
+        lines.push(Line::from(meta));
     }
     if !r.task.labels.is_empty() {
-        spans.push(Span::styled(format!("  @{}", r.task.labels.join(" @")), Style::new().fg(Color::Cyan)));
+        let labels = format!("@{}", r.task.labels.join(" @"));
+        lines.extend(wrap(&labels, width).into_iter().map(|l| Line::styled(l, Style::new().fg(Color::Cyan))));
     }
-    ListItem::new(Line::from(spans))
+    lines.push(Line::raw(""));
+    ListItem::new(lines)
+}
+
+fn centered(area: Rect, pct: u16) -> Rect {
+    let [v] = Layout::vertical([Constraint::Percentage(pct)]).flex(ratatui::layout::Flex::Center).areas(area);
+    let [h] = Layout::horizontal([Constraint::Percentage(pct)]).flex(ratatui::layout::Flex::Center).areas(v);
+    h
+}
+
+fn detail(f: &mut Frame, app: &App) {
+    let Some(r) = app.selected_row() else { return };
+    let dim = Style::new().fg(Color::DarkGray);
+    let head = |t: &'static str| Line::styled(t, Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED));
+    let mut lines = vec![Line::styled(r.task.content.clone(), Style::new().add_modifier(Modifier::BOLD)), Line::raw("")];
+    if !r.task.labels.is_empty() {
+        lines.push(Line::styled(format!("@{}", r.task.labels.join(" @")), Style::new().fg(Color::Cyan)));
+    }
+    if let Some(a) = &r.agent {
+        let (name, color) = state_style(a.agent);
+        lines.push(Line::styled(format!("{name} {}", age_str(a.state_at)), Style::new().fg(color)));
+        lines.push(Line::styled(format!("session {}", a.session), dim));
+        lines.push(Line::styled(format!("cwd     {}", a.cwd), dim));
+        for repo in &a.repos {
+            lines.push(Line::styled(format!("repo    {} @ {}", repo.root, repo.ref_), dim));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(head("Description"));
+    if r.task.description.is_empty() {
+        lines.push(Line::styled("none", dim));
+    } else {
+        lines.extend(r.task.description.lines().map(|l| Line::raw(l.to_string())));
+    }
+    lines.push(Line::raw(""));
+    lines.push(head("Latest comment"));
+    match app.comments.get(&r.task.id) {
+        None => lines.push(Line::styled("loading…", dim)),
+        Some(None) => lines.push(Line::styled("none", dim)),
+        Some(Some(c)) => lines.extend(c.lines().map(|l| Line::raw(l.to_string()))),
+    }
+    let area = centered(f.area(), 80);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::Cyan))
+        .title_bottom(Line::styled(" ↑↓ scroll  H/L move  x complete  o open  esc close ", dim));
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((app.scroll, 0)).block(block), area);
 }
 
 fn writer_span(a: &AgentRecord) -> Span<'static> {
@@ -45,7 +133,10 @@ fn writer_span(a: &AgentRecord) -> Span<'static> {
     Span::styled(format!("pen {name} {}  ", age_str(a.state_at)), Style::new().fg(color))
 }
 
-pub fn draw(f: &mut Frame, app: &App) {
+/// Draws the board and returns where each card and column landed, for mouse hits.
+pub fn draw(f: &mut Frame, app: &App) -> Vec<Hit> {
+    let mut hits = vec![];
+    let mut columns = vec![];
     let [header, cols, writers, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
@@ -71,19 +162,44 @@ pub fn draw(f: &mut Frame, app: &App) {
     {
         let rows = app.rows(s);
         let active = app.selected.0 == s;
-        let title = format!("{title} ({})", rows.len());
-        let block = Block::bordered()
-            .title(title)
-            .border_style(if active { Style::new().fg(Color::Cyan) } else { Style::new() });
-        let list = List::new(rows.iter().map(row_item))
+        let title = format!(" {title} ({}) ", rows.len());
+        let border = if app.hover == Some(s) && app.drag != Some(s) {
+            Style::new().fg(Color::Yellow)
+        } else if active {
+            Style::new().fg(Color::Cyan)
+        } else {
+            Style::new()
+        };
+        let block = Block::bordered().title(title).border_style(border);
+        // Borders take 2 columns and the highlight bar 2 more.
+        let width = area.width.saturating_sub(4) as usize;
+        let items: Vec<ListItem> = rows.iter().map(|r| card(r, width)).collect();
+        let heights: Vec<u16> = items.iter().map(|i| i.height() as u16).collect();
+        let list = List::new(items)
             .block(block)
-            .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+            .highlight_symbol(Line::styled("▌ ", Style::new().fg(Color::Cyan)))
+            .repeat_highlight_symbol(true)
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(Style::new().fg(Color::Cyan));
         let mut st = ListState::default();
         if active && !rows.is_empty() {
             st.select(Some(app.selected.1));
         }
         f.render_stateful_widget(list, *area, &mut st);
+
+        let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+        let mut y = inner.y;
+        for (i, h) in heights.iter().enumerate().skip(st.offset()) {
+            if y >= inner.bottom() {
+                break;
+            }
+            let rect = Rect::new(inner.x, y, inner.width, (*h).min(inner.bottom() - y));
+            hits.push(Hit { rect, section: s, index: Some(i) });
+            y += h;
+        }
+        columns.push(Hit { rect: *area, section: s, index: None });
     }
+    hits.extend(columns);
 
     let mut w = vec![Span::raw("Pen: ")];
     if app.board.writers.is_empty() {
@@ -98,11 +214,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         Line::styled(m.clone(), Style::new().fg(Color::Yellow))
     } else {
         Line::styled(
-            "←→ section  ↑↓ move  n next  p pen  ⏎ jump  x complete  o open  r refresh  q quit",
+            "←→ column  ↑↓ card  space expand  H/L or drag: move  n next  p pen  ⏎ jump  x complete  o open  r refresh  q quit",
             Style::new().fg(Color::DarkGray),
         )
     };
     f.render_widget(Paragraph::new(foot), footer);
+    if app.expanded {
+        detail(f, app);
+    }
+    hits
 }
 
 #[cfg(test)]
@@ -132,8 +252,43 @@ mod tests {
         let mut app = App::new(ids, None);
         app.on_agents(vec![blocked_agent(), blocked_agent()]);
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| { draw(f, &app); }).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("2 blocked"), "{text}");
+    }
+
+    #[test]
+    fn wrap_breaks_words_and_long_tokens() {
+        assert_eq!(wrap("fix the flaky login test", 10), ["fix the", "flaky", "login test"]);
+        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap("", 4), [""]);
+    }
+
+    #[test]
+    fn long_title_is_shown_in_full_and_hits_cover_cards() {
+        use crate::todoist::Task;
+        let ids = SectionIds { up_next: "u".into(), in_progress: "p".into(), needs_review: "r".into() };
+        let mut app = App::new(ids, None);
+        let t = |id: &str, content: &str| Task {
+            id: id.into(),
+            content: content.into(),
+            description: String::new(),
+            labels: vec![],
+            section_id: Some("u".into()),
+            child_order: 0,
+        };
+        let long = "Investigate why the nightly ingest job drops events after a schema change";
+        app.on_tasks(Ok(vec![t("a", long), t("b", "short")]));
+        let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        let mut hits = vec![];
+        term.draw(|f| hits = draw(f, &app)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        for word in long.split(' ') {
+            assert!(text.contains(word), "missing {word:?}");
+        }
+        let cards: Vec<_> = hits.iter().filter(|h| h.index.is_some()).collect();
+        assert_eq!(cards.len(), 2);
+        assert!(cards[0].rect.height > 2, "long title wraps: {:?}", cards[0].rect);
+        assert_eq!(cards[1].rect.y, cards[0].rect.bottom());
     }
 }

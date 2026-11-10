@@ -25,8 +25,10 @@ pub fn jump_target(agent: Option<&AgentRecord>, current: Option<&str>) -> Jump {
     }
 }
 
-pub fn new_tab_cmd(name: &str, cwd: &str, claude_args: &[&str]) -> Vec<String> {
-    let mut v: Vec<String> = ["zellij", "action", "new-tab", "-n", name, "-c", cwd, "--", "claude"]
+/// The pane is started by the zellij server, not us, so the Claude dir is passed explicitly.
+pub fn new_tab_cmd(name: &str, cwd: &str, claude_dir: &str, claude_args: &[&str]) -> Vec<String> {
+    let dir = format!("CLAUDE_CONFIG_DIR={claude_dir}");
+    let mut v: Vec<String> = ["zellij", "action", "new-tab", "-n", name, "-c", cwd, "--", "env", &dir, "claude"]
         .into_iter()
         .map(String::from)
         .collect();
@@ -51,16 +53,16 @@ pub fn run(cmd: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn spawn_claude_in(current: Option<&str>, name: &str, cwd: &str, args: &[&str]) -> Result<()> {
+fn spawn_claude_in(current: Option<&str>, name: &str, cwd: &str, claude_dir: &str, args: &[&str]) -> Result<()> {
     if current.is_none() {
         bail!("not inside zellij");
     }
-    run(&new_tab_cmd(name, cwd, args))?;
+    run(&new_tab_cmd(name, cwd, claude_dir, args))?;
     run(&back_cmd())
 }
 
-pub fn spawn_claude(name: &str, cwd: &str, args: &[&str]) -> Result<()> {
-    spawn_claude_in(current_session().as_deref(), name, cwd, args)
+pub fn spawn_claude(name: &str, cwd: &str, claude_dir: &str, args: &[&str]) -> Result<()> {
+    spawn_claude_in(current_session().as_deref(), name, cwd, claude_dir, args)
 }
 
 #[cfg(test)]
@@ -114,15 +116,16 @@ mod tests {
 
     #[test]
     fn new_tab_cmd_shape() {
-        let want: Vec<String> = ["zellij", "action", "new-tab", "-n", "next", "-c", "/home/x", "--", "claude", "/next"]
-            .map(String::from)
-            .to_vec();
-        assert_eq!(new_tab_cmd("next", "/home/x", &["/next"]), want);
+        let want: Vec<String> =
+            ["zellij", "action", "new-tab", "-n", "next", "-c", "/home/x", "--", "env", "CLAUDE_CONFIG_DIR=/c", "claude", "/next"]
+                .map(String::from)
+                .to_vec();
+        assert_eq!(new_tab_cmd("next", "/home/x", "/c", &["/next"]), want);
     }
 
     #[test]
     fn outside_zellij_is_refused() {
-        let e = spawn_claude_in(None, "n", "/", &[]).unwrap_err();
+        let e = spawn_claude_in(None, "n", "/", "/c", &[]).unwrap_err();
         assert!(e.to_string().contains("not inside zellij"));
     }
 }

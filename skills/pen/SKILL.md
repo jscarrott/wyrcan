@@ -5,10 +5,10 @@ description: Turn a note, GitHub issue/PR, or Slack thread into tasks on the use
 
 # /pen — write tasks for the Claude Board
 
-Board script: `~/.claude-work/hooks/claude-board.sh`. This is a scratch session: **never edit code or files here.** Your only output is tasks on the board.
+Board script: `"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/claude-board.sh"`. This is a scratch session: **never edit code or files here.** Your only output is tasks on the board.
 
 1. Register this session as a pen, so the board TUI shows it:
-   `~/.claude-work/hooks/claude-board.sh register-pen ${CLAUDE_SESSION_ID} "$PWD"`
+   `"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/claude-board.sh" register-pen ${CLAUDE_SESSION_ID} "$PWD"`
 2. If the user didn't give a source, ask what it is (a pasted note, a GitHub issue/PR, a Slack link).
 3. Read it. GitHub: `gh issue view <n-or-url> --comments` / `gh pr view <n-or-url> --comments`. Slack links: the Slack MCP read tools (thread or channel). Pasted notes: use as given.
 4. Ask what you need to write good tasks: which repo each belongs to, and what "done" means. Skip what the source already answers.
@@ -28,7 +28,7 @@ desc=$(cat <<'CLAUDE_BOARD_PEN_END'
 <description>
 CLAUDE_BOARD_PEN_END
 )
-~/.claude-work/hooks/claude-board.sh add "$title" "$desc" '<repo-label>'
+"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/claude-board.sh" add "$title" "$desc" '<repo-label>'
 ```
 
 8. Report the created ids, in order.

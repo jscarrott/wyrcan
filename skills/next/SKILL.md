@@ -6,7 +6,7 @@ argument-hint: "[pane | TASK_ID]"
 
 # /next — pick up the next Claude Board task
 
-Board script: `~/.claude-work/hooks/claude-board.sh` (its edit/stop hooks keep the task updated after you claim it).
+Board script: `"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/claude-board.sh"` (its edit/stop hooks keep the task updated after you claim it).
 
 ## If the argument is `pane`
 
@@ -14,7 +14,7 @@ Run the pickup in a fresh Claude session beside this one, then stop. Do not pick
 
 **In zellij** (`test -n "${ZELLIJ:-}"`):
 
-1. `zellij action new-tab -n next -c "$PWD" -- claude "/next"`
+1. `zellij action new-tab -n next -c "$PWD" -- env CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" claude "/next"`
 2. `zellij action go-to-previous-tab` (keeps focus on this session).
 3. Tell the user it opened in the `next` tab. Done.
 
@@ -31,9 +31,9 @@ Run the pickup in a fresh Claude session beside this one, then stop. Do not pick
 
 If the argument is a Todoist task id (the board TUI passes one so two sessions never grab the same task), skip step 1 and claim that id in step 2.
 
-1. `~/.claude-work/hooks/claude-board.sh next`. It prints the top task as JSON `{id, content, description, labels}`, or exits 1 when Up next is empty or Todoist is unreachable. If it fails, tell the user what it printed and stop.
+1. `"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/claude-board.sh" next`. It prints the top task as JSON `{id, content, description, labels}`, or exits 1 when Up next is empty or Todoist is unreachable. If it fails, tell the user what it printed and stop.
 2. Claim it for this session, so the hooks update this task instead of creating a new one:
-   `~/.claude-work/hooks/claude-board.sh claim ${CLAUDE_SESSION_ID} <id> "$PWD"`
+   `"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/claude-board.sh" claim ${CLAUDE_SESSION_ID} <id> "$PWD"`
    It prints the claimed task as JSON `{id, content, description, labels}` (use these details when you were given an id), or exits 1 if the task is gone or Todoist is unreachable; then tell the user what it printed and stop.
 3. Tell the user in one line which task you picked up.
 4. Work out where the work happens. Labels and description usually name a repo (repos and jj workspaces live under `~/git-work/`). If you can't tell which repo, ask; don't guess.

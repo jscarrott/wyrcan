@@ -8,7 +8,6 @@ pub struct Task {
     pub id: String,
     pub content: String,
     #[serde(default)]
-    #[allow(dead_code)] // not yet shown
     pub description: String,
     #[serde(default)]
     pub labels: Vec<String>,
@@ -119,13 +118,32 @@ impl Client {
         self.list("/tasks", &[("project_id", project_id)])
     }
 
-    pub fn complete(&self, task_id: &str) -> anyhow::Result<()> {
+    fn post(&self, path: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
         self.agent
-            .post(format!("{}/tasks/{task_id}/close", self.base))
+            .post(format!("{}{path}", self.base))
             .header("Authorization", format!("Bearer {}", self.token))
-            .send_empty()
-            .context("closing task")?;
+    }
+
+    pub fn complete(&self, task_id: &str) -> anyhow::Result<()> {
+        self.post(&format!("/tasks/{task_id}/close")).send_empty().context("closing task")?;
         Ok(())
+    }
+
+    pub fn move_task(&self, task_id: &str, section_id: &str) -> anyhow::Result<()> {
+        self.post(&format!("/tasks/{task_id}/move"))
+            .send_json(serde_json::json!({ "section_id": section_id }))
+            .context("moving task")?;
+        Ok(())
+    }
+
+    /// Comments come oldest first.
+    pub fn latest_comment(&self, task_id: &str) -> anyhow::Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Comment {
+            content: String,
+        }
+        let mut cs: Vec<Comment> = self.list("/comments", &[("task_id", task_id)])?;
+        Ok(cs.pop().map(|c| c.content))
     }
 }
 
