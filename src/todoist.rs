@@ -98,7 +98,7 @@ impl Client {
     }
 
     pub fn resolve(&self, project: &str) -> anyhow::Result<(String, SectionIds)> {
-        let hint = "run `hooks/claude-board.sh next` once to create it";
+        let hint = "create the project in Todoist";
         let pid = self
             .find_id("/projects", &[], project)?
             .ok_or_else(|| anyhow!("Todoist project {project:?} not found; {hint}"))?;

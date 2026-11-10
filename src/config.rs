@@ -10,7 +10,7 @@ pub struct Config {
     /// Cap on tasks in the Active stage.
     pub max_active: usize,
     /// Raw config file text, for keys read on demand.
-    file: String,
+    pub(crate) file: String,
 }
 
 pub fn home() -> PathBuf {

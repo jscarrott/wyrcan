@@ -1,5 +1,6 @@
 mod app;
 mod board;
+mod cli;
 mod config;
 mod gate;
 mod hook;
@@ -19,18 +20,19 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
-    match std::env::args().nth(1).as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
         Some("install") => {
             let dir = config::Config::from_env().claude_dir;
             println!("installing into {}", dir.display());
             install::run(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &dir, &config::home().join(".local/bin"))
         }
         Some("hook") => {
-            hook::run(&std::env::args().nth(2).unwrap_or_default(), &config::Config::from_env());
+            hook::run(args.get(1).map(String::as_str).unwrap_or_default(), &config::Config::from_env());
             Ok(())
         }
         None => tui(),
-        _ => anyhow::bail!("usage: claude-board [install | hook <event>]"),
+        Some(_) => std::process::exit(cli::run(&args, &config::Config::from_env())?),
     }
 }
 
