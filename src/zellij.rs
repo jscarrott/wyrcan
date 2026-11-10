@@ -69,6 +69,14 @@ impl Zellij {
         (s.zellij_session.is_some() && s.zellij_session == self.session && live.iter().any(|l| l == pane)).then_some(pane)
     }
 
+    /// zellij refuses to focus the pane that already has focus; that is the state we wanted.
+    fn focus(&self, r: &dyn Runner, pane: &str) -> Result<()> {
+        match self.act(r, &["focus-pane-id", pane]) {
+            Err(e) if !e.to_string().contains("already focused") => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     pub fn open(
         &self,
         r: &dyn Runner,
@@ -103,17 +111,17 @@ impl Zellij {
             sp.push(id.clone());
             r.run(&sp)?;
         }
-        self.act(r, &["focus-pane-id", &board])?;
+        self.focus(r, &board)?;
         Ok(id)
     }
 
     pub fn show(&self, r: &dyn Runner, pane: &str) -> Result<()> {
         self.enter(r, pane)?;
-        self.act(r, &["focus-pane-id", self.board()?]).map(drop)
+        self.focus(r, self.board()?)
     }
 
     pub fn enter(&self, r: &dyn Runner, pane: &str) -> Result<()> {
-        self.act(r, &["focus-pane-id", pane]).map(drop)
+        self.focus(r, pane)
     }
 
     pub fn fullscreen(&self, r: &dyn Runner, pane: &str) -> Result<()> {
@@ -153,6 +161,24 @@ mod tests {
         fn calls(&self) -> Vec<String> {
             self.0.borrow().iter().map(|c| c.join(" ")).collect()
         }
+    }
+
+    /// Fails every focus the way zellij does when the pane already has focus.
+    struct Focused;
+    impl Runner for Focused {
+        fn run(&self, cmd: &[String]) -> Result<String> {
+            if cmd.iter().any(|c| c == "focus-pane-id") {
+                bail!("Pane Terminal(0) is already focused");
+            }
+            Ok("terminal_4".into())
+        }
+    }
+
+    #[test]
+    fn focusing_the_focused_pane_is_not_an_error() {
+        assert_eq!(zj().open(&Focused, "t", "/w", "/c", &[], &[]).unwrap(), "terminal_4");
+        zj().show(&Focused, "terminal_4").unwrap();
+        zj().enter(&Focused, "terminal_0").unwrap();
     }
 
     fn zj() -> Zellij {
