@@ -369,7 +369,7 @@ mod tests {
         let mut ap = app(&s, &c);
         let e = ap.on_key_event(crate::app::tests::key('L'));
         run_all(e, &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
-        assert_eq!(ap.message.as_deref(), Some("Not ready for review: no explainer"));
+        assert_eq!(ap.message.as_deref(), Some("Not ready for review: no PR or reason recorded; no explainer"));
         assert_eq!(stage(&s, id), Stage::Active);
     }
 
@@ -490,7 +490,7 @@ mod tests {
         let id = add(&s, "a", Stage::Active);
         let mut ap = app(&s, &c);
         drag(&s, &c, &mut ap, id, crate::app::Group::Review);
-        assert_eq!(ap.message.as_deref(), Some("Not ready for review: no explainer"));
+        assert_eq!(ap.message.as_deref(), Some("Not ready for review: no PR or reason recorded; no explainer"));
         assert_eq!(stage(&s, id), Stage::Active);
     }
 

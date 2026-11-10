@@ -26,6 +26,11 @@ pub fn evaluate(store: &Store, task: &Task, checks: &[String], verify_pr: &PrVer
                         continue;
                     }
                 };
+                // Repos are only recorded by Edit/Write hooks inside a repo; without any, every recorded row must stand.
+                let roots = if roots.is_empty() { prs.iter().map(|p| p.root.clone()).collect() } else { roots };
+                if roots.is_empty() {
+                    missing.push("no PR or reason recorded".into());
+                }
                 for root in roots {
                     let name = basename(&root);
                     match prs.iter().find(|p| p.root == root) {
@@ -50,7 +55,6 @@ pub fn evaluate(store: &Store, task: &Task, checks: &[String], verify_pr: &PrVer
     missing
 }
 
-/// The worst state across repos; waived rows count as merged.
 /// The one way into Review. `verify_pr` does network I/O, so it runs on every PR url before the
 /// transaction opens; the gate inside only checks membership and the write lock is held for local work.
 /// A PR recorded after the pre-check is not in the set and fails closed.
@@ -59,12 +63,14 @@ pub fn to_review(store: &Store, id: i64, max_active: usize, checks: &[String], v
     store.transition(id, Stage::Review, max_active, &|s, t| evaluate(s, t, checks, &|u| verified.iter().any(|v| v == u)))
 }
 
+/// The worst state across repos; waived rows count as merged.
 pub fn worst(prs: &[Pr]) -> Option<PrState> {
     prs.iter().map(|p| if waived(p) { PrState::Merged } else { p.state }).max_by_key(|s| s.badness())
 }
 
+/// No rows means nothing was ever recorded, so not ready.
 pub fn ready_to_close(prs: &[Pr]) -> bool {
-    worst(prs).is_none_or(|s| s == PrState::Merged)
+    worst(prs) == Some(PrState::Merged)
 }
 
 #[cfg(test)]
@@ -175,6 +181,29 @@ mod tests {
         assert_eq!(worst(&b), Some(PrState::Merged));
         assert!(ready_to_close(&b));
         assert_eq!(worst(&[]), None);
+        assert!(!ready_to_close(&[]), "no PR rows is not ready");
+    }
+
+    #[test]
+    fn no_repos_still_needs_a_pr_or_waiver() {
+        let s = Store::open_in_memory();
+        let id = s.add_task(NewTask { title: "t", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        s.link_session("s1", id, "/w").unwrap();
+        explainer(&s, id);
+        assert_eq!(eval(&s, id, true), ["no PR or reason recorded"]);
+        s.set_pr(id, "/w", Some("https://x/pr/1"), None).unwrap();
+        assert_eq!(eval(&s, id, false), ["couldn't verify PR https://x/pr/1"]);
+        assert!(eval(&s, id, true).is_empty());
+        s.set_pr(id, "/w", None, Some("config only")).unwrap();
+        assert!(eval(&s, id, false).is_empty());
+    }
+
+    #[test]
+    fn review_with_no_pr_rows_is_not_done() {
+        let s = Store::open_in_memory();
+        let id = s.add_task(NewTask { title: "t", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        s.conn.execute("UPDATE tasks SET stage='review'", []).unwrap();
+        assert_eq!(s.transition(id, Stage::Done, 3, &|_, _| vec![]).unwrap(), Err(Refusal::NotMerged));
     }
 
     #[test]

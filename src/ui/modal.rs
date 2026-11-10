@@ -235,8 +235,9 @@ mod tests {
         ap.modal.as_mut().unwrap().detail = detail(&s, id).unwrap();
         let t = text(&mut ap, 140, 40);
         assert!(t.contains("Gate") && t.contains("no explainer"), "{t}");
-        // The gate wants the explainer on disk; no repos edited means no PR is needed.
+        // The gate wants the explainer on disk, and a PR or a reason even when no repo was edited.
         s.set_explainer(id, &std::env::temp_dir().to_string_lossy()).unwrap();
+        s.set_pr(id, "/w", None, Some("notes only")).unwrap();
         ap.set_snapshot(crate::app::snapshot(&s, &cfg(3)).unwrap());
         ap.modal.as_mut().unwrap().detail = detail(&s, id).unwrap();
         assert!(text(&mut ap, 140, 40).contains("ready for review"));

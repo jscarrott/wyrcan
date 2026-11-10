@@ -699,7 +699,7 @@ pub(crate) mod tests {
         assert_eq!((sn.active, sn.max_active, sn.blocked, sn.writers.len()), (4, 5, 2, 1));
         // Active cards carry what the gate still lacks.
         let c = &sn.groups[0].1[0];
-        assert_eq!(c.missing, ["no explainer"]);
+        assert_eq!(c.missing, ["no PR or reason recorded", "no explainer"]);
     }
 
     #[test]
@@ -720,6 +720,7 @@ pub(crate) mod tests {
         let merged = review(Some(PrState::Merged), None);
         let waived = review(None, Some("dotfiles only"));
         let waiting = review(Some(PrState::Waiting), None);
+        let bare = review(None, None);
         let sn = snapshot(&s, &cfg(3)).unwrap();
         assert_eq!(flag_of(&sn, outside).as_deref(), Some("working outside Active"));
         assert_eq!(flag_of(&sn, changes).as_deref(), Some("changes requested, waiting for a slot"));
@@ -727,6 +728,7 @@ pub(crate) mod tests {
         assert_eq!(flag_of(&sn, merged).as_deref(), Some("ready to close"));
         assert_eq!(flag_of(&sn, waived).as_deref(), Some("ready to close"));
         assert_eq!(flag_of(&sn, waiting), None);
+        assert_eq!(flag_of(&sn, bare), None, "no PR rows is not ready to close");
     }
 
     #[test]

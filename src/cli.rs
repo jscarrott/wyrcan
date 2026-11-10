@@ -143,6 +143,9 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
                         store.set_pr(t.id, root, url, waiver)?;
                     }
                     "--explainer" => {
+                        if std::fs::metadata(v).is_ok_and(|m| m.len() == 0) {
+                            return Ok((1, "explainer is empty".into()));
+                        }
                         let dest = cfg.explainer_dir().join(format!("{}.html", t.id));
                         std::fs::create_dir_all(cfg.explainer_dir())?;
                         if let Err(e) = std::fs::copy(v, &dest) {
@@ -290,6 +293,24 @@ mod tests {
         assert_eq!(go(&s, &c, &["gate", "s", "--no-pr", "/r/app=docs only"], false).0, 0);
         assert_eq!(stage(&s, id), Stage::Review);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gate_without_repos_needs_a_pr_or_reason_and_a_real_explainer() {
+        let (c, dir) = cfg(3);
+        let s = Store::open_in_memory();
+        let id: i64 = go(&s, &c, &["add", "t"], true).1.parse().unwrap();
+        go(&s, &c, &["claim", "s", &id.to_string(), "/w"], true);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (empty, full) = (dir.join("empty.html"), dir.join("e.html"));
+        std::fs::write(&empty, "").unwrap();
+        std::fs::write(&full, "<p>x</p>").unwrap();
+        assert_eq!(go(&s, &c, &["gate", "s", "--explainer", empty.to_str().unwrap()], true), (1, "explainer is empty".into()));
+        let (code, msg) = go(&s, &c, &["gate", "s", "--explainer", full.to_str().unwrap()], true);
+        assert!(code == 1 && msg.contains("no PR or reason recorded"), "{msg}");
+        assert_eq!(stage(&s, id), Stage::Active);
+        assert_eq!(go(&s, &c, &["gate", "s", "--no-pr", "/w=dotfiles only"], true), (0, "In review.".into()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

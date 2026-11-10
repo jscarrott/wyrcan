@@ -466,6 +466,8 @@ mod tests {
         for &from in Stage::ALL {
             for &to in Stage::ALL {
                 let id = task_in(&s, from);
+                // Done needs a merged or waived PR row.
+                s.set_pr(id, "/a", None, Some("no code")).unwrap();
                 let r = s.transition(id, to, 99, &no_gate).unwrap();
                 if allowed.contains(&(from, to)) {
                     assert_eq!(r, Ok(()), "{from} -> {to}");
