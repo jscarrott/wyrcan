@@ -3,7 +3,7 @@
 #   claude-board.sh edit  (PostToolUse Edit|Write|MultiEdit|NotebookEdit) -> task in "In progress"
 #   claude-board.sh stop  (Stop)                                         -> task to "Needs review" + summary comment
 #   claude-board.sh next                     -> prints top "Up next" task as JSON (exit 1 if none)   [used by /next]
-#   claude-board.sh claim SESSION TASK CWD   -> moves TASK to "In progress" and links it to SESSION  [used by /next]
+#   claude-board.sh claim SESSION TASK CWD   -> moves TASK to "In progress", links it to SESSION, prints it as JSON  [used by /next]
 #   claude-board.sh state working|waiting|blocked|ended  (hook JSON on stdin; offline, only touches an existing state file)
 #   claude-board.sh register-pen SESSION CWD -> state record for a pen (scratch) session
 #   claude-board.sh add TITLE DESC [LABEL...] -> new task at the bottom of Up next; prints its id
@@ -20,7 +20,11 @@ IN_PROGRESS="In progress"
 NEEDS_REVIEW="Needs review"
 UP_NEXT="Up next"
 
-[[ -r $TOKEN_FILE ]] || { echo "claude-board: no Todoist token at $TOKEN_FILE" >&2; exit 0; }
+if [[ ! -r $TOKEN_FILE ]]; then
+  echo "claude-board: no Todoist token at $TOKEN_FILE" >&2
+  [[ $action =~ ^(next|claim|add)$ ]] && exit 1
+  exit 0
+fi
 TOKEN=$(tr -d '[:space:]' <"$TOKEN_FILE")
 mkdir -p "$STATE" || exit 0
 
@@ -119,7 +123,7 @@ case "$action" in
 state)
   [[ -s $sf && ${2:-} =~ ^(working|waiting|blocked|ended)$ ]] || exit 0
   # closed guard lives inside the locked filter so a concurrent `close` can't be overwritten
-  upd --arg a "$2" --argjson t "$(date +%s)" --argjson z "$(zj)" 'if .agent=="closed" then . else .agent=$a | .state_at=$t | . + $z end'
+  upd --arg a "$2" --argjson t "$(date +%s)" --argjson z "$(zj)" 'if .agent=="closed" then . elif .agent==$a then . + $z else .agent=$a | .state_at=$t | . + $z end'
   exit 0 ;;
 register-pen)
   [[ -n ${3:-} ]] || exit 0
@@ -132,7 +136,9 @@ close)
 edit|stop)
   if [[ -s $sf ]]; then
     [[ $(jq -r '.kind // "task"' "$sf") == pen ]] && exit 0
-    if [[ $(jq -r .agent "$sf") == closed ]]; then
+    if [[ -z $(jq -r '.task // empty' "$sf") ]]; then
+      drop # half-created record (edit killed between POST and upd): start over
+    elif [[ $(jq -r .agent "$sf") == closed ]]; then
       [[ $action == stop ]] && exit 0
       drop # a closed session's next edit starts a new task
     fi
@@ -196,8 +202,8 @@ stop)
   ;;
 add)
   [[ -n ${2:-} ]] || { echo "usage: claude-board.sh add TITLE DESCRIPTION [LABEL...]" >&2; exit 1; }
-  api POST /tasks "$(jq -nc --arg c "$2" --arg d "${3:-}" --arg p "$P" --arg s "$UN" --args '$ARGS.positional[3:] as $l
-    | {content:$c, description:$d, project_id:$p, section_id:$s, labels:$l}' "$@")" | jq -er '.id' \
+  api POST /tasks "$(jq -nc --arg c "$2" --arg d "${3:-}" --arg p "$P" --arg s "$UN" \
+    '{content:$c, description:$d, project_id:$p, section_id:$s, labels:$ARGS.positional}' --args -- "${@:4}")" | jq -er '.id' \
     || { echo "claude-board: add failed" >&2; exit 1; }
   ;;
 next)
@@ -213,7 +219,7 @@ claim)
   jq -n --arg s "$session" --arg cwd "$claim_cwd" --arg task "$claim_task" --argjson t "$t" --argjson now "$(date +%s)" --argjson z "$(zj)" \
     '{session:$s, cwd:$cwd, task:$task, repos:[], dirty:false, section:"ip", note:($t.description // ""), labels0:($t.labels // []),
       kind:"task", agent:"working", state_at:$now, zellij_session:null, zellij_pane:null} + $z' | put
-  echo "claimed $claim_task"
+  jq -c '{id, content, description, labels}' <<<"$t"
   ;;
 esac
 exit 0

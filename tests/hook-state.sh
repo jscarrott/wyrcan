@@ -23,6 +23,13 @@ for a in working blocked waiting ended; do
   if [[ $(jq -r .zellij_session "$S") != main ]]; then fail "zellij session after $a"; fi
 done
 
+# state_same_agent_keeps_state_at
+echo '{"session":"s","task":"t1","kind":"task","agent":"working","state_at":123}' >"$S"
+ev | ZELLIJ_PANE_ID=8 $H state working
+if [[ $(jq -r '.state_at,.zellij_pane' "$S" | tr '\n' ' ') != "123 terminal_8 " ]]; then fail "working->working reset state_at"; fi
+ev | $H state waiting
+if [[ $(jq -r .state_at "$S") == 123 ]]; then fail "working->waiting kept state_at"; fi
+
 # register_pen_creates_pen_record
 $H register-pen pen1 "$W"
 P=$CLAUDE_BOARD_STATE/pen1.json
@@ -35,7 +42,13 @@ export CLAUDE_BOARD_API=http://127.0.0.1:9
 echo '{"p":"1","un":"2","ip":"3","nr":"4"}' >"$CLAUDE_BOARD_STATE/board-$(printf %s 'Claude Board' | md5sum | cut -c1-8).json"
 # curl shim: every API call "succeeds" with a task id and is logged, so edit/stop's API-gated writes run.
 mkdir -p "$W/bin"; export CURL_LOG=$W/curl.log
-printf '%s\n' '#!/usr/bin/env bash' 'echo "$*" >>"$CURL_LOG"' "echo '{\"id\":\"t-new\"}'" >"$W/bin/curl"
+export CURL_BODY=$W/body.json
+cat >"$W/bin/curl" <<'SHIM'
+#!/usr/bin/env bash
+echo "$*" >>"$CURL_LOG"
+while (($#)); do [[ $1 == --data ]] && printf '%s' "$2" >"$CURL_BODY"; shift; done
+echo '{"id":"t-new"}'
+SHIM
 chmod +x "$W/bin/curl"; export PATH=$W/bin:$PATH
 git init -q "$W/repo"
 edit() { jq -nc --arg f "$W/repo/x.py" --arg c "$W/repo" '{session_id:"s",cwd:$c,tool_input:{file_path:$f}}' | $H edit; }
@@ -60,6 +73,26 @@ if [[ $(jq -c . "$S") != $(jq -c . <<<"$C") ]]; then fail "stop/state touched cl
 seed "$C"; : >"$CURL_LOG"; edit
 if [[ $(jq -r '.task,.agent,.kind' "$S" | tr '\n' ' ') != "t-new working task " ]]; then fail "closed edit did not start a new task"; fi
 if ! grep -q 'POST.*/tasks' "$CURL_LOG"; then fail "no POST /tasks"; fi
+# half-created record (no .task): edit starts over instead of hitting /tasks/null
+seed '{"session":"s","kind":"task","agent":"working","state_at":5,"repos":[],"dirty":true,"section":"ip"}'; : >"$CURL_LOG"; edit
+if [[ $(jq -r .task "$S") != t-new ]]; then fail "taskless record not recreated"; fi
+if grep -q '/tasks/null' "$CURL_LOG"; then fail "hit /tasks/null"; fi
+seed '{"session":"s","kind":"task","agent":"working","state_at":5,"repos":[],"dirty":true,"section":"ip"}'; : >"$CURL_LOG"
+ev | $H stop
+if [[ -e $S ]] || grep -q '/tasks/null' "$CURL_LOG"; then fail "stop on taskless record"; fi
+# add: dash-leading title/description/labels survive as data
+out=$($H add -e $'- bullet\n--- x' lab -lab2) || fail "add exit"
+if [[ $out != t-new ]]; then fail "add output: $out"; fi
+if [[ $(jq -c '[.content,.description,.labels]' "$CURL_BODY") != '["-e","- bullet\n--- x",["lab","-lab2"]]' ]]; then fail "add body: $(cat "$CURL_BODY")"; fi
+$H add t d >/dev/null || fail "add without labels"
+if [[ $(jq -c .labels "$CURL_BODY") != '[]' ]]; then fail "add empty labels"; fi
+# missing token: CLI modes fail loudly, hook modes still exit 0
+for m in next "claim s t1 /x" "add t d"; do
+  if CLAUDE_BOARD_TOKEN_FILE=$W/none $H $m 2>/dev/null; then fail "$m exited 0 without token"; fi
+done
+CLAUDE_BOARD_TOKEN_FILE=$W/none edit 2>/dev/null || fail "edit without token"
+ev | CLAUDE_BOARD_TOKEN_FILE=$W/none $H state working 2>/dev/null || fail "state without token"
+
 # pen: edit/stop leave it alone
 PEN='{"session":"s","cwd":"/x","kind":"pen","agent":"working","state_at":5}'
 seed "$PEN"; edit; ev | $H stop
