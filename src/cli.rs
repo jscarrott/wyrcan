@@ -174,7 +174,9 @@ mod tests {
     use super::*;
 
     fn cfg(max: usize) -> (Config, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("cb-cli-{}-{}", std::process::id(), crate::store::now()));
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cb-cli-{}-{n}", std::process::id()));
         let mut c = Config::from_env();
         c.state_dir = dir.clone();
         c.max_active = max;
