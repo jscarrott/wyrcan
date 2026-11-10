@@ -8,6 +8,7 @@ pub struct Task {
     pub id: String,
     pub content: String,
     #[serde(default)]
+    #[allow(dead_code)] // not yet shown
     pub description: String,
     #[serde(default)]
     pub labels: Vec<String>,
@@ -27,6 +28,7 @@ fn parse<T: serde::de::DeserializeOwned>(body: &str) -> anyhow::Result<(Vec<T>, 
     Ok((p.results, p.next_cursor))
 }
 
+#[allow(dead_code)] // only exercised by tests
 pub fn parse_page(body: &str) -> anyhow::Result<(Vec<Task>, Option<String>)> {
     parse(body)
 }

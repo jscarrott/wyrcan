@@ -21,6 +21,7 @@ pub enum Kind {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // parsed from state files, not yet shown
 pub struct Repo {
     pub root: String,
     #[serde(rename = "ref")]
@@ -45,6 +46,7 @@ pub struct AgentRecord {
     #[serde(default)]
     pub zellij_pane: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)] // not yet shown
     pub repos: Vec<Repo>,
 }
 
