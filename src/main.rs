@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod closed;
 mod config;
 mod effects;
 mod gate;
@@ -90,7 +91,8 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, store: &store:
             _ => continue,
         };
         // A task view that just opened has nothing to show until refresh reads it.
-        if effects.is_empty() && !app.modal.as_ref().is_some_and(|v| v.detail.is_none()) {
+        let loading = app.modal.as_ref().is_some_and(|v| v.detail.is_none()) || app.closed.as_ref().is_some_and(|c| c.rows.is_none());
+        if effects.is_empty() && !loading {
             continue;
         }
         // The gate shells out to gh, so a move into Review runs off the UI thread.
@@ -114,6 +116,12 @@ fn refresh(app: &mut App, store: &store::Store, cfg: &config::Config) {
     match app::snapshot(store, cfg) {
         Ok(s) => app.set_snapshot(s),
         Err(e) => app.message = Some(format!("{e:#}")),
+    }
+    if let Some(c) = app.closed.as_mut() {
+        match closed::closed(store, None) {
+            Ok(r) => c.rows = Some(r),
+            Err(e) => app.message = Some(format!("{e:#}")),
+        }
     }
     let Some(id) = app.modal.as_ref().map(|v| v.id) else { return };
     match app::detail(store, id) {

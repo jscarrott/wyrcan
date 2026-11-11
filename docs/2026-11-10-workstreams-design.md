@@ -192,3 +192,7 @@ A task can carry a directory. **(call)** If it doesn't, the board asks for one w
 - Sync timing and how Todoist sections map to stages (Parked needs somewhere to go).
 - How existing state files are migrated, or whether they're just left behind.
 - Tests: the cap and the gate each need tests that try every way into Active and Review.
+
+## Revision 2026-11-11: closed record
+
+Done and Dropped tasks stay in the database; a record of them is now shown. `closed::closed(store, since)` (src/closed.rs) is the one query: each closed task with its close time (`stage_at`), start time (first `→ active` stage event), PRs and wrap-up summary. The board's `c` key opens a read-only Closed view (one list, newest first, wrapped titles, `closed <date> · took <duration> · <PR>`); `space`, `e`, `o` work, every stage key is inert, `esc`/`c` returns. `claude-board closed [--days N]` (default 7, 0 = all) prints the same data as Markdown, and the `board-log` skill saves that to the Capacities daily note. Dates are local time (offset read once from `date +%z`; no new dependency).

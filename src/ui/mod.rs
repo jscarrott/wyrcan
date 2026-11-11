@@ -1,5 +1,6 @@
 //! Drawing. `draw` picks the form by width; both share the header, writers line and footer.
 mod card;
+mod closed;
 mod modal;
 mod narrow;
 mod wide;
@@ -17,6 +18,8 @@ const KEYS: &[&str] = &[
     "a adopt", "⏎ go to", "f full", "v wide", "p pen", "e explainer", "o PR", "q quit",
 ];
 const VIEW_KEYS: &[&str] = &["↑↓ scroll", "e explainer", "o PR", "w wrap", "P park", "x done", "D drop", "esc close"];
+const CLOSED_KEYS: &[&str] = &["↑↓ move", "space view", "e explainer", "o PR", "c/esc board", "q quit"];
+const CLOSED_VIEW_KEYS: &[&str] = &["↑↓ scroll", "e explainer", "o PR", "esc close"];
 const ADD_KEYS: &[&str] = &["⏎ add to queue", "esc cancel", "@label", "#directory"];
 const PROMPT_KEYS: &[&str] = &["⏎ ok", "esc cancel"];
 
@@ -41,6 +44,8 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
     let keys = match () {
         _ if app.quick.is_some() => ADD_KEYS,
         _ if app.prompt.is_some() => PROMPT_KEYS,
+        _ if app.closed.is_some() && app.modal.is_some() => CLOSED_VIEW_KEYS,
+        _ if app.closed.is_some() => CLOSED_KEYS,
         _ if app.modal.is_some() => VIEW_KEYS,
         _ => KEYS,
     };
@@ -96,14 +101,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Line::from(w), writers);
     f.render_widget(Paragraph::new(foot), footer);
 
-    let mut hits = if app.wide { wide::draw(f, body, app, now) } else { narrow::draw(f, body, app, now) };
+    // The Closed view only reads, so it leaves no hits for the mouse.
+    let mut hits = if let Some(c) = &app.closed {
+        closed::draw(f, body, c);
+        vec![]
+    } else if app.wide { wide::draw(f, body, app, now) } else { narrow::draw(f, body, app, now) };
     if let Some(q) = &app.quick {
         modal::draw_quick_add(f, input, q);
     } else if let Some(p) = &app.prompt {
         modal::draw_prompt(f, input, &p.label, &p.text, p.text.chars().count());
     }
     // The gate status the card carries: what an Active stream still lacks, or that a Review one passed.
-    let gate = match app.selected_card() {
+    let gate = match app.selected_card().filter(|_| app.closed.is_none()) {
         Some(c) if c.task.as_ref().is_some_and(|t| t.stage == crate::model::Stage::Review) => vec!["passed".into()],
         Some(c) if c.task.as_ref().is_some_and(|t| t.stage == crate::model::Stage::Active) && c.missing.is_empty() => vec!["ready for review".into()],
         Some(c) => c.missing.clone(),

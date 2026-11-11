@@ -6,11 +6,11 @@ use crate::store::{NewTask, Store};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. | next | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] | drop TASK_ID | export | sync";
+const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. | next | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] | drop TASK_ID | closed [--days N] | export | sync";
 
 pub fn run(args: &[String], cfg: &Config) -> Result<i32> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    if !matches!(a.first(), Some(&("add" | "next" | "claim" | "register-pen" | "status" | "gate" | "drop" | "export" | "sync"))) {
+    if !matches!(a.first(), Some(&("add" | "next" | "claim" | "register-pen" | "status" | "gate" | "drop" | "closed" | "export" | "sync"))) {
         eprintln!("{USAGE}");
         return Ok(2);
     }
@@ -194,6 +194,20 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
                 Err(r) => refused(r),
             }
         }
+        "closed" => {
+            let (pos, fl) = parse(rest, &["--days"])?;
+            let days = match (pos.is_empty(), fl.last()) {
+                (false, _) => return usage("closed takes only --days N"),
+                (_, Some(f)) => match f.1.parse::<i64>() {
+                    Ok(d) if d >= 0 => d,
+                    _ => return usage("--days must be a number of days, 0 for everything"),
+                },
+                _ => 7,
+            };
+            let now = crate::store::now();
+            let rows = crate::closed::closed(store, (days > 0).then(|| now - days * 86400))?;
+            ok(crate::closed::report(store, &rows, days, now)?.trim_end().to_string())
+        }
         _ => ok(store.export_json()?.to_string()),
     }
 }
@@ -376,5 +390,33 @@ mod tests {
         assert_eq!(v["repos"], json!(["/r/app"]));
         assert_eq!(v["missing"], json!(["no PR for app", "no explainer"]));
         assert_eq!(go(&s, &c, &["status", "nobody"], true).0, 1);
+    }
+
+    #[test]
+    fn closed_prints_markdown_for_done_and_dropped() {
+        use crate::closed::{date, tests::close};
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        assert_eq!(go(&s, &c, &["closed"], true), (0, format!("# Closed work: {} to {}\n\nNothing closed in this period.", date(crate::store::now() - 7 * 86400), date(crate::store::now()))));
+        let now = crate::store::now();
+        let a = close(&s, "Ship\nthe thing", Stage::Done, Some(now - 3600 - 600), now - 600);
+        crate::app::tests::session(&s, "x", Some(a), crate::model::AgentState::Ended);
+        s.mark_edited("x", "/r/app", "git main").unwrap();
+        s.set_pr(a, "/r/app", Some("https://github.com/acme/app/pull/3"), None).unwrap();
+        s.set_pr(a, "/r/lib", None, Some("docs only")).unwrap();
+        s.set_explainer(a, "/e/1.html").unwrap();
+        s.add_event(a, "summary", "Did it.").unwrap();
+        close(&s, "Old win", Stage::Done, None, now - 30 * 86400);
+        close(&s, "Nope", Stage::Dropped, None, now - 86400);
+        let (code, md) = go(&s, &c, &["closed"], true);
+        let d = |t| date(t);
+        let want = format!(
+            "# Closed work: {} to {}\n\n1 done · 1 dropped\n\n## Done\n\n### Ship the thing\n- Closed: {} (took 1h 0m)\n- Repos: app\n- PR: https://github.com/acme/app/pull/3\n- No PR: docs only\n- Explainer: /e/1.html\n\nDid it.\n\n## Dropped\n\n### Nope\n- Dropped: {} (took —)",
+            d(now - 7 * 86400), d(now), d(now - 600), d(now - 86400)
+        );
+        assert_eq!((code, md), (0, want));
+        let (_, all) = go(&s, &c, &["closed", "--days", "0"], true);
+        assert!(all.contains("2 done · 1 dropped") && all.contains("### Old win"));
+        assert!(exec(&s, &["closed", "--days", "x"], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
     }
 }

@@ -1,4 +1,5 @@
 //! Board state and input: a snapshot of the store, the selection, and keys/mouse turned into effects.
+use crate::closed::Closed;
 use crate::config::Config;
 use crate::gate;
 use crate::model::{AgentState, Event, Pr, PrState, Session, SessionKind, Stage, Task};
@@ -215,6 +216,30 @@ pub struct TaskView {
     pub detail: Option<Detail>,
 }
 
+/// The Closed view: read-only rows loaded by the loop while it is open (`None` until then).
+#[derive(Debug, Default)]
+pub struct ClosedView {
+    pub rows: Option<Vec<Closed>>,
+    pub selected: Option<i64>,
+}
+
+impl ClosedView {
+    pub fn index(&self) -> usize {
+        let rows = self.rows.as_deref().unwrap_or_default();
+        rows.iter().position(|c| Some(c.task.id) == self.selected).unwrap_or(0)
+    }
+
+    fn step(&mut self, d: isize) {
+        let rows = self.rows.as_deref().unwrap_or_default();
+        let i = self.index().saturating_add_signed(d).min(rows.len().saturating_sub(1));
+        self.selected = rows.get(i).map(|c| c.task.id);
+    }
+
+    fn id(&self) -> Option<i64> {
+        self.rows.as_deref()?.get(self.index()).map(|c| c.task.id)
+    }
+}
+
 /// The quick-add line; `cursor` counts chars.
 #[derive(Debug, Default)]
 pub struct Input {
@@ -277,6 +302,7 @@ pub struct App {
     pub confirm: Option<Pending>,
     pub modal: Option<TaskView>,
     pub quick: Option<Input>,
+    pub closed: Option<ClosedView>,
     pub drag: Option<Drag>,
     pub hits: Vec<Hit>,
     /// The wide form is on screen (set by `ui::draw` from the width).
@@ -297,6 +323,7 @@ impl App {
             confirm: None,
             modal: None,
             quick: None,
+            closed: None,
             drag: None,
             hits: vec![],
             wide: false,
@@ -330,7 +357,7 @@ impl App {
             self.selected = flat.get(old.unwrap_or(0).min(flat.len().saturating_sub(1))).map(|c| c.key());
         }
         // The task view follows its card; once the card leaves the board (done, dropped), it closes.
-        if self.modal.as_ref().is_some_and(|v| self.selected != Some(CardKey::Task(v.id))) {
+        if self.closed.is_none() && self.modal.as_ref().is_some_and(|v| self.selected != Some(CardKey::Task(v.id))) {
             self.modal = None;
         }
     }
@@ -407,6 +434,10 @@ impl App {
         };
         if let Some(v) = self.modal.as_mut() {
             v.scroll = v.scroll.saturating_add_signed(wheel * 3);
+            return vec![];
+        }
+        if let Some(c) = self.closed.as_mut() {
+            c.step(wheel as isize);
             return vec![];
         }
         match m.kind {
@@ -493,6 +524,9 @@ impl App {
             }
             return vec![];
         }
+        if self.closed.is_some() {
+            return self.closed_key(k.code);
+        }
         // In the task view these act on the card in view, as on the board; other keys stay in the view.
         let passes = matches!(k.code, KeyCode::Char('e' | 'o' | 'w' | 'P' | 'x' | 'D'));
         if let Some(v) = self.modal.as_mut().filter(|_| !passes) {
@@ -540,6 +574,10 @@ impl App {
             KeyCode::Char('f') => on(Effect::Fullscreen),
             KeyCode::Char('e') => on(Effect::OpenExplainer),
             KeyCode::Char('o') => on(Effect::OpenPr),
+            KeyCode::Char('c') => {
+                self.closed = Some(ClosedView::default());
+                vec![]
+            }
             KeyCode::Char('v') => vec![Effect::ToggleBoardWide],
             KeyCode::Char('p') => vec![Effect::SpawnPen],
             KeyCode::Char(' ') => {
@@ -555,6 +593,35 @@ impl App {
             KeyCode::Char('q') => vec![Effect::Quit],
             _ => vec![],
         }
+    }
+
+    /// The Closed view only reads: moving, the task view, the explainer and the PR links.
+    fn closed_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        let Some(c) = self.closed.as_mut() else { return vec![] };
+        let id = self.modal.as_ref().map(|v| v.id).or(c.id());
+        match code {
+            KeyCode::Char('q') => return vec![Effect::Quit],
+            KeyCode::Char('e') => return id.map(Effect::OpenExplainer).into_iter().collect(),
+            KeyCode::Char('o') => return id.map(Effect::OpenPr).into_iter().collect(),
+            _ => {}
+        }
+        if let Some(v) = self.modal.as_mut() {
+            match code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Up | KeyCode::Char('k') => v.scroll = v.scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => v.scroll += 1,
+                _ => {}
+            }
+            return vec![];
+        }
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => c.step(-1),
+            KeyCode::Down | KeyCode::Char('j') => c.step(1),
+            KeyCode::Char(' ') => self.modal = c.id().map(|id| TaskView { id, scroll: 0, detail: None }),
+            KeyCode::Esc | KeyCode::Char('c') => self.closed = None,
+            _ => {}
+        }
+        vec![]
     }
 
     fn prompt_key(&mut self, code: KeyCode) -> Vec<Effect> {
@@ -968,5 +1035,47 @@ pub(crate) mod tests {
         assert_eq!((ap.selected.clone(), ap.scroll[Group::Queue as usize]), (Some(CardKey::Task(a)), 3));
         ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 6));
         assert!(ap.quick.is_some());
+    }
+
+    /// Presses `c` and loads the rows the way the loop does.
+    pub fn open_closed(ap: &mut App, s: &Store) {
+        assert!(ap.on_key_event(key('c')).is_empty());
+        ap.closed.as_mut().unwrap().rows = Some(crate::closed::closed(s, None).unwrap());
+    }
+
+    #[test]
+    fn closed_view_keys_are_read_only() {
+        use crate::closed::tests::close;
+        let s = Store::open_in_memory();
+        let queued = add(&s, "queued", Stage::Queue);
+        let (new, old) = (close(&s, "new", Stage::Done, Some(10), 500), close(&s, "old", Stage::Dropped, None, 100));
+        let mut ap = app(&s, &cfg(3));
+        open_closed(&mut ap, &s);
+        for c in ['P', 'x', 'D', 'H', 'L', 'n', 's', 'w', 'a', 'f', 'p', 'v', '+'] {
+            assert_eq!(ap.on_key_event(key(c)), [], "{c} must do nothing");
+        }
+        assert!(ap.quick.is_none() && ap.confirm.is_none() && ap.prompt.is_none());
+        assert_eq!(ap.on_key_event(key('j')), []);
+        assert_eq!(ap.closed.as_ref().unwrap().selected, Some(old));
+        assert_eq!(ap.on_key_event(key('k')), []);
+        assert_eq!(ap.on_key_event(key('e')), [Effect::OpenExplainer(new)]);
+        assert_eq!(ap.on_key_event(key('o')), [Effect::OpenPr(new)]);
+        // Space opens the usual task view, and the loader finds a closed task.
+        ap.on_key_event(key(' '));
+        assert_eq!(ap.modal.as_ref().map(|v| v.id), Some(new));
+        assert_eq!(detail(&s, new).unwrap().unwrap().task.stage, Stage::Done);
+        // A refresh doesn't close the view of a task that isn't on the board; board keys stay inert under it.
+        ap.set_snapshot(snapshot(&s, &cfg(3)).unwrap());
+        assert!(ap.modal.is_some());
+        for c in ['P', 'x', 'D', 'w'] {
+            assert_eq!(ap.on_key_event(key(c)), [], "{c} must do nothing");
+        }
+        ap.on_key_event(KeyCode::Esc.into());
+        assert!(ap.modal.is_none() && ap.closed.is_some());
+        assert_eq!(ap.on_key_event(key('q')), [Effect::Quit]);
+        ap.on_key_event(KeyCode::Esc.into());
+        assert!(ap.closed.is_none());
+        // Back on the board the queued card is selectable and actions work again.
+        assert_eq!(ap.on_key_event(key('n')), [Effect::Start(queued)]);
     }
 }

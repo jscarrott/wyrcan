@@ -1,23 +1,13 @@
 //! Overlays: the task view, quick add and the one-line prompt box.
 use super::card::{age, chips, home_short, wrap};
 use super::theme;
+use crate::closed::date;
 use crate::app::{parse_quick_add, Input, TaskView};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
-
-/// `YYYY-MM-DD` (UTC) of a Unix time; Howard Hinnant's civil-from-days.
-fn date(ts: i64) -> String {
-    let z = ts.div_euclid(86400) + 719468;
-    let (era, doe) = (z.div_euclid(146097), z.rem_euclid(146097));
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
-    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + i64::from(m <= 2))
-}
 
 /// The task view: title, description and thread on the left, the facts in a side panel on the right.
 /// `gate` is what the card shows for the review gate; empty leaves the field out.
