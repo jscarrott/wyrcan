@@ -17,6 +17,12 @@ const KEYS: &[&str] = &[
     "⇥ view", "↑↓ card", "←→ group", "space view", "+ add", "n next", "s start", "P park", "w wrap", "H/L move", "x done", "D drop/dismiss",
     "a adopt", "⏎ go to", "f full", "v wide", "p pen", "e explainer", "o PR", "q quit",
 ];
+// Reviews: no Queue for `n`, no untracked sessions to adopt.
+const REVIEWS_KEYS: &[&str] = &[
+    "⇥ view", "↑↓ card", "←→ group", "space view", "s start", "P park", "H/L move", "x done", "D drop", "⏎ go to", "f full", "v wide",
+    "p pen", "e explainer", "o PR", "q quit",
+];
+const SHELVED_KEYS: &[&str] = &["⇥ view", "↑↓ card", "space view", "s/⏎ resume experiment", "D drop", "v wide", "p pen", "e explainer", "q quit"];
 const VIEW_KEYS: &[&str] = &["↑↓ scroll", "e explainer", "o PR", "w wrap", "P park", "x done", "D drop", "esc close"];
 const CLOSED_KEYS: &[&str] = &["↑↓ move", "space view", "e explainer", "o PR", "c/esc board", "q quit"];
 const CLOSED_VIEW_KEYS: &[&str] = &["↑↓ scroll", "e explainer", "o PR", "esc close"];
@@ -47,7 +53,11 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         _ if app.closed.is_some() && app.modal.is_some() => CLOSED_VIEW_KEYS,
         _ if app.closed.is_some() => CLOSED_KEYS,
         _ if app.modal.is_some() => VIEW_KEYS,
-        _ => KEYS,
+        _ => match app.view {
+            View::Work => KEYS,
+            View::Reviews => REVIEWS_KEYS,
+            View::Shelved => SHELVED_KEYS,
+        },
     };
     if let Some(c) = &app.confirm {
         text(c.prompt.clone(), warn)

@@ -178,10 +178,11 @@ mod tests {
         let heads = &rows[2];
         assert!(heads.find("Requested  1").unwrap() < heads.find("Reviewing  0").unwrap(), "{heads:?}");
         assert!(heads.contains("Waiting on author  0"), "{heads:?}");
-        assert!(rows.join("\n").contains("review their PR"));
+        let text = rows.join("\n");
+        assert!(text.contains("review their PR") && !text.contains("n next"), "{text}");
         ap.on_key_event(ratatui::crossterm::event::KeyCode::Tab.into());
         let text = draw(&mut ap, 140, 30).join("\n");
-        for want in ["Shelved  1", "try sled storage", "sled is fast but unmaintained", "/w/proj → exp-sled"] {
+        for want in ["Shelved  1", "try sled storage", "sled is fast but unmaintained", "/w/proj → exp-sled", "s/⏎ resume experiment"] {
             assert!(text.contains(want), "missing {want:?} in\n{text}");
         }
         assert!(!text.contains("queued work"), "{text}");

@@ -172,7 +172,7 @@ pub fn card_lines(c: &Card, width: usize, selected: bool, now: i64) -> Vec<Line<
         body.extend(wrap(&why, text_w).into_iter().map(|l| vec![indent(), Span::styled(l, theme::dim())]));
     }
     // Shelved: what was learnt, where it's written up, and where the code was left.
-    let explainer = c.task.as_ref().and_then(|t| t.explainer.as_deref()).map(home_short);
+    let explainer = c.task.as_ref().filter(|t| t.stage == crate::model::Stage::Shelved).and_then(|t| t.explainer.as_deref()).map(home_short);
     let roots = c.bookmarks.iter().map(|(root, name)| format!("{} → {name}", home_short(root)));
     for l in c.summary.iter().cloned().chain(explainer).chain(roots) {
         body.extend(wrap(&l, text_w).into_iter().map(|l| vec![indent(), Span::styled(l, theme::dim())]));
@@ -272,6 +272,13 @@ mod tests {
         }
         // Every line is exactly the card's width.
         assert!(lines.iter().all(|l| dw(l) == 30), "{t}");
+        // Only a Shelved card shows its explainer path.
+        let mut c = card("Fix auth timeout");
+        let task = c.task.as_mut().unwrap();
+        (task.stage, task.explainer) = (Stage::Review, Some("/w/explainer.html".into()));
+        assert!(!text(&card_lines(&c, 60, false, 0)).contains("explainer.html"));
+        c.task.as_mut().unwrap().stage = Stage::Shelved;
+        assert!(text(&card_lines(&c, 60, false, 0)).contains("/w/explainer.html"));
     }
 
     #[test]
