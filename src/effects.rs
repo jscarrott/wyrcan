@@ -14,6 +14,8 @@ pub struct Ctx<'a> {
     pub cfg: &'a Config,
     pub zj: &'a Zellij,
     pub run: &'a dyn Runner,
+    /// gh and jj for review workspaces; the real one has a timeout.
+    pub cmd: &'a dyn Runner,
     pub verify: &'a PrVerifier<'a>,
     /// Where pen sessions start.
     pub cwd: &'a str,
@@ -292,7 +294,7 @@ fn review_workspace(c: &Ctx, app: &mut App, t: &Task) -> Result<Option<String>> 
     };
     c.zj.board()?;
     let cmd = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let json = c.run.run(&cmd(&["gh", "pr", "view", link, "--json", "headRefName"]))?;
+    let json = c.cmd.run(&cmd(&["gh", "pr", "view", link, "--json", "headRefName"]))?;
     let head = serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| v["headRefName"].as_str().map(String::from)).unwrap_or_default();
     // The head goes into jj args and a revset: refuse anything unusual rather than quote it.
     if head.is_empty() || head.starts_with('-') || !head.chars().all(|ch| ch.is_ascii_alphanumeric() || "/_.-".contains(ch)) {
@@ -300,13 +302,13 @@ fn review_workspace(c: &Ctx, app: &mut App, t: &Task) -> Result<Option<String>> 
     }
     let path = reviews::workspace_path(&home, repo, number).to_string_lossy().into_owned();
     let [fetch, add] = <[_; 2]>::try_from(reviews::workspace_cmds(&parent, &path, &format!("{repo}-{number}-review"), &head)).expect("two commands");
-    c.run.run(&fetch).with_context(|| format!("Can't fetch {head} from origin"))?;
+    c.cmd.run(&fetch).with_context(|| format!("Can't fetch {head} from origin (fork PR?)"))?;
     // `jj git fetch` only warns about a missing branch, and a failed `workspace add` leaves a half-made workspace, so check first.
     // shortcut: fork PRs aren't supported (head not on origin); add `gh pr checkout` in a colocated workspace if they come up.
-    if c.run.run(&cmd(&["jj", "-R", &parent, "log", "-r", &format!("{head}@origin"), "--no-graph", "-T", "commit_id"])).is_err() {
+    if c.cmd.run(&cmd(&["jj", "-R", &parent, "log", "-r", &format!("{head}@origin"), "--no-graph", "-T", "commit_id"])).is_err() {
         bail!("Can't fetch {head} from origin (fork PR?)");
     }
-    c.run.run(&add)?;
+    c.cmd.run(&add)?;
     c.store.add_event(t.id, "workspace", &path)?;
     c.store.update_task(t.id, &t.title, &t.description, Some(&path), &t.labels)?;
     Ok(Some(path))
@@ -387,7 +389,7 @@ mod tests {
         Zellij { session: Some("z".into()), board_pane: Some("terminal_0".into()), bin: "wyrcan".into() }
     }
     fn ctx<'a>(s: &'a Store, c: &'a Config, zj: &'a Zellij, r: &'a Rec) -> Ctx<'a> {
-        Ctx { store: s, cfg: c, zj, run: r, verify: &|_| true, cwd: "/home" }
+        Ctx { store: s, cfg: c, zj, run: r, cmd: r, verify: &|_| true, cwd: "/home" }
     }
     fn stage(s: &Store, id: i64) -> Stage {
         s.task(id).unwrap().unwrap().stage

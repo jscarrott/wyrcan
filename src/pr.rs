@@ -1,6 +1,11 @@
 //! PR state from `gh`. Every failure is `Unknown` so a flaky network never refuses or crashes anything.
 use crate::model::PrState;
 use crate::store::Store;
+use crate::zellij::Runner;
+use anyhow::{bail, Context, Result};
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub fn parse(json: &str) -> (PrState, String) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return (PrState::Unknown, String::new()) };
@@ -18,32 +23,63 @@ pub fn parse(json: &str) -> (PrState, String) {
 }
 
 /// Runs `prog ARGS`, killing it after 15 s; stdout on success. `path` overrides the child's PATH (tests).
-// shortcut: stdout is read after exit, so output past the pipe buffer (64 KiB) would hang until the kill; gh's JSON here is tiny.
 pub fn gh_args(prog: &str, path: Option<&str>, args: &[&str]) -> Option<String> {
-    use std::io::Read;
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
     let mut cmd = std::process::Command::new(prog);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.args(args);
     if let Some(p) = path {
         cmd.env("PATH", p);
     }
-    let mut child = cmd.spawn().ok()?;
+    run_limited(cmd, Duration::from_secs(15)).ok()
+}
+
+/// Runs `cmd`, killing it after `limit`. Stdout on success; otherwise its stderr (or stdout) is the error.
+pub fn run_limited(mut cmd: Command, limit: Duration) -> Result<String> {
+    let prog = cmd.get_program().to_string_lossy().into_owned();
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().with_context(|| format!("running {prog}"))?;
+    // Both pipes are drained while it runs, so a chatty child can't fill one and stall.
+    fn drain(p: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(mut p) = p {
+                let _ = p.read_to_string(&mut s);
+            }
+            s
+        })
+    }
+    let (out, err) = (drain(child.stdout.take()), drain(child.stderr.take()));
     let start = Instant::now();
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) if start.elapsed() < Duration::from_secs(15) => std::thread::sleep(Duration::from_millis(50)),
-            _ => {
+        match child.try_wait()? {
+            Some(s) => break s,
+            None if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(50)),
+            None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                // The readers are left behind: a grandchild may still hold the pipes.
+                bail!("{prog} took longer than {}s", limit.as_secs());
             }
         }
     };
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    status.success().then_some(out)
+    let (out, err) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    if !status.success() {
+        bail!("{}", if err.trim().is_empty() { out.trim() } else { err.trim() });
+    }
+    Ok(out)
+}
+
+/// Runs the gh and jj calls for review workspaces under `run_limited`: 15 s, like every other gh call.
+pub struct TimeoutRunner;
+
+impl Runner for TimeoutRunner {
+    fn run(&self, cmd: &[String]) -> Result<String> {
+        let (prog, args) = cmd.split_first().context("empty command")?;
+        // shortcut: `jj git fetch` gets 120 s, as a first fetch in a big repo can outlast 15 s; move it off the UI thread if that wait hurts.
+        let fetch = prog == "jj" && args.windows(2).any(|w| w[0] == "git" && w[1] == "fetch");
+        let mut c = Command::new(prog);
+        c.args(args);
+        run_limited(c, Duration::from_secs(if fetch { 120 } else { 15 }))
+    }
 }
 
 fn gh(prog: &str, path: Option<&str>, url: &str, extra: &[&str]) -> Option<String> {
@@ -106,6 +142,20 @@ mod tests {
     #[test]
     fn gh_failure_is_unknown() {
         assert_eq!(fetch_with("gh", Some(""), "https://github.com/o/r/pull/1"), (PrState::Unknown, String::new()));
+    }
+
+    #[test]
+    fn run_limited_reports_stderr_and_kills_slow_commands() {
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        assert_eq!(run_limited(sh("echo hi"), Duration::from_secs(5)).unwrap(), "hi\n");
+        assert_eq!(run_limited(sh("echo bad >&2; exit 1"), Duration::from_secs(5)).unwrap_err().to_string(), "bad");
+        let t = Instant::now();
+        assert!(run_limited(sh("sleep 5"), Duration::from_millis(200)).unwrap_err().to_string().contains("took longer"));
+        assert!(t.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

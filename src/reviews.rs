@@ -103,19 +103,26 @@ pub fn removable(path: &Path, recorded: Option<&str>, home: &Path) -> bool {
         && !name.starts_with('-')
         && is_dir(path)
         && is_dir(&path.join(".jj"))
+        // A secondary workspace points at its repo with a file; a main repo has a directory there.
+        && std::fs::symlink_metadata(path.join(".jj/repo")).is_ok_and(|m| m.is_file())
 }
 
-/// Deletes a finished review's workspace, once jj in its parent repo confirms it and forgets it.
+/// Deletes a finished review's workspace once its session has ended and jj in its parent repo confirms, snapshots and forgets it.
 /// Anything doubtful leaves the folder and says why in the task's "workspace" event.
 fn remove_workspace(store: &Store, id: i64, link: &str, run: &dyn Runner, home: &Path) -> Result<()> {
     let Some(recorded) = store.events(id)?.into_iter().rfind(|e| e.kind == "workspace").map(|e| e.detail) else { return Ok(()) };
     let path = Path::new(&recorded);
     let canon = |p: &Path| std::fs::canonicalize(p).ok();
-    let parents = store.review_parents()?;
-    if !removable(path, Some(&recorded), home) || parents.iter().any(|p| Path::new(p) == path || canon(Path::new(p)) == canon(path)) {
+    // A registered parent at or inside the folder means the folder is not just a workspace.
+    let inside = |p: &String| Path::new(p).starts_with(path) || canon(Path::new(p)).zip(canon(path)).is_some_and(|(p, w)| p.starts_with(w));
+    if !removable(path, Some(&recorded), home) || store.review_parents()?.iter().any(inside) {
         return Ok(());
     }
     let left = |why: String| store.replace_event(id, "workspace", &format!("left {recorded}: {why}"));
+    // A merge mid-review can finish the task under a live session; don't pull its folder away.
+    if store.current_session(id)?.is_some_and(|s| s.state != AgentState::Ended) {
+        return left("session still running".into());
+    }
     let Some(parent) = pr_ref(link).map(|(repo, _)| store.review_parent(repo)).transpose()?.flatten() else {
         return left("no parent repo recorded".into());
     };
@@ -126,6 +133,10 @@ fn remove_workspace(store: &Store, id: i64, link: &str, run: &dyn Runner, home: 
         Ok(root) if canon(Path::new(root.trim())).is_some_and(|r| Some(r) == canon(path)) => {}
         Ok(root) => return left(format!("jj puts {name} at {}", root.trim())),
         Err(e) => return left(format!("{e:#}")),
+    }
+    // Snapshot first, so edits not yet recorded survive in the parent repo.
+    if let Err(e) = run.run(&["jj", "-R", &recorded, "status"].map(String::from)) {
+        return left(format!("{e:#}"));
     }
     if let Err(e) = jj(&["workspace", "forget", name]) {
         return left(format!("{e:#}"));
@@ -435,13 +446,16 @@ mod tests {
         );
     }
 
-    /// A fake home with git-work/{delta (parent), delta-812-review (workspace), plain, link-review -> workspace} and other-review outside.
+    /// A fake home with git-work/{delta (parent), delta-812-review (workspace), main-review (a main repo), plain, plain-review, link-review -> workspace} and other-review outside.
     fn fake_home(tag: &str) -> PathBuf {
         let home = std::env::temp_dir().join(format!("wyrcan-ws-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&home).ok();
         let gw = home.join("git-work");
-        for d in ["delta/.jj", "delta-812-review/.jj", "plain/.jj", "plain-review", "../other-review/.jj"] {
+        for d in ["delta/.jj/repo", "delta-812-review/.jj", "main-review/.jj/repo", "plain/.jj", "plain-review", "../other-review/.jj"] {
             std::fs::create_dir_all(gw.join(d)).unwrap();
+        }
+        for f in ["delta-812-review/.jj/repo", "plain/.jj/repo", "../other-review/.jj/repo"] {
+            std::fs::write(gw.join(f), "../delta/.jj/repo").unwrap();
         }
         std::os::unix::fs::symlink(gw.join("delta-812-review"), gw.join("link-review")).unwrap();
         home
@@ -458,6 +472,7 @@ mod tests {
         assert!(!ok(&home.join("other-review")), "outside git-work");
         assert!(!ok(&gw.join("plain")), "no -review suffix");
         assert!(!ok(&gw.join("plain-review")), "not a jj workspace");
+        assert!(!ok(&gw.join("main-review")), "a main repo, not a secondary workspace");
         assert!(!ok(&gw.join("delta/../delta-812-review")), "a .. component");
         assert!(!ok(&gw.join("missing-review")), "not there");
         assert!(!ok(&gw), "git-work itself");
@@ -504,7 +519,11 @@ mod tests {
         apply(&s, &poll(None, None, vec![(U, pr(PrState::Merged, &[]))]), &jj, &home).unwrap();
         assert_eq!(stage(&s, id), Stage::Done);
         let p = parent.to_str().unwrap();
-        assert_eq!(*jj.calls.borrow(), [format!("jj -R {p} workspace root --name delta-812-review"), format!("jj -R {p} workspace forget delta-812-review")]);
+        let w = ws.to_str().unwrap();
+        assert_eq!(
+            *jj.calls.borrow(),
+            [format!("jj -R {p} workspace root --name delta-812-review"), format!("jj -R {w} status"), format!("jj -R {p} workspace forget delta-812-review")]
+        );
         assert!(!ws.exists() && parent.exists());
         std::fs::remove_dir_all(home).ok();
     }
@@ -532,6 +551,28 @@ mod tests {
         let jj = Jj { calls: Default::default(), root: ws.to_str().unwrap().into(), fail: false };
         apply(&s, &poll(None, None, vec![(U, pr(PrState::Merged, &[]))]), &jj, &home).unwrap();
         assert!(ws.exists() && jj.calls.borrow().is_empty());
+        // a registered parent inside the folder: nothing runs
+        let (s, _) = with_workspace(&ws, &parent);
+        s.set_review_parent("nested", ws.join("inner").to_str().unwrap()).unwrap();
+        let jj = Jj { calls: Default::default(), root: ws.to_str().unwrap().into(), fail: false };
+        apply(&s, &poll(None, None, vec![(U, pr(PrState::Merged, &[]))]), &jj, &home).unwrap();
+        assert!(ws.exists() && jj.calls.borrow().is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn workspace_is_kept_while_its_session_runs() {
+        let home = fake_home("live");
+        let (ws, parent) = (home.join("git-work/delta-812-review"), home.join("git-work/delta"));
+        let (s, id) = with_workspace(&ws, &parent);
+        go(&s, id, Stage::Active);
+        s.link_session("s", id, ws.to_str().unwrap()).unwrap();
+        let jj = Jj { calls: Default::default(), root: ws.to_str().unwrap().into(), fail: false };
+        apply(&s, &poll(None, None, vec![(U, pr(PrState::Merged, &[]))]), &jj, &home).unwrap();
+        assert_eq!(stage(&s, id), Stage::Done);
+        assert!(ws.exists() && jj.calls.borrow().is_empty(), "{:?}", jj.calls.borrow());
+        let e = s.events(id).unwrap().into_iter().rfind(|e| e.kind == "workspace").unwrap().detail;
+        assert_eq!(e, format!("left {}: session still running", ws.display()));
         std::fs::remove_dir_all(home).ok();
     }
 

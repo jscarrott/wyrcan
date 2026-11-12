@@ -56,7 +56,7 @@ fn tui() -> Result<()> {
 fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, store: &store::Store) -> Result<()> {
     let zj = zellij::Zellij::from_env();
     let cwd = std::env::current_dir().context("cwd")?.to_string_lossy().into_owned();
-    let ctx = effects::Ctx { store, cfg, zj: &zj, run: &zellij::ShellRunner, verify: &pr::exists, cwd: &cwd };
+    let ctx = effects::Ctx { store, cfg, zj: &zj, run: &zellij::ShellRunner, cmd: &pr::TimeoutRunner, verify: &pr::exists, cwd: &cwd };
     let mut panes = effects::Panes::new(store::now());
     let mut app = App::new(app::snapshot(store, cfg)?);
     let mut last_read = Instant::now();
@@ -164,7 +164,7 @@ fn spawn_poller() {
             for t in store.tasks().unwrap_or_default().iter().filter(|t| t.stage == model::Stage::Review) {
                 pr::refresh(&store, t.id);
             }
-            let _ = reviews::apply(&store, &reviews::fetch(&store, &cfg), &zellij::ShellRunner, &config::home());
+            let _ = reviews::apply(&store, &reviews::fetch(&store, &cfg), &pr::TimeoutRunner, &config::home());
         }
         std::thread::sleep(Duration::from_secs(120));
     });
