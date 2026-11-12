@@ -1,27 +1,25 @@
 //! The server: owns the panes, draws the screen for the attached client, answers `pipe` calls.
-//! Everything runs on one loop fed by a channel; connection and PTY threads only send `Ev`s.
+//! Everything runs on one loop fed by a channel; connection and PTY threads only send `Ev`s
+//! (ghostty's terminals are `!Send`, so they never leave this thread).
 use crate::pane::Pane;
 use crate::proto::{self, Hello};
-use alacritty_terminal::term::TermMode;
-use alacritty_terminal::vte::ansi::CursorShape;
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 pub enum Ev {
-    Wakeup,
-    PtyWrite(u32, Vec<u8>),
+    Output(u32, Vec<u8>),
     Exited(u32, Option<i32>),
     Attach(UnixStream, u16, u16),
-    Input(u64, Vec<u8>),
-    Resize(u64, u16, u16),
+    Input(u64, Event),
     Gone(u64),
     Pipe { name: String, args: BTreeMap<String, String>, payload: Option<String>, out: UnixStream },
 }
@@ -100,9 +98,34 @@ fn layout(size: (u16, u16), agents: &[u32], expanded: Option<u32>, fullscreen: O
     l
 }
 
+/// What an Alt+key does, if it's one of wyrcan's.
+#[derive(Debug, PartialEq)]
+enum Hotkey {
+    Board,
+    Agents,
+    Next,
+    Prev,
+    Detach,
+}
+
+fn hotkey(e: &Event) -> Option<Hotkey> {
+    let Event::Key(k) = e else { return None };
+    if k.kind == KeyEventKind::Release || k.modifiers != KeyModifiers::ALT {
+        return None;
+    }
+    Some(match k.code {
+        KeyCode::Char('b' | 'h') | KeyCode::Left => Hotkey::Board,
+        KeyCode::Char('l') | KeyCode::Right => Hotkey::Agents,
+        KeyCode::Char('j') | KeyCode::Down => Hotkey::Next,
+        KeyCode::Char('k') | KeyCode::Up => Hotkey::Prev,
+        KeyCode::Char('d') => Hotkey::Detach,
+        _ => return None,
+    })
+}
+
 impl Server {
-    fn pane(&self, id: u32) -> Option<&Pane> {
-        self.panes.iter().find(|p| p.id == id)
+    fn pane(&mut self, id: u32) -> Option<&mut Pane> {
+        self.panes.iter_mut().find(|p| p.id == id)
     }
 
     fn agents(&self) -> Vec<u32> {
@@ -117,7 +140,7 @@ impl Server {
         layout(self.size(), &self.agents(), self.expanded, self.fullscreen)
     }
 
-    /// Board panes keep their own size; collapsed agents keep the expanded agent's size, so they don't reflow.
+    /// Visible panes take their rect's size; collapsed agents keep the expanded agent's size, so they don't reflow.
     fn fit(&mut self) {
         let l = self.layout();
         let agent = l.panes.iter().find(|(id, _)| *id != BOARD).map(|(_, r)| (r.width, r.height));
@@ -162,122 +185,131 @@ impl Server {
         }
     }
 
+    /// Composes the whole screen into a buffer, then hands it to ratatui, which sends only what changed.
     fn render(&mut self) {
+        let Some((w, h)) = self.client.as_ref().map(|c| c.size) else { return };
         let l = self.layout();
-        let titles: Vec<(u32, Rect, String, bool, bool)> = l
-            .titles
-            .iter()
-            .filter_map(|&(id, r)| {
-                let p = self.pane(id)?;
-                let state = match p.exited {
-                    Some(Some(c)) => format!(" (exited {c})"),
-                    Some(None) => " (exited)".into(),
-                    None => String::new(),
-                };
-                Some((id, r, format!("{}{state}", p.name), id == self.focus, Some(id) == self.expanded))
-            })
-            .collect();
-        let panes: Vec<(&Pane, Rect)> = l.panes.iter().filter_map(|&(id, r)| Some((self.panes.iter().find(|p| p.id == id)?, r))).collect();
-        let focus = self.focus;
-        let split = self.fullscreen.is_none();
-        let Some(c) = self.client.as_mut() else { return };
+        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
         let mut cursor = None;
-        let drawn = c.term.draw(|f| {
-            let buf = f.buffer_mut();
-            for (p, r) in &panes {
-                let cur = p.draw(buf, *r);
-                if p.id == focus {
+        let focus = self.focus;
+        for &(id, r) in &l.panes {
+            if let Some(p) = self.pane(id) {
+                let cur = p.draw(&mut buf, r);
+                if id == focus {
                     cursor = cur;
                 }
             }
-            // The column between board and agents.
-            if let Some((_, b)) = l.panes.first().filter(|(id, _)| *id == BOARD && split) {
-                for y in 0..b.height {
-                    buf.set_string(b.right(), y, "│", Style::default().fg(Color::DarkGray));
-                }
+        }
+        if let Some(&(_, b)) = l.panes.first().filter(|(id, _)| *id == BOARD && self.fullscreen.is_none()) {
+            for y in 0..b.height {
+                buf.set_string(b.right(), y, "│", Style::default().fg(Color::DarkGray));
             }
-            for (_, r, name, focused, _) in &titles {
-                let style = if *focused { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM) };
-                buf.set_style(*r, style);
-                buf.set_stringn(r.x, r.y, format!(" ▸ {name}"), r.width as usize, style);
-            }
-            if let Some(r) = l.placeholder {
-                buf.set_stringn(r.x + 2, r.y + 1, "Agents open here.", r.width.saturating_sub(2) as usize, Style::default().add_modifier(Modifier::DIM));
-            }
-            buf.set_style(l.status, Style::default().fg(Color::Black).bg(Color::DarkGray));
-            buf.set_stringn(l.status.x, l.status.y, STATUS, l.status.width as usize, Style::default().fg(Color::Black).bg(Color::DarkGray));
+        }
+        for &(id, r) in &l.titles {
+            let Some(p) = self.panes.iter().find(|p| p.id == id) else { continue };
+            let state = match p.exited {
+                Some(Some(c)) => format!(" (exited {c})"),
+                Some(None) => " (exited)".into(),
+                None => String::new(),
+            };
+            let style = if id == focus { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM) };
+            buf.set_style(r, style);
+            buf.set_stringn(r.x, r.y, format!(" ▸ {}{state}", p.name), r.width as usize, style);
+        }
+        if let Some(r) = l.placeholder {
+            buf.set_stringn(r.x + 2, r.y + 1, "Agents open here.", r.width.saturating_sub(2) as usize, Style::default().add_modifier(Modifier::DIM));
+        }
+        let bar = Style::default().fg(Color::Black).bg(Color::DarkGray);
+        buf.set_style(l.status, bar);
+        buf.set_stringn(l.status.x, l.status.y, STATUS, l.status.width as usize, bar);
+
+        let Some(c) = self.client.as_mut() else { return };
+        let drawn = c.term.draw(|f| {
+            f.buffer_mut().merge(&buf);
             if let Some((pos, _)) = cursor {
                 f.set_cursor_position(pos);
             }
         });
-        let Ok(drawn) = drawn.map(|f| f.buffer.clone()) else {
+        if drawn.is_err() {
             self.client = None;
             return;
-        };
+        }
         // DECSCUSR: the focused pane's cursor shape.
-        let n = match cursor.map(|(_, s)| s) {
-            Some(CursorShape::Beam) => 6,
-            Some(CursorShape::Underline) => 4,
-            _ => 2,
-        };
-        let _ = write!(c.term.backend_mut(), "\x1b[{n} q");
+        let _ = write!(c.term.backend_mut(), "\x1b[{} q", cursor.map_or(2, |(_, s)| s));
         let _ = c.term.backend_mut().flush();
-        self.last_screen = Some(drawn);
+        self.last_screen = Some(buf);
         self.dirty = false;
     }
 
-    fn input(&mut self, bytes: Vec<u8>) {
+    fn hotkey(&mut self, h: Hotkey) {
         let agents = self.agents();
-        let cycle = |s: &Server, step: isize| -> Option<u32> {
-            let cur = s.expanded.and_then(|e| agents.iter().position(|&a| a == e))?;
-            let n = agents.len() as isize;
-            Some(agents[((cur as isize + step).rem_euclid(n)) as usize])
-        };
-        // shortcut: a hotkey must arrive as its own read (true for typed keys, not for pasted text).
-        match bytes.as_slice() {
-            b"\x1bb" | b"\x1bh" | b"\x1b[1;3D" => {
+        match h {
+            Hotkey::Board => {
                 self.focus = BOARD;
                 self.fullscreen = None;
-                return self.fit();
             }
-            b"\x1bl" | b"\x1b[1;3C" => {
+            Hotkey::Agents => {
                 if let Some(e) = self.expanded.filter(|e| agents.contains(e)).or(agents.last().copied()) {
                     self.focus = e;
                     self.expanded = Some(e);
                 }
-                return self.fit();
             }
-            b"\x1bj" | b"\x1b[1;3B" | b"\x1bk" | b"\x1b[1;3A" => {
-                let step = if matches!(bytes.as_slice(), b"\x1bj" | b"\x1b[1;3B") { 1 } else { -1 };
-                if let Some(a) = cycle(self, step) {
+            Hotkey::Next | Hotkey::Prev => {
+                let step = if h == Hotkey::Next { 1 } else { -1 };
+                if let Some(cur) = self.expanded.and_then(|e| agents.iter().position(|&a| a == e)) {
+                    let a = agents[(cur as isize + step).rem_euclid(agents.len() as isize) as usize];
                     self.expanded = Some(a);
                     self.focus = a;
                 }
-                return self.fit();
             }
-            b"\x1bd" => {
+            Hotkey::Detach => {
                 self.client = None;
                 return;
             }
-            _ => {}
         }
-        if let Some(events) = proto::parse_mouse(&bytes) {
-            for m in events {
-                self.mouse(m);
-            }
-            return;
-        }
-        let Some(p) = self.pane(self.focus) else { return };
-        let bytes = if p.mode().contains(TermMode::BRACKETED_PASTE) { bytes } else { proto::strip_paste_marks(&bytes) };
-        p.scroll_to_bottom();
-        p.write(bytes);
+        self.fit();
     }
 
-    fn mouse(&mut self, m: proto::Mouse) {
+    fn input(&mut self, e: Event) {
+        if let Some(h) = hotkey(&e) {
+            return self.hotkey(h);
+        }
+        let focus = self.focus;
+        match e {
+            Event::Key(k) if k.kind != KeyEventKind::Release => {
+                if let Some(p) = self.pane(focus) {
+                    p.key(k);
+                }
+            }
+            Event::Mouse(m) => self.mouse(m),
+            Event::Paste(s) => {
+                if let Some(p) = self.pane(focus) {
+                    p.paste(&s);
+                }
+            }
+            Event::FocusGained | Event::FocusLost => {
+                if let Some(p) = self.pane(focus) {
+                    p.focus_event(matches!(e, Event::FocusGained));
+                }
+            }
+            Event::Resize(w, h) => {
+                if let Some(c) = self.client.as_mut() {
+                    c.size = (w, h);
+                    let _ = c.term.resize(Rect::new(0, 0, w, h));
+                    let _ = c.term.clear();
+                }
+                self.fit();
+            }
+            _ => {}
+        }
+    }
+
+    fn mouse(&mut self, m: crossterm::event::MouseEvent) {
         let l = self.layout();
-        let at = Position::new(m.x, m.y);
+        let at = Position::new(m.column, m.row);
+        let press = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
         if let Some(&(id, _)) = l.titles.iter().find(|(_, r)| r.contains(at)) {
-            if m.press {
+            if press {
                 self.expanded = Some(id);
                 self.focus = id;
                 self.fit();
@@ -285,16 +317,15 @@ impl Server {
             return;
         }
         let Some(&(id, r)) = l.panes.iter().find(|(_, r)| r.contains(at)) else { return };
-        if m.press && id != self.focus {
+        if press && id != self.focus {
             self.focus = id;
             self.dirty = true;
         }
         let Some(p) = self.pane(id) else { return };
-        let mode = p.mode();
-        if mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE) {
-            p.write(m.encode(m.x - r.x, m.y - r.y));
-        } else if m.wheel != 0 && !mode.contains(TermMode::ALT_SCREEN) {
-            p.scroll(-3 * m.wheel);
+        if p.wants_mouse() {
+            p.mouse_event(m, m.column - r.x, m.row - r.y);
+        } else if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = m.kind {
+            p.scroll(if m.kind == MouseEventKind::ScrollUp { -3 } else { 3 });
             self.dirty = true;
         }
     }
@@ -305,8 +336,7 @@ impl Server {
             self.subscribers.push(out);
             return;
         }
-        let reply = self.command(name, args, payload);
-        let text = match reply {
+        let text = match self.command(name, args, payload) {
             Ok(s) => format!("{s}\n"),
             Err(e) => format!("error: {e}\n"),
         };
@@ -315,7 +345,7 @@ impl Server {
 
     fn pane_arg(&self, args: &BTreeMap<String, String>) -> anyhow::Result<u32> {
         let id: u32 = args.get("pane").and_then(|p| p.strip_prefix("terminal_")?.parse().ok()).ok_or_else(|| anyhow::anyhow!("needs --args pane=terminal_<n>"))?;
-        self.pane(id).map(|p| p.id).ok_or_else(|| anyhow::anyhow!("no pane terminal_{id}"))
+        self.panes.iter().any(|p| p.id == id).then_some(id).ok_or_else(|| anyhow::anyhow!("no pane terminal_{id}"))
     }
 
     fn command(&mut self, name: &str, args: &BTreeMap<String, String>, payload: Option<String>) -> anyhow::Result<String> {
@@ -350,14 +380,20 @@ impl Server {
                 let id = self.pane_arg(args)?;
                 let mut b = payload.unwrap_or_default().into_bytes();
                 b.push(b'\r');
-                self.pane(id).expect("checked by pane_arg").write(b);
+                self.pane(id).expect("checked by pane_arg").write(&b);
             }
             "dump" => {
                 if args.contains_key("pane") {
-                    return Ok(self.pane(self.pane_arg(args)?).expect("checked").text());
+                    let id = self.pane_arg(args)?;
+                    return Ok(self.pane(id).expect("checked").text());
                 }
                 let b = self.last_screen.as_ref().ok_or_else(|| anyhow::anyhow!("nothing drawn yet"))?;
                 return Ok(screen_text(b));
+            }
+            "info" => {
+                let live = self.panes.iter().filter(|p| p.exited.is_none()).count();
+                let client = self.client.as_ref().map_or("detached".to_string(), |c| format!("attached {}x{}", c.size.0, c.size.1));
+                return Ok(format!("{} panes ({live} running), {client}", self.panes.len()));
             }
             "kill" => self.quit = true,
             other => anyhow::bail!("unknown command {other}"),
@@ -384,14 +420,14 @@ impl Server {
 
     fn handle(&mut self, ev: Ev) {
         match ev {
-            Ev::Wakeup => self.dirty = true,
-            Ev::PtyWrite(id, b) => {
+            Ev::Output(id, b) => {
                 if let Some(p) = self.pane(id) {
-                    p.write(b);
+                    p.feed(&b);
+                    self.dirty = true;
                 }
             }
             Ev::Exited(id, code) => {
-                if let Some(p) = self.panes.iter_mut().find(|p| p.id == id) {
+                if let Some(p) = self.pane(id) {
                     p.exited = Some(code);
                 }
                 // Nothing left running: the session is over.
@@ -413,22 +449,14 @@ impl Server {
                     self.fit();
                 }
             }
-            Ev::Input(id, b) if self.client.as_ref().is_some_and(|c| c.id == id) => self.input(b),
-            Ev::Resize(id, w, h) => {
-                if let Some(c) = self.client.as_mut().filter(|c| c.id == id) {
-                    c.size = (w, h);
-                    let _ = c.term.resize(Rect::new(0, 0, w, h));
-                    let _ = c.term.clear();
-                    self.fit();
-                }
-            }
+            Ev::Input(id, e) if self.client.as_ref().is_some_and(|c| c.id == id) => self.input(e),
+            Ev::Input(..) => {}
             Ev::Gone(id) => {
                 if self.client.as_ref().is_some_and(|c| c.id == id) {
                     self.client = None;
                 }
             }
             Ev::Pipe { name, args, payload, out } => self.pipe(&name, &args, payload, out),
-            Ev::Input(..) => {}
         }
     }
 }
@@ -440,26 +468,17 @@ fn screen_text(b: &Buffer) -> String {
         .join("\n")
 }
 
-/// Client → server frames after the hello line: input bytes and resizes.
+/// After the hello line, an attached client sends one crossterm event per line, as JSON.
 fn read_client(id: u64, s: UnixStream, tx: Sender<Ev>) {
     std::thread::spawn(move || {
-        let mut r = BufReader::new(s);
-        loop {
-            match proto::read_frame(&mut r) {
-                Ok(proto::Frame::Input(b)) => {
-                    if tx.send(Ev::Input(id, b)).is_err() {
-                        return;
-                    }
-                }
-                Ok(proto::Frame::Resize(w, h)) => {
-                    let _ = tx.send(Ev::Resize(id, w, h));
-                }
-                Err(_) => {
-                    let _ = tx.send(Ev::Gone(id));
+        for line in BufReader::new(s).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(e) = serde_json::from_str::<Event>(&line)
+                && tx.send(Ev::Input(id, e)).is_err() {
                     return;
                 }
-            }
         }
+        let _ = tx.send(Ev::Gone(id));
     });
 }
 
@@ -516,13 +535,13 @@ pub fn run(session: &str) -> anyhow::Result<()> {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        // Coalesce: PTY output wakes us per read; draw at most once a frame.
+        // Coalesce: PTY output arrives per read; draw at most once a frame.
         if s.dirty && last.elapsed() >= frame {
             s.render();
             last = Instant::now();
         }
     }
-    for p in &s.panes {
+    for p in &mut s.panes {
         p.kill();
     }
     let _ = std::fs::remove_file(&path);
@@ -532,6 +551,7 @@ pub fn run(session: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
 
     #[test]
     fn layout_board_left_agents_stacked_right() {
@@ -545,5 +565,14 @@ mod tests {
     fn layout_without_agents_has_a_placeholder_and_fullscreen_takes_all() {
         assert_eq!(layout((80, 24), &[], None, None).placeholder, Some(Rect::new(41, 0, 39, 23)));
         assert_eq!(layout((80, 24), &[1], None, Some(1)).panes, vec![(1, Rect::new(0, 0, 80, 23))]);
+    }
+
+    #[test]
+    fn only_bare_alt_keys_are_hotkeys() {
+        let k = |c, m| Event::Key(KeyEvent::new(c, m));
+        assert_eq!(hotkey(&k(KeyCode::Char('b'), KeyModifiers::ALT)), Some(Hotkey::Board));
+        assert_eq!(hotkey(&k(KeyCode::Right, KeyModifiers::ALT)), Some(Hotkey::Agents));
+        assert_eq!(hotkey(&k(KeyCode::Char('b'), KeyModifiers::NONE)), None);
+        assert_eq!(hotkey(&k(KeyCode::Char('b'), KeyModifiers::ALT | KeyModifiers::SHIFT)), None);
     }
 }
