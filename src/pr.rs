@@ -5,6 +5,7 @@ use crate::zellij::Runner;
 use anyhow::{bail, Context, Result};
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub fn parse(json: &str) -> (PrState, String) {
@@ -38,21 +39,34 @@ pub fn run_limited(mut cmd: Command, limit: Duration) -> Result<String> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().with_context(|| format!("running {prog}"))?;
     // Both pipes are drained while it runs, so a chatty child can't fill one and stall.
-    fn drain(p: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<String> {
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(mut p) = p {
-                let _ = p.read_to_string(&mut s);
-            }
-            s
-        })
+    fn drain(p: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        if let Some(mut p) = p {
+            std::thread::spawn(move || {
+                let mut buf = [0; 8192];
+                while let Ok(n @ 1..) = p.read(&mut buf) {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        rx
+    }
+    /// What the pipe gave until it closed, or until `deadline`: a grandchild (say, an ssh ControlPersist master) may hold it open.
+    fn collect(rx: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> String {
+        let mut v = vec![];
+        while let Ok(chunk) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            v.extend(chunk);
+        }
+        String::from_utf8_lossy(&v).into_owned()
     }
     let (out, err) = (drain(child.stdout.take()), drain(child.stderr.take()));
-    let start = Instant::now();
+    let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait()? {
             Some(s) => break s,
-            None if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(50)),
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -61,7 +75,7 @@ pub fn run_limited(mut cmd: Command, limit: Duration) -> Result<String> {
             }
         }
     };
-    let (out, err) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    let (out, err) = (collect(&out, deadline), collect(&err, deadline));
     if !status.success() {
         bail!("{}", if err.trim().is_empty() { out.trim() } else { err.trim() });
     }
@@ -156,6 +170,16 @@ mod tests {
         let t = Instant::now();
         assert!(run_limited(sh("sleep 5"), Duration::from_millis(200)).unwrap_err().to_string().contains("took longer"));
         assert!(t.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn run_limited_is_not_held_up_by_a_grandchild_holding_stdout() {
+        let mut c = Command::new("sh");
+        // Like an ssh ControlPersist master: it outlives the command with the pipe still open.
+        c.args(["-c", "sleep 5 & echo hi"]);
+        let t = Instant::now();
+        assert_eq!(run_limited(c, Duration::from_millis(500)).unwrap(), "hi\n");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     }
 
     #[test]
