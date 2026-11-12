@@ -1,9 +1,0 @@
-[package]
-name = "wyrcan"
-version = "0.1.0"
-edition = "2021"
-
-# Not in a workspace with claude-board: zellij-utils pins rusqlite 0.30, claude-board uses 0.39.
-[dependencies]
-serde_json = "1"
-zellij = "=0.46.0"

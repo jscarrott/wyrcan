@@ -1,4 +1,4 @@
-//! Pane control through wyrcan's bundled plugin (`wyrcan/plugin`): one `wyrcan pipe` call per action,
+//! Pane control through wyrcan (`wyrcan-native/`): one `wyrcan pipe` call per action,
 //! plus a long-lived `events` pipe that reports the live panes whenever they change.
 use crate::model::Session;
 use anyhow::{bail, Context, Result};
