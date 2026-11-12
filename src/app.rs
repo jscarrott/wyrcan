@@ -145,7 +145,8 @@ pub fn snapshot(store: &Store, cfg: &Config) -> anyhow::Result<Snapshot> {
         let session = sessions.iter().find(|s| s.task_id == Some(t.id) && s.current).cloned();
         let prs = store.prs(t.id)?;
         // Display only, so PR URLs aren't verified with `gh` here; the real gate does that.
-        let missing = if t.stage == Stage::Active { gate::evaluate(store, &t, &cfg.gate_checks(&t.kind), &|_| true) } else { vec![] };
+        // A review never goes through the gate, so it has nothing missing.
+        let missing = if t.stage == Stage::Active && t.kind != "review" { gate::evaluate(store, &t, &cfg.gate_checks(&t.kind), &|_| true) } else { vec![] };
         let flag = flag(&t, session.as_ref(), &prs).map(String::from);
         let (mut bookmarks, mut summary) = (vec![], None);
         if g == Group::Shelved {
@@ -988,7 +989,7 @@ pub(crate) mod tests {
         let s = Store::open_in_memory();
         let (q, p) = (add(&s, "q", Stage::Queue), add(&s, "p", Stage::Parked));
         for id in [q, p] {
-            s.set_kind(id, "review", Some("https://github.com/o/r/pull/1")).unwrap();
+            s.set_kind(id, "review", Some(&format!("https://github.com/o/r/pull/{id}"))).unwrap();
         }
         let mut ap = app(&s, &cfg(3));
         ap.view = View::Reviews;

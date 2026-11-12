@@ -223,12 +223,17 @@ pub fn apply(store: &Store, poll: &Poll, run: &dyn Runner, home: &Path) -> Resul
         }
         let asked = poll.requested.as_ref().map(|r| r.iter().any(|f| f.url == url));
         let pr = poll.prs.get(url);
-        if asked == Some(true) && stage == Stage::Parked {
-            go(t.id, Stage::Queue)?;
-            store.replace_event(t.id, "review", "requested")?;
+        let latest = store.events(t.id)?.into_iter().rfind(|e| e.kind == "review").map(|e| e.detail);
+        if asked == Some(true) {
+            // Re-requested after my review; a parked review I never submitted stays parked.
+            if stage == Stage::Parked && pr.is_some_and(|p| p.reviewed_by.contains(&poll.me)) {
+                go(t.id, Stage::Queue)?;
+            }
+            if latest.as_deref() != Some("requested") {
+                store.replace_event(t.id, "review", "requested")?;
+            }
         } else if let (Some(false), Some(pr)) = (asked, pr) {
-            let latest = store.events(t.id)?.into_iter().rfind(|e| e.kind == "review");
-            if latest.is_some_and(|e| e.detail == "requested") && !pr.reviewed_by.contains(&poll.me) {
+            if latest.as_deref() == Some("requested") && !pr.reviewed_by.contains(&poll.me) {
                 store.replace_event(t.id, "review", "no longer requested")?;
             }
         }
@@ -372,6 +377,25 @@ mod tests {
         go(&s, id, Stage::Active);
         go(&s, id, Stage::Parked);
         s.replace_event(id, "review", "no longer requested").unwrap();
+        apply(&s, &poll(Some(vec![found(U, "o/r")]), None, vec![(U, pr(PrState::Waiting, &["me"]))]), &none(), Path::new("/nonexistent")).unwrap();
+        assert_eq!((stage(&s, id), ev(&s, id).as_str()), (Stage::Queue, "requested"));
+    }
+
+    #[test]
+    fn still_requested_but_unreviewed_stays_parked() {
+        let (s, id) = imported(true);
+        go(&s, id, Stage::Active);
+        go(&s, id, Stage::Parked);
+        apply(&s, &poll(Some(vec![found(U, "o/r")]), None, vec![(U, pr(PrState::Waiting, &[]))]), &none(), Path::new("/nonexistent")).unwrap();
+        assert_eq!((stage(&s, id), ev(&s, id).as_str()), (Stage::Parked, "requested"));
+    }
+
+    #[test]
+    fn request_upgrades_a_not_requested_note_in_any_open_stage() {
+        let s = Store::open_in_memory();
+        apply(&s, &poll(Some(vec![]), Some(vec![found(U, "o/r")]), vec![]), &none(), Path::new("/nonexistent")).unwrap();
+        let id = s.review_task(U).unwrap().unwrap().id;
+        assert_eq!(ev(&s, id), "not requested");
         apply(&s, &poll(Some(vec![found(U, "o/r")]), None, vec![]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!((stage(&s, id), ev(&s, id).as_str()), (Stage::Queue, "requested"));
     }

@@ -246,11 +246,18 @@ fn open(c: &Ctx, p: &mut Panes, app: &mut App, id: i64, resume: bool) -> Result<
     };
     // Checked before the stage changes, so a board outside zellij can't start what it can't open.
     c.zj.board()?;
+    c.refresh(p)?;
+    let live = c.pane(p, id)?;
+    // A review started again (say, re-requested) gets the PR's latest head; never under a live pane.
+    if t.kind == "review" && !resume && t.dir.is_some() && live.is_none() {
+        let head = pr_head(c, t.link.as_deref().unwrap_or_default())?;
+        fetch_head(c, &cwd, &head)?;
+        c.cmd.run(&["jj", "-R", &cwd, "new", &format!("{head}@origin")].map(String::from))?;
+    }
     if t.stage != Stage::Active && !c.move_to(id, Stage::Active, app)? {
         return Ok(());
     }
-    c.refresh(p)?;
-    if let Some(x) = c.pane(p, id)? {
+    if let Some(x) = live {
         return c.zj.show(c.run, &x);
     }
     let next = if t.kind == "review" { format!("/review-pr {id}") } else { format!("/next {id}") };
@@ -293,25 +300,42 @@ fn review_workspace(c: &Ctx, app: &mut App, t: &Task) -> Result<Option<String>> 
         }
     };
     c.zj.board()?;
-    let cmd = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let json = c.cmd.run(&cmd(&["gh", "pr", "view", link, "--json", "headRefName"]))?;
-    let head = serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| v["headRefName"].as_str().map(String::from)).unwrap_or_default();
-    // The head goes into jj args and a revset: refuse anything unusual rather than quote it.
-    if head.is_empty() || head.starts_with('-') || !head.chars().all(|ch| ch.is_ascii_alphanumeric() || "/_.-".contains(ch)) {
-        bail!("Can't use the PR's head branch {head:?}.");
-    }
+    let head = pr_head(c, link)?;
     let path = reviews::workspace_path(&home, repo, number).to_string_lossy().into_owned();
-    let [fetch, add] = <[_; 2]>::try_from(reviews::workspace_cmds(&parent, &path, &format!("{repo}-{number}-review"), &head)).expect("two commands");
-    c.cmd.run(&fetch).with_context(|| format!("Can't fetch {head} from origin (fork PR?)"))?;
-    // `jj git fetch` only warns about a missing branch, and a failed `workspace add` leaves a half-made workspace, so check first.
-    // shortcut: fork PRs aren't supported (head not on origin); add `gh pr checkout` in a colocated workspace if they come up.
-    if c.cmd.run(&cmd(&["jj", "-R", &parent, "log", "-r", &format!("{head}@origin"), "--no-graph", "-T", "commit_id"])).is_err() {
-        bail!("Can't fetch {head} from origin (fork PR?)");
-    }
+    let [_, add] = <[_; 2]>::try_from(reviews::workspace_cmds(&parent, &path, &format!("{repo}-{number}-review"), &head)).expect("two commands");
+    fetch_head(c, &parent, &head)?;
     c.cmd.run(&add)?;
     c.store.add_event(t.id, "workspace", &path)?;
     c.store.update_task(t.id, &t.title, &t.description, Some(&path), &t.labels)?;
     Ok(Some(path))
+}
+
+/// The PR's head branch, checked safe to put in jj args and a revset.
+fn pr_head(c: &Ctx, link: &str) -> Result<String> {
+    let json = c.cmd.run(&["gh", "pr", "view", link, "--json", "headRefName,isCrossRepository"].map(String::from))?;
+    let v = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
+    // shortcut: fork PRs aren't supported (head not on origin); add `gh pr checkout` in a colocated workspace if they come up.
+    // A fork's branch may share a name with one on origin, so this is checked, not left to the fetch.
+    if v["isCrossRepository"].as_bool() == Some(true) {
+        bail!("Can't review a fork PR yet.");
+    }
+    let head = v["headRefName"].as_str().unwrap_or_default().to_string();
+    // Refuse anything unusual rather than quote it.
+    if head.is_empty() || head.starts_with('-') || !head.chars().all(|ch| ch.is_ascii_alphanumeric() || "/_.-".contains(ch)) {
+        bail!("Can't use the PR's head branch {head:?}.");
+    }
+    Ok(head)
+}
+
+/// `jj git fetch` of `head` in `repo`, then a check that `head@origin` exists:
+/// the fetch only warns about a missing branch, and a failed `workspace add` leaves a half-made workspace.
+fn fetch_head(c: &Ctx, repo: &str, head: &str) -> Result<()> {
+    let jj = |a: &[&str]| c.cmd.run(&["jj", "-R", repo].iter().chain(a).map(|s| s.to_string()).collect::<Vec<_>>());
+    jj(&["git", "fetch", "--branch", head]).with_context(|| format!("Can't fetch {head} from origin."))?;
+    if jj(&["log", "-r", &format!("{head}@origin"), "--no-graph", "-T", "commit_id"]).is_err() {
+        bail!("Can't fetch {head} from origin.");
+    }
+    Ok(())
 }
 
 /// The PR URLs to open: the recorded PRs, else a review task's own link.
@@ -367,6 +391,8 @@ mod tests {
     struct Rec {
         calls: RefCell<Vec<String>>,
         live: Vec<&'static str>,
+        /// What `gh pr view` answers.
+        pr: &'static str,
     }
     impl Runner for Rec {
         fn run(&self, cmd: &[String]) -> Result<String> {
@@ -375,14 +401,14 @@ mod tests {
             Ok(if line.contains("--name open") {
                 "terminal_9\n".into()
             } else if line.starts_with("gh pr view") {
-                r#"{"headRefName":"feat/x"}"#.into()
+                self.pr.into()
             } else {
                 String::new()
             })
         }
     }
     fn rec(live: &[&'static str]) -> Rec {
-        Rec { calls: RefCell::new(vec![]), live: live.to_vec() }
+        Rec { calls: RefCell::new(vec![]), live: live.to_vec(), pr: r#"{"headRefName":"feat/x","isCrossRepository":false}"# }
     }
     /// Pane state as if the events stream had reported `r.live`.
     fn panes(r: &Rec) -> Panes {
@@ -490,6 +516,39 @@ mod tests {
         assert!(calls[open].contains(&format!(r#""claude","/review-pr {q}"]"#)), "{}", calls[open]);
         assert_eq!(s.task(q).unwrap().unwrap().dir.as_deref(), Some(ws.as_str()));
         assert_eq!(s.events(q).unwrap().into_iter().rfind(|e| e.kind == "workspace").unwrap().detail, ws);
+        assert_eq!(stage(&s, q), Stage::Active);
+    }
+
+    #[test]
+    fn start_review_refuses_a_fork_pr() {
+        let (s, c, zj) = (Store::open_in_memory(), cfg(3), inside());
+        let r = Rec { pr: r#"{"headRefName":"feat/x","isCrossRepository":true}"#, ..rec(&["terminal_0"]) };
+        let q = s.add_task(NewTask { title: "t", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        s.set_kind(q, "review", Some("https://github.com/acme/delta/pull/812")).unwrap();
+        s.set_review_parent("delta", "/h/git-work/delta").unwrap();
+        let mut ap = app(&s, &c);
+        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
+        assert_eq!(ap.message.as_deref(), Some("Can't review a fork PR yet."));
+        assert!(!r.calls.borrow().iter().any(|l| l.starts_with("jj") || l.contains("--name open")), "{:?}", r.calls.borrow());
+        assert_eq!(stage(&s, q), Stage::Queue);
+    }
+
+    #[test]
+    fn restarting_a_review_moves_its_workspace_to_the_latest_head() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&["terminal_0", "terminal_9"]));
+        let ws = "/h/git-work/delta-812-review";
+        let q = s.add_task(NewTask { title: "t", description: "", dir: Some(ws), labels: &[], todoist_id: None }).unwrap();
+        s.set_kind(q, "review", Some("https://github.com/acme/delta/pull/812")).unwrap();
+        let mut ap = app(&s, &c);
+        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
+        assert_eq!(ap.message, None);
+        let calls = r.calls.borrow();
+        let at = |want: &str| calls.iter().position(|l| l.starts_with(want)).unwrap_or_else(|| panic!("no {want} in {calls:?}"));
+        let fetch = at(&format!("jj -R {ws} git fetch --branch feat/x"));
+        let new = at(&format!("jj -R {ws} new feat/x@origin"));
+        let open = at(&format!("{P} open"));
+        assert!(fetch < new && new < open, "{calls:?}");
+        assert!(!calls.iter().any(|l| l.contains("workspace add")), "{calls:?}");
         assert_eq!(stage(&s, q), Stage::Active);
     }
 

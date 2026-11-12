@@ -65,7 +65,12 @@ pub fn target(kind: &str) -> Stage {
 /// A PR recorded after the pre-check is not in the set and fails closed.
 pub fn to_review(store: &Store, id: i64, max_active: usize, checks: &[String], verify_pr: &PrVerifier) -> anyhow::Result<Result<(), Refusal>> {
     let verified: Vec<String> = store.prs(id)?.into_iter().filter(|p| !waived(p)).filter_map(|p| p.url).filter(|u| verify_pr(u)).collect();
-    let kind = store.task(id)?.map(|t| t.kind).unwrap_or_default();
+    let task = store.task(id)?;
+    // Someone else's PR: it never enters Review / My work.
+    if let Some(t) = task.as_ref().filter(|t| t.kind == "review") {
+        return Ok(Err(Refusal::NotAllowed { from: t.stage, to: Stage::Review }));
+    }
+    let kind = task.map(|t| t.kind).unwrap_or_default();
     store.transition(id, target(&kind), max_active, &|s, t| evaluate(s, t, checks, &|u| verified.iter().any(|v| v == u)))
 }
 
@@ -153,6 +158,16 @@ mod tests {
         let r = to_review(&s, id, 3, &["pr".to_string()], &|_| false).unwrap();
         assert!(matches!(r, Err(Refusal::Gate(m)) if m == ["couldn't verify PR https://x/pr/1"]));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn review_task_is_never_gated_into_review() {
+        let (s, id) = setup();
+        s.set_kind(id, "review", Some("https://x/pull/1")).unwrap();
+        s.conn.execute("UPDATE tasks SET stage='active'", []).unwrap();
+        explainer(&s, id);
+        assert!(to_review(&s, id, 3, &[], &|_| true).unwrap().is_err());
+        assert_eq!(s.task(id).unwrap().unwrap().stage, Stage::Active);
     }
 
     #[test]
