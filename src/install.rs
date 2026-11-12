@@ -127,13 +127,13 @@ pub fn run(repo_root: &Path, claude: &Path, bin_dir: &Path) -> Result<()> {
         std::fs::rename(&tmp, &settings_path).context("replacing settings.json")?;
         println!("updated {}", settings_path.display());
     }
-    // wyrcan is built separately (wyrcan/build.sh): it can't share a lockfile with claude-board.
-    let wyrcan = root.join("wyrcan/target/release/wyrcan");
+    // wyrcan (the standalone workspace in wyrcan-native/) is built separately: it needs Zig for libghostty.
+    let wyrcan = root.join("wyrcan-native/target/release/wyrcan");
     if wyrcan.exists() {
         symlink(&claude, &wyrcan, &bin_dir.join("wyrcan"))?;
         println!("Start the board with `wyrcan`.");
     } else {
-        println!("Build wyrcan to run the board: {}", root.join("wyrcan/build.sh").display());
+        println!("Build wyrcan to run the board: cd {} && cargo build --release", root.join("wyrcan-native").display());
     }
     Ok(())
 }
