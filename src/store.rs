@@ -40,13 +40,26 @@ fn enable_wal(conn: &Connection, ms: u64) {
     }
 }
 
-/// Brings any database (new, or created at user_version 1 or 2) to version 3.
+/// Brings any database (new, or created at user_version 1 or 2) to version 3, then indexes review links.
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     let version = |c: &Connection| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0));
-    if version(conn)? >= 3 {
-        return Ok(());
+    if version(conn)? < 3 {
+        to_v3(conn, version)?;
     }
+    // One task per reviewed PR; a board that already holds duplicates keeps opening, just without the index.
+    let dups: i64 = conn.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM tasks WHERE kind='review' AND link IS NOT NULL GROUP BY link HAVING count(*)>1)",
+        [],
+        |r| r.get(0),
+    )?;
+    if dups == 0 {
+        conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS tasks_review_link ON tasks(link) WHERE kind='review'")?;
+    }
+    Ok(())
+}
+
+fn to_v3(conn: &Connection, version: impl Fn(&Connection) -> rusqlite::Result<i64>) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     // Another process may have migrated while we waited for the lock.
     let r = (|| -> Result<()> {
@@ -381,7 +394,7 @@ impl Store {
     pub fn active_repo_roots(&self, since: i64) -> Result<Vec<String>> {
         let mut q = self.conn.prepare(
             "SELECT DISTINCT r.root FROM repos r JOIN sessions s ON s.id=r.session_id JOIN tasks t ON t.id=s.task_id
-             WHERE t.stage_at>=?1 ORDER BY r.root",
+             WHERE t.stage_at>=?1 AND t.kind!='review' ORDER BY r.root",
         )?;
         let rows = q.query_map([since], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
@@ -566,6 +579,39 @@ mod tests {
         }
         assert_eq!(s.active_repo_roots(150).unwrap(), ["/new"]);
         assert_eq!(s.active_repo_roots(0).unwrap(), ["/new", "/old"]);
+        // A review's workspace isn't the user's own work.
+        let rv = s.add_task(nt("review")).unwrap();
+        s.set_kind(rv, "review", Some("https://x/pull/1")).unwrap();
+        s.link_session("c", rv, "/ws").unwrap();
+        s.mark_edited("c", "/ws", "main").unwrap();
+        assert_eq!(s.active_repo_roots(0).unwrap(), ["/new", "/old"]);
+    }
+
+    #[test]
+    fn one_review_task_per_link() {
+        let s = Store::open_in_memory();
+        let (a, b) = (s.add_task(nt("a")).unwrap(), s.add_task(nt("b")).unwrap());
+        s.set_kind(a, "review", Some("https://x/pull/1")).unwrap();
+        assert!(s.set_kind(b, "review", Some("https://x/pull/1")).is_err());
+        s.set_kind(b, "experiment", Some("https://x/pull/1")).unwrap();
+    }
+
+    #[test]
+    fn duplicate_reviews_still_open_without_the_index() {
+        let dir = std::env::temp_dir().join(format!("cb-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("board.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute_batch("ALTER TABLE tasks ADD COLUMN synced_stage TEXT; ALTER TABLE tasks ADD COLUMN link TEXT; PRAGMA user_version = 3;").unwrap();
+            c.execute_batch("INSERT INTO tasks(title,kind,link,created_at,stage_at) VALUES('a','review','u',1,1),('b','review','u',1,1)").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.tasks().unwrap().len(), 2);
+        let idx: i64 = s.conn.query_row("SELECT count(*) FROM sqlite_master WHERE name='tasks_review_link'", [], |r| r.get(0)).unwrap();
+        assert_eq!(idx, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

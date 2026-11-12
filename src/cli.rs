@@ -90,9 +90,13 @@ fn task_full_json(store: &Store, t: &Task) -> Result<Value> {
     Ok(v)
 }
 
-fn check_kind_link(kind: &str, link: Option<&str>) -> Result<()> {
+/// `was`: the task's kind now ("default" for a new task). Reviews are only imported, and stay reviews.
+fn check_kind_link(kind: &str, was: &str, link: Option<&str>) -> Result<()> {
     if !crate::model::KINDS.contains(&kind) {
         return usage(&format!("--kind is one of {}", crate::model::KINDS.join(", ")));
+    }
+    if (kind == "review") != (was == "review") {
+        return usage("review tasks are only imported from GitHub; --kind is default or experiment");
     }
     match link {
         Some(l) if !l.is_empty() && !l.starts_with("https://") => usage(&format!("--link wants an https:// URL, got {l}")),
@@ -134,7 +138,7 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
             let val = |k| fl.iter().rev().find(|f| f.0 == k).map(|f| f.1);
             let labels: Vec<String> = fl.iter().filter(|f| f.0 == "--label").map(|f| f.1.to_string()).collect();
             let (kind, link) = (val("--kind").unwrap_or("default"), val("--link").filter(|l| !l.is_empty()));
-            check_kind_link(kind, link)?;
+            check_kind_link(kind, "default", link)?;
             let id = store.add_task(NewTask { title, description: val("--desc").unwrap_or(""), dir: val("--dir"), labels: &labels, todoist_id: None })?;
             if kind != "default" || link.is_some() {
                 store.set_kind(id, kind, link)?;
@@ -253,7 +257,7 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
                 Some(l) => Some(l).filter(|l| !l.is_empty()),
                 None => t.link.as_deref(),
             };
-            check_kind_link(kind, link)?;
+            check_kind_link(kind, &t.kind, link)?;
             store.update_task(id, title, val("--desc").unwrap_or(&t.description), dir, &labels)?;
             store.set_kind(id, kind, link)?;
             ok(task_full_json(store, &store.task(id)?.expect("just read"))?.to_string())
@@ -329,19 +333,37 @@ mod tests {
         let id = go(&s, &c, &["add", "t", "--kind", "experiment", "--link", "https://github.com/o/r/issues/4"], true).1;
         let j: Value = serde_json::from_str(&go(&s, &c, &["edit", &id], true).1).unwrap();
         assert_eq!((j["kind"].as_str(), j["link"].as_str()), (Some("experiment"), Some("https://github.com/o/r/issues/4")));
-        let j: Value = serde_json::from_str(&go(&s, &c, &["edit", &id, "--kind", "review"], true).1).unwrap();
-        assert_eq!((j["kind"].as_str(), j["link"].as_str()), (Some("review"), Some("https://github.com/o/r/issues/4")));
+        let j: Value = serde_json::from_str(&go(&s, &c, &["edit", &id, "--kind", "default"], true).1).unwrap();
+        assert_eq!((j["kind"].as_str(), j["link"].as_str()), (Some("default"), Some("https://github.com/o/r/issues/4")));
         let j: Value = serde_json::from_str(&go(&s, &c, &["edit", &id, "--link", ""], true).1).unwrap();
-        assert_eq!((j["kind"].as_str(), j["link"].is_null()), (Some("review"), true));
+        assert_eq!((j["kind"].as_str(), j["link"].is_null()), (Some("default"), true));
         assert!(exec(&s, &["edit", &id, "--kind", "nope"], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
         assert!(exec(&s, &["add", "u", "--link", "http://x"], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
+    }
+
+    #[test]
+    fn reviews_are_only_imported() {
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        let usage = |a: &[&str]| exec(&s, a, &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some();
+        assert!(usage(&["add", "r", "--kind", "review"]));
+        assert!(s.tasks().unwrap().is_empty());
+        let d = go(&s, &c, &["add", "d"], true).1;
+        assert!(usage(&["edit", &d, "--kind", "review"]));
+        let r = s.add_task(NewTask { title: "r", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        s.set_kind(r, "review", Some("https://github.com/o/r/pull/1")).unwrap();
+        assert!(usage(&["edit", &r.to_string(), "--kind", "default"]));
+        // Editing a review's other fields keeps it a review.
+        let j: Value = serde_json::from_str(&go(&s, &c, &["edit", &r.to_string(), "--desc", "x"], true).1).unwrap();
+        assert_eq!(j["kind"].as_str(), Some("review"));
     }
 
     #[test]
     fn next_skips_reviews_and_claim_resumes_shelved() {
         let (c, _) = cfg(3);
         let s = Store::open_in_memory();
-        go(&s, &c, &["add", "r", "--kind", "review"], true);
+        let r = s.add_task(NewTask { title: "r", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        s.set_kind(r, "review", Some("https://github.com/o/r/pull/1")).unwrap();
         let d = go(&s, &c, &["add", "d"], true).1;
         let j: Value = serde_json::from_str(&go(&s, &c, &["next"], true).1).unwrap();
         assert_eq!(j["id"].to_string(), d);

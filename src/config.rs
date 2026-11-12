@@ -80,7 +80,7 @@ impl Config {
     }
 
     /// Review-gate checks for a task kind: `gate_<kind>` in the file, comma-separated.
-    /// Local-only work has nothing to open a PR against, so it needs only an explainer.
+    /// An experiment is shelved, not merged, so by default it needs only an explainer.
     pub fn gate_checks(&self, kind: &str) -> Vec<String> {
         let dflt = if kind == "experiment" { "explainer" } else { "pr,explainer" };
         let v = file_value(&self.file, &format!("gate_{kind}")).unwrap_or_else(|| dflt.into());

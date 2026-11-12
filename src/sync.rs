@@ -347,7 +347,7 @@ mod tests {
         s.conn.execute("UPDATE tasks SET stage='shelved' WHERE id=?1", [a]).unwrap();
         let mk = |stage: &str| {
             let id = s.add_task(NewTask { title: "PR", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
-            s.set_kind(id, "review", Some("https://github.com/o/r/pull/1")).unwrap();
+            s.set_kind(id, "review", Some(&format!("https://github.com/o/r/pull/{id}"))).unwrap();
             s.conn.execute("UPDATE tasks SET stage=?2 WHERE id=?1", rusqlite::params![id, stage]).unwrap();
             id
         };
