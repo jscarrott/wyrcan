@@ -17,17 +17,14 @@ pub fn parse(json: &str) -> (PrState, String) {
     (state, who.join(", "))
 }
 
-/// Runs `prog pr view URL ...`, killing it after 15 s; stdout on success. `path` overrides the child's PATH (tests).
+/// Runs `prog ARGS`, killing it after 15 s; stdout on success. `path` overrides the child's PATH (tests).
 // shortcut: stdout is read after exit, so output past the pipe buffer (64 KiB) would hang until the kill; gh's JSON here is tiny.
-fn gh(prog: &str, path: Option<&str>, url: &str, extra: &[&str]) -> Option<String> {
+pub fn gh_args(prog: &str, path: Option<&str>, args: &[&str]) -> Option<String> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
-    if !url.starts_with("https://") {
-        return None; // never let a value starting with `-` reach gh as a flag
-    }
     let mut cmd = std::process::Command::new(prog);
-    cmd.args(["pr", "view", url]).args(extra).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     if let Some(p) = path {
         cmd.env("PATH", p);
     }
@@ -47,6 +44,13 @@ fn gh(prog: &str, path: Option<&str>, url: &str, extra: &[&str]) -> Option<Strin
     let mut out = String::new();
     child.stdout.take()?.read_to_string(&mut out).ok()?;
     status.success().then_some(out)
+}
+
+fn gh(prog: &str, path: Option<&str>, url: &str, extra: &[&str]) -> Option<String> {
+    if !url.starts_with("https://") {
+        return None; // never let a value starting with `-` reach gh as a flag
+    }
+    gh_args(prog, path, &[&["pr", "view", url], extra].concat())
 }
 
 fn fetch_with(prog: &str, path: Option<&str>, url: &str) -> (PrState, String) {

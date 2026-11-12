@@ -8,6 +8,7 @@ mod hook;
 mod install;
 mod model;
 mod pr;
+mod reviews;
 mod store;
 mod sync;
 mod todoist;
