@@ -450,6 +450,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// (root, name) pairs recorded by `gate --bookmark`, the latest per root.
+    pub fn bookmarks(&self, task_id: i64) -> Result<Vec<(String, String)>> {
+        let mut out: Vec<(String, String)> = vec![];
+        for e in self.events(task_id)?.into_iter().filter(|e| e.kind == "bookmark") {
+            let Some((root, name)) = e.detail.split_once('=') else { continue };
+            match out.iter_mut().find(|b| b.0 == root) {
+                Some(b) => b.1 = name.into(),
+                None => out.push((root.into(), name.into())),
+            }
+        }
+        Ok(out)
+    }
+
     pub fn export_json(&self) -> Result<Value> {
         let mut out = serde_json::Map::new();
         for table in ["tasks", "sessions", "repos", "prs", "events"] {

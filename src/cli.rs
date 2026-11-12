@@ -6,7 +6,7 @@ use crate::store::{NewTask, Store};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. | next | list [--stage S].. | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] | edit TASK_ID [--title T] [--desc D] [--dir DIR] [--label L].. | requeue TASK_ID | drop TASK_ID | closed [--days N] | export | sync";
+const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. [--kind K] [--link URL] | next | list [--stage S].. | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] [--bookmark ROOT=NAME].. | edit TASK_ID [--title T] [--desc D] [--dir DIR] [--label L].. [--kind K] [--link URL] | requeue TASK_ID | drop TASK_ID | closed [--days N] | export | sync";
 
 pub fn run(args: &[String], cfg: &Config) -> Result<i32> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -79,7 +79,25 @@ fn parse<'a>(args: &[&'a str], flags: &[&str]) -> Result<(Vec<&'a str>, Vec<(&'a
 }
 
 fn task_json(t: &Task) -> Value {
-    json!({"id": t.id, "title": t.title, "description": t.description, "dir": t.dir, "labels": t.labels})
+    json!({"id": t.id, "title": t.title, "description": t.description, "dir": t.dir, "labels": t.labels, "kind": t.kind, "link": t.link})
+}
+
+/// `task_json` plus the bookmarks the last gate recorded.
+fn task_full_json(store: &Store, t: &Task) -> Result<Value> {
+    let mut v = task_json(t);
+    let marks: Vec<Value> = store.bookmarks(t.id)?.into_iter().map(|(root, name)| json!({"root": root, "name": name})).collect();
+    v["bookmarks"] = Value::Array(marks);
+    Ok(v)
+}
+
+fn check_kind_link(kind: &str, link: Option<&str>) -> Result<()> {
+    if !crate::model::KINDS.contains(&kind) {
+        return usage(&format!("--kind is one of {}", crate::model::KINDS.join(", ")));
+    }
+    match link {
+        Some(l) if !l.is_empty() && !l.starts_with("https://") => usage(&format!("--link wants an https:// URL, got {l}")),
+        _ => Ok(()),
+    }
 }
 
 fn refused(r: Refusal) -> Result<(i32, String)> {
@@ -93,7 +111,7 @@ fn session_task(store: &Store, session: &str) -> Result<Option<Task>> {
     }
 }
 
-const GATE_FLAGS: &[&str] = &["--pr", "--no-pr", "--explainer", "--summary"];
+const GATE_FLAGS: &[&str] = &["--pr", "--no-pr", "--explainer", "--summary", "--bookmark"];
 
 /// The task a `gate` command line is about.
 fn gate_task(store: &Store, a: &[&str]) -> Result<Option<Task>> {
@@ -108,17 +126,22 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
     let rest = &a[1..];
     match a[0] {
         "add" => {
-            let (pos, fl) = parse(rest, &["--desc", "--dir", "--label"])?;
+            let (pos, fl) = parse(rest, &["--desc", "--dir", "--label", "--kind", "--link"])?;
             let [title] = pos[..] else { return usage("add takes one TITLE") };
             if title.trim().is_empty() {
                 return usage("TITLE can't be blank");
             }
             let val = |k| fl.iter().rev().find(|f| f.0 == k).map(|f| f.1);
             let labels: Vec<String> = fl.iter().filter(|f| f.0 == "--label").map(|f| f.1.to_string()).collect();
+            let (kind, link) = (val("--kind").unwrap_or("default"), val("--link").filter(|l| !l.is_empty()));
+            check_kind_link(kind, link)?;
             let id = store.add_task(NewTask { title, description: val("--desc").unwrap_or(""), dir: val("--dir"), labels: &labels, todoist_id: None })?;
+            if kind != "default" || link.is_some() {
+                store.set_kind(id, kind, link)?;
+            }
             ok(id.to_string())
         }
-        "next" => match store.tasks()?.into_iter().find(|t| t.stage == Stage::Queue) {
+        "next" => match store.tasks()?.into_iter().find(|t| t.stage == Stage::Queue && t.kind != "review") {
             Some(t) => ok(task_json(&t).to_string()),
             None => Ok((1, "Queue is empty".into())),
         },
@@ -134,7 +157,7 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
             }
             // Closed tasks pile up, so they show only when asked for.
             let want = |st: Stage| if stages.is_empty() { !matches!(st, Stage::Done | Stage::Dropped) } else { stages.contains(&st) };
-            let rows: Vec<Value> = store.tasks()?.iter().filter(|t| want(t.stage)).map(|t| json!({"id": t.id, "title": t.title, "stage": t.stage.as_str(), "dir": t.dir, "labels": t.labels})).collect();
+            let rows: Vec<Value> = store.tasks()?.iter().filter(|t| want(t.stage)).map(|t| json!({"id": t.id, "title": t.title, "stage": t.stage.as_str(), "dir": t.dir, "labels": t.labels, "kind": t.kind, "link": t.link})).collect();
             ok(Value::Array(rows).to_string())
         }
         "claim" => {
@@ -143,7 +166,7 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
             let Some(t) = store.task(id)? else { return refused(Refusal::NoSuchTask) };
             match t.stage {
                 Stage::Active => {}
-                Stage::Queue | Stage::Parked => {
+                Stage::Queue | Stage::Parked | Stage::Shelved => {
                     if let Err(r) = store.transition(id, Stage::Active, cfg.max_active, &|_, _| vec![])? {
                         return refused(r);
                     }
@@ -151,7 +174,7 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
                 from => return refused(Refusal::NotAllowed { from, to: Stage::Active }),
             }
             store.link_session(session, id, cwd)?;
-            ok(task_json(&store.task(id)?.expect("just read")).to_string())
+            ok(task_full_json(store, &store.task(id)?.expect("just read"))?.to_string())
         }
         "register-pen" => {
             let [session, cwd] = rest[..] else { return usage("register-pen takes SESSION CWD") };
@@ -180,6 +203,12 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
                         let (url, waiver) = if *k == "--pr" { (Some(val), None) } else { (None, Some(val)) };
                         store.set_pr(t.id, root, url, waiver)?;
                     }
+                    "--bookmark" => {
+                        if !v.split_once('=').is_some_and(|(r, n)| !r.is_empty() && !n.is_empty()) {
+                            return usage("--bookmark wants ROOT=NAME");
+                        }
+                        store.add_event(t.id, "bookmark", v)?;
+                    }
                     "--explainer" => {
                         if std::fs::metadata(v).is_ok_and(|m| m.len() == 0) {
                             return Ok((1, "explainer is empty".into()));
@@ -196,13 +225,13 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
             }
             let checks = cfg.gate_checks(&t.kind);
             match gate::to_review(&store, t.id, cfg.max_active, &checks, verify)? {
-                Ok(()) => ok("In review.".into()),
+                Ok(()) => ok(if gate::target(&t.kind) == Stage::Shelved { "Shelved." } else { "In review." }.into()),
                 Err(Refusal::Gate(m)) => Ok((1, format!("Not ready for review. Missing:\n- {}", m.join("\n- ")))),
                 Err(r) => refused(r),
             }
         }
         "edit" => {
-            let (pos, fl) = parse(rest, &["--title", "--desc", "--dir", "--label"])?;
+            let (pos, fl) = parse(rest, &["--title", "--desc", "--dir", "--label", "--kind", "--link"])?;
             let [id] = pos[..] else { return usage("edit takes one TASK_ID") };
             let Ok(id) = id.parse::<i64>() else { return usage("TASK_ID must be a number") };
             let Some(t) = store.task(id)? else { return refused(Refusal::NoSuchTask) };
@@ -218,8 +247,16 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
                 Some(d) => Some(d).filter(|d| !d.is_empty()),
                 None => t.dir.as_deref(),
             };
+            // Each of --kind and --link keeps the other's current value; --link "" clears it.
+            let kind = val("--kind").unwrap_or(&t.kind);
+            let link = match val("--link") {
+                Some(l) => Some(l).filter(|l| !l.is_empty()),
+                None => t.link.as_deref(),
+            };
+            check_kind_link(kind, link)?;
             store.update_task(id, title, val("--desc").unwrap_or(&t.description), dir, &labels)?;
-            ok(task_json(&store.task(id)?.expect("just read")).to_string())
+            store.set_kind(id, kind, link)?;
+            ok(task_full_json(store, &store.task(id)?.expect("just read"))?.to_string())
         }
         "requeue" | "drop" => {
             let [id] = rest[..] else { return usage(&format!("{} takes TASK_ID", a[0])) };
@@ -283,6 +320,42 @@ mod tests {
         let id: i64 = go(&s, &c, &["add", "t", "--desc", "- a list", "--label", "x", "--label", "-y", "--dir", "/d"], true).1.parse().unwrap();
         let t = s.task(id).unwrap().unwrap();
         assert_eq!((t.description.as_str(), t.dir.as_deref(), t.labels), ("- a list", Some("/d"), vec!["x".to_string(), "-y".to_string()]));
+    }
+
+    #[test]
+    fn add_and_edit_set_kind_and_link() {
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        let id = go(&s, &c, &["add", "t", "--kind", "experiment", "--link", "https://github.com/o/r/issues/4"], true).1;
+        let j: Value = serde_json::from_str(&go(&s, &c, &["edit", &id], true).1).unwrap();
+        assert_eq!((j["kind"].as_str(), j["link"].as_str()), (Some("experiment"), Some("https://github.com/o/r/issues/4")));
+        let j: Value = serde_json::from_str(&go(&s, &c, &["edit", &id, "--kind", "review"], true).1).unwrap();
+        assert_eq!((j["kind"].as_str(), j["link"].as_str()), (Some("review"), Some("https://github.com/o/r/issues/4")));
+        let j: Value = serde_json::from_str(&go(&s, &c, &["edit", &id, "--link", ""], true).1).unwrap();
+        assert_eq!((j["kind"].as_str(), j["link"].is_null()), (Some("review"), true));
+        assert!(exec(&s, &["edit", &id, "--kind", "nope"], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
+        assert!(exec(&s, &["add", "u", "--link", "http://x"], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
+    }
+
+    #[test]
+    fn next_skips_reviews_and_claim_resumes_shelved() {
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        go(&s, &c, &["add", "r", "--kind", "review"], true);
+        let d = go(&s, &c, &["add", "d"], true).1;
+        let j: Value = serde_json::from_str(&go(&s, &c, &["next"], true).1).unwrap();
+        assert_eq!(j["id"].to_string(), d);
+        let e = go(&s, &c, &["add", "e", "--kind", "experiment"], true).1;
+        go(&s, &c, &["claim", "s", &e, "/w"], true);
+        s.mark_edited("s", "/r/app", "git main").unwrap();
+        let ex = std::env::temp_dir().join(format!("cb-ex-{}.html", std::process::id()));
+        std::fs::write(&ex, "<p>x</p>").unwrap();
+        let g = go(&s, &c, &["gate", "s", "--pr", "/r/app=https://x/1", "--explainer", ex.to_str().unwrap(), "--bookmark", "/r/app=exp/1-try-sled"], true);
+        assert_eq!(g, (0, "Shelved.".into()));
+        let j: Value = serde_json::from_str(&go(&s, &c, &["claim", "s2", &e, "/w"], true).1).unwrap();
+        assert_eq!(stage(&s, e.parse().unwrap()), Stage::Active);
+        assert_eq!(j["kind"], "default");
+        assert_eq!(j["bookmarks"], json!([{"root": "/r/app", "name": "exp/1-try-sled"}]));
     }
 
     #[test]
