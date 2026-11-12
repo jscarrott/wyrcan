@@ -215,6 +215,7 @@ mod tests {
             explainer: None,
             todoist_id: None,
             synced_stage: None,
+            link: None,
             created_at: 0,
             stage_at: 0,
         };

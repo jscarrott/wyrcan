@@ -16,7 +16,7 @@ macro_rules! str_enum {
     };
 }
 
-str_enum!(Stage { Queue => "queue", Active => "active", Review => "review", Parked => "parked", Done => "done", Dropped => "dropped" });
+str_enum!(Stage { Queue => "queue", Active => "active", Review => "review", Parked => "parked", Shelved => "shelved", Done => "done", Dropped => "dropped" });
 str_enum!(AgentState { Working => "working", Waiting => "waiting", Blocked => "blocked", Ended => "ended" });
 str_enum!(SessionKind { Task => "task", Pen => "pen" });
 str_enum!(PrState { Unknown => "unknown", Waiting => "waiting", ChangesRequested => "changes_requested", Approved => "approved", Merged => "merged", Closed => "closed" });
@@ -35,6 +35,9 @@ impl PrState {
     }
 }
 
+/// Task types: where the work came from. "default" is what older tasks carry.
+pub const KINDS: &[&str] = &["default", "experiment", "review"];
+
 #[derive(Clone, Debug)]
 pub struct Task {
     pub id: i64,
@@ -49,6 +52,8 @@ pub struct Task {
     pub todoist_id: Option<String>,
     /// The stage last pushed to Todoist.
     pub synced_stage: Option<String>,
+    /// The issue, PR or thread a task tracks.
+    pub link: Option<String>,
     pub created_at: i64,
     pub stage_at: i64,
 }

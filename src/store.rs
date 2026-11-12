@@ -39,25 +39,27 @@ fn enable_wal(conn: &Connection, ms: u64) {
     }
 }
 
-/// Brings any database (new, or created at user_version 1) to version 2.
+/// Brings any database (new, or created at user_version 1 or 2) to version 3.
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     let version = |c: &Connection| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0));
-    if version(conn)? >= 2 {
+    if version(conn)? >= 3 {
         return Ok(());
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     // Another process may have migrated while we waited for the lock.
     let r = (|| -> Result<()> {
-        if version(conn)? < 2 {
+        if version(conn)? < 3 {
             // An older binary resets user_version on every open, so trust the schema, not the number.
-            let has: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info('tasks') WHERE name='synced_stage'", [], |r| r.get(0))?;
-            if has == 0 {
-                conn.execute_batch("ALTER TABLE tasks ADD COLUMN synced_stage TEXT")?;
+            for (col, ty) in [("synced_stage", "TEXT"), ("link", "TEXT")] {
+                let has: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info('tasks') WHERE name=?1", [col], |r| r.get(0))?;
+                if has == 0 {
+                    conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {col} {ty}"))?;
+                }
             }
             conn.execute_batch(
                 "CREATE UNIQUE INDEX IF NOT EXISTS tasks_todoist_id ON tasks(todoist_id) WHERE todoist_id IS NOT NULL;
-                 PRAGMA user_version = 2;",
+                 PRAGMA user_version = 3;",
             )?;
         }
         Ok(())
@@ -90,7 +92,7 @@ pub(crate) fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
-const TASK_COLS: &str = "id,title,description,kind,stage,position,dir,labels,explainer,todoist_id,created_at,stage_at,synced_stage";
+const TASK_COLS: &str = "id,title,description,kind,stage,position,dir,labels,explainer,todoist_id,created_at,stage_at,synced_stage,link";
 
 fn task_row(r: &rusqlite::Row) -> rusqlite::Result<Task> {
     let stage: String = r.get(4)?;
@@ -109,6 +111,7 @@ fn task_row(r: &rusqlite::Row) -> rusqlite::Result<Task> {
         created_at: r.get(10)?,
         stage_at: r.get(11)?,
         synced_stage: r.get(12)?,
+        link: r.get(13)?,
     })
 }
 
@@ -165,6 +168,12 @@ impl Store {
         Ok(())
     }
 
+    /// The task's type (see `model::KINDS`) and the issue, PR or thread it tracks.
+    pub fn set_kind(&self, id: i64, kind: &str, link: Option<&str>) -> Result<()> {
+        self.conn.execute("UPDATE tasks SET kind=?1, link=?2 WHERE id=?3", params![kind, link, id])?;
+        Ok(())
+    }
+
     /// Only for undoing an add that was refused straight away (adopting at the cap).
     pub fn delete_task(&self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM tasks WHERE id=?1", [id])?;
@@ -194,7 +203,7 @@ impl Store {
     }
 
     pub fn active_count(&self) -> Result<usize> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM tasks WHERE stage='active'", [], |r| r.get(0))?;
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM tasks WHERE stage='active' AND kind!='review'", [], |r| r.get(0))?;
         Ok(n as usize)
     }
 
@@ -223,25 +232,28 @@ impl Store {
         use Stage::*;
         let Some(task) = self.task(id)? else { return Ok(Err(Refusal::NoSuchTask)) };
         let from = task.stage;
-        if !matches!(
+        if !(matches!(
             (from, to),
             (Queue, Active | Dropped)
                 | (Active, Review | Parked | Queue | Dropped)
                 | (Parked, Active | Queue | Dropped)
                 | (Review, Active | Done | Dropped)
-        ) {
+                | (Active, Shelved)
+                | (Shelved, Active | Dropped)
+        ) || (task.kind == "review" && matches!((from, to), (Queue | Active | Parked, Done))))
+        {
             return Ok(Err(Refusal::NotAllowed { from, to }));
         }
-        if to == Active && self.active_count()? >= max_active {
+        if to == Active && task.kind != "review" && self.active_count()? >= max_active {
             return Ok(Err(Refusal::CapFull { max: max_active }));
         }
-        if (from, to) == (Active, Review) {
+        if matches!((from, to), (Active, Review | Shelved)) {
             let missing = gate(self, &task);
             if !missing.is_empty() {
                 return Ok(Err(Refusal::Gate(missing)));
             }
         }
-        if to == Done {
+        if to == Done && task.kind != "review" {
             if !gate::ready_to_close(&self.prs(id)?) {
                 return Ok(Err(Refusal::NotMerged));
             }
@@ -254,6 +266,9 @@ impl Store {
              WHERE id=?3",
             params![to.as_str(), n, id],
         )?;
+        if (from, to) == (Shelved, Active) {
+            self.conn.execute("UPDATE tasks SET kind='default' WHERE id=?1", [id])?;
+        }
         self.add_event(id, "stage", &format!("{from} → {to}"))?;
         Ok(Ok(()))
     }
@@ -493,6 +508,7 @@ mod tests {
             (Active, Review), (Active, Parked), (Active, Queue), (Active, Dropped),
             (Parked, Active), (Parked, Queue), (Parked, Dropped),
             (Review, Active), (Review, Done), (Review, Dropped),
+            (Active, Shelved), (Shelved, Active), (Shelved, Dropped),
         ];
         let s = Store::open_in_memory();
         for &from in Stage::ALL {
@@ -508,6 +524,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn experiments_shelve_through_the_gate_and_resume_as_default() {
+        let s = Store::open_in_memory();
+        let id = task_in(&s, Stage::Active);
+        s.set_kind(id, "experiment", None).unwrap();
+        assert!(matches!(s.transition(id, Stage::Shelved, 3, &|_, _| vec!["no explainer".into()]).unwrap(), Err(Refusal::Gate(_))));
+        s.transition(id, Stage::Shelved, 3, &no_gate).unwrap().unwrap();
+        assert_eq!(s.transition(id, Stage::Review, 3, &no_gate).unwrap(), Err(Refusal::NotAllowed { from: Stage::Shelved, to: Stage::Review }));
+        s.transition(id, Stage::Active, 3, &no_gate).unwrap().unwrap();
+        assert_eq!(s.task(id).unwrap().unwrap().kind, "default");
+    }
+
+    #[test]
+    fn reviews_skip_the_cap_and_close_without_prs() {
+        let s = Store::open_in_memory();
+        let mine = task_in(&s, Stage::Active);
+        let r = task_in(&s, Stage::Queue);
+        s.set_kind(r, "review", Some("https://github.com/o/r/pull/1")).unwrap();
+        s.transition(r, Stage::Active, 1, &no_gate).unwrap().unwrap(); // cap 1 already used by `mine`
+        assert_eq!(s.active_count().unwrap(), 1);
+        s.transition(r, Stage::Done, 1, &no_gate).unwrap().unwrap();
+        assert_eq!(s.transition(mine, Stage::Done, 1, &no_gate).unwrap(), Err(Refusal::NotAllowed { from: Stage::Active, to: Stage::Done }));
+    }
+
+    #[test]
+    fn migration_adds_link_and_keeps_old_rows() {
+        let dir = std::env::temp_dir().join(format!("cb-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("board.db");
+        {
+            // A v2 database: no `link` column.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute_batch("PRAGMA user_version = 2; INSERT INTO tasks(title,created_at,stage_at) VALUES('old',1,1)").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let t = &s.tasks().unwrap()[0];
+        assert_eq!((t.kind.as_str(), t.link.clone()), ("default", None));
+        drop(s);
+        Connection::open(&path).unwrap().execute_batch("PRAGMA user_version = 1").unwrap();
+        let s = Store::open(&path).unwrap();
+        assert_eq!((version(&s), s.tasks().unwrap()[0].link.clone()), (3, None));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -647,20 +708,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = v1_db(&dir);
         let s = Store::open(&path).unwrap();
-        assert_eq!(version(&s), 2);
+        assert_eq!(version(&s), 3);
         let t = s.tasks().unwrap();
         assert_eq!((t.len(), t[0].title.as_str(), t[0].stage, t[0].synced_stage.clone()), (1, "old", Stage::Review, None));
         s.set_synced_stage(t[0].id, Stage::Review).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!((version(&s), s.tasks().unwrap()[0].synced_stage.as_deref()), (2, Some("review")));
+        assert_eq!((version(&s), s.tasks().unwrap()[0].synced_stage.as_deref()), (3, Some("review")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn fresh_database_is_v2_and_todoist_ids_are_unique() {
+    fn fresh_database_is_v3_and_todoist_ids_are_unique() {
         let s = Store::open_in_memory();
-        assert_eq!(version(&s), 2);
+        assert_eq!(version(&s), 3);
         let mk = |tid| s.add_task(NewTask { title: "x", description: "", dir: None, labels: &[], todoist_id: tid });
         mk(None).unwrap();
         mk(None).unwrap();
@@ -676,7 +737,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path).unwrap().execute_batch("PRAGMA user_version = 1").unwrap();
         let s = Store::open(&path).unwrap();
-        assert_eq!(version(&s), 2);
+        assert_eq!(version(&s), 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -687,7 +748,7 @@ mod tests {
         let path = v1_db(&dir);
         let hs: Vec<_> = (0..4).map(|_| { let p = path.clone(); std::thread::spawn(move || Store::open(&p).map(|s| version(&s))) }).collect();
         for h in hs {
-            assert_eq!(h.join().unwrap().unwrap(), 2);
+            assert_eq!(h.join().unwrap().unwrap(), 3);
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

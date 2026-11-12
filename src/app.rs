@@ -35,7 +35,7 @@ impl Group {
             Stage::Review => Some(Group::Review),
             Stage::Parked => Some(Group::Parked),
             Stage::Queue => Some(Group::Queue),
-            Stage::Done | Stage::Dropped => None,
+            Stage::Shelved | Stage::Done | Stage::Dropped => None,
         }
     }
 }

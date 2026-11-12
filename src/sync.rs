@@ -39,7 +39,7 @@ fn section_for<'a>(stage: Stage, s: &'a Sections) -> Option<&'a str> {
         Stage::Queue => Some(&s.up_next),
         Stage::Active => Some(&s.in_progress),
         Stage::Review => Some(&s.needs_review),
-        Stage::Parked => Some(&s.parked),
+        Stage::Parked | Stage::Shelved => Some(&s.parked),
         Stage::Done | Stage::Dropped => None,
     }
 }
