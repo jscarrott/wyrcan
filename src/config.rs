@@ -75,7 +75,7 @@ impl Config {
     /// Review-gate checks for a task kind: `gate_<kind>` in the file, comma-separated.
     /// Local-only work has nothing to open a PR against, so it needs only an explainer.
     pub fn gate_checks(&self, kind: &str) -> Vec<String> {
-        let dflt = if kind == "local" { "explainer" } else { "pr,explainer" };
+        let dflt = if kind == "experiment" { "explainer" } else { "pr,explainer" };
         let v = file_value(&self.file, &format!("gate_{kind}")).unwrap_or_else(|| dflt.into());
         v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
     }
@@ -117,6 +117,6 @@ mod tests {
         assert_eq!(c.gate_checks("task"), ["pr", "explainer"]);
         assert_eq!(c.gate_checks("bug"), ["explainer"]);
         assert_eq!(c.gate_checks("spike"), ["pr", "explainer"]);
-        assert_eq!(c.gate_checks("local"), ["explainer"]);
+        assert_eq!(c.gate_checks("experiment"), ["explainer"]);
     }
 }

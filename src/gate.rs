@@ -55,12 +55,18 @@ pub fn evaluate(store: &Store, task: &Task, checks: &[String], verify_pr: &PrVer
     missing
 }
 
-/// The one way into Review. `verify_pr` does network I/O, so it runs on every PR url before the
+/// Experiments end in Shelved (nothing to merge); everything else goes to Review.
+pub fn target(kind: &str) -> Stage {
+    if kind == "experiment" { Stage::Shelved } else { Stage::Review }
+}
+
+/// The one way into Review (or Shelved, for experiments). `verify_pr` does network I/O, so it runs on every PR url before the
 /// transaction opens; the gate inside only checks membership and the write lock is held for local work.
 /// A PR recorded after the pre-check is not in the set and fails closed.
 pub fn to_review(store: &Store, id: i64, max_active: usize, checks: &[String], verify_pr: &PrVerifier) -> anyhow::Result<Result<(), Refusal>> {
     let verified: Vec<String> = store.prs(id)?.into_iter().filter(|p| !waived(p)).filter_map(|p| p.url).filter(|u| verify_pr(u)).collect();
-    store.transition(id, Stage::Review, max_active, &|s, t| evaluate(s, t, checks, &|u| verified.iter().any(|v| v == u)))
+    let kind = store.task(id)?.map(|t| t.kind).unwrap_or_default();
+    store.transition(id, target(&kind), max_active, &|s, t| evaluate(s, t, checks, &|u| verified.iter().any(|v| v == u)))
 }
 
 /// The worst state across repos; waived rows count as merged.
@@ -147,6 +153,16 @@ mod tests {
         let r = to_review(&s, id, 3, &["pr".to_string()], &|_| false).unwrap();
         assert!(matches!(r, Err(Refusal::Gate(m)) if m == ["couldn't verify PR https://x/pr/1"]));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn experiment_gates_on_explainer_only_into_shelved() {
+        let (s, id) = setup();
+        s.set_kind(id, "experiment", None).unwrap();
+        s.conn.execute("UPDATE tasks SET stage='active'", []).unwrap();
+        explainer(&s, id);
+        assert_eq!(to_review(&s, id, 3, &["explainer".into()], &|_| true).unwrap(), Ok(()));
+        assert_eq!(s.task(id).unwrap().unwrap().stage, Stage::Shelved);
     }
 
     #[test]
