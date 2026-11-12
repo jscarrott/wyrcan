@@ -656,7 +656,7 @@ impl App {
                 vec![]
             }
             KeyCode::Char('s') | KeyCode::Enter if shelved => on(Effect::Unshelve),
-            KeyCode::Enter if self.task().is_some_and(|t| t.0.kind == "review" && t.0.stage == Stage::Queue) => self.start(),
+            KeyCode::Enter if self.task().is_some_and(|t| t.0.kind == "review" && matches!(t.0.stage, Stage::Queue | Stage::Parked)) => self.start(),
             KeyCode::Up | KeyCode::Char('k') => self.step(-1),
             KeyCode::Down | KeyCode::Char('j') => self.step(1),
             KeyCode::Left | KeyCode::Char('h') => self.jump_group(-1),
@@ -981,6 +981,23 @@ pub(crate) mod tests {
         assert_eq!(ap.on_key_event(key('y')), [Effect::Park(busy)]);
         select(&mut ap, idle);
         assert_eq!(ap.on_key_event(key('P')), [Effect::Park(idle)]);
+    }
+
+    #[test]
+    fn s_and_enter_review_or_resume_review_cards() {
+        let s = Store::open_in_memory();
+        let (q, p) = (add(&s, "q", Stage::Queue), add(&s, "p", Stage::Parked));
+        for id in [q, p] {
+            s.set_kind(id, "review", Some("https://github.com/o/r/pull/1")).unwrap();
+        }
+        let mut ap = app(&s, &cfg(3));
+        ap.view = View::Reviews;
+        for k in [key('s'), KeyCode::Enter.into()] {
+            select(&mut ap, q);
+            assert_eq!(ap.on_key_event(k), [Effect::Start(q)]);
+            select(&mut ap, p);
+            assert_eq!(ap.on_key_event(k), [Effect::Resume(p)]);
+        }
     }
 
     #[test]

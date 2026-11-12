@@ -19,7 +19,7 @@ const KEYS: &[&str] = &[
 ];
 // Reviews: no Queue for `n`, no untracked sessions to adopt.
 const REVIEWS_KEYS: &[&str] = &[
-    "⇥ view", "↑↓ card", "←→ group", "space view", "s/⏎ review", "P park", "H/L move", "x done", "D drop", "f full", "v wide",
+    "⇥ view", "↑↓ card", "←→ group", "space view", "s review", "⏎ review/go to", "P park", "H/L move", "x done", "D drop", "f full", "v wide",
     "p pen", "e explainer", "o PR", "q quit",
 ];
 const SHELVED_KEYS: &[&str] = &["⇥ view", "↑↓ card", "space view", "s/⏎ resume experiment", "D drop", "v wide", "p pen", "e explainer", "q quit"];

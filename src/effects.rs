@@ -314,14 +314,14 @@ fn review_workspace(c: &Ctx, app: &mut App, t: &Task) -> Result<Option<String>> 
     Ok(Some(path))
 }
 
-/// Detached: Command::output() would block until the browser closes its inherited pipes.
-// shortcut: the child is never waited on (zombie until exit), fine for a short-lived TUI.
 /// The PR URLs to open: the recorded PRs, else a review task's own link.
 fn pr_urls(task: &Task, prs: Vec<crate::model::Pr>) -> Vec<String> {
     let urls: Vec<String> = prs.into_iter().filter_map(|p| p.url).collect();
     if urls.is_empty() { task.link.iter().cloned().collect() } else { urls }
 }
 
+/// Detached: Command::output() would block until the browser closes its inherited pipes.
+// shortcut: the child is never waited on (zombie until exit), fine for a short-lived TUI.
 fn xdg_open(target: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(target)
