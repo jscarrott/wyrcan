@@ -7,7 +7,7 @@ description: Wrap up this workstream for review. Use when the user says /wrap, "
 
 The board is the `claude-board` binary. It refuses review until every repo you touched has a PR or a stated reason, and an explainer exists.
 
-1. `claude-board status ${CLAUDE_SESSION_ID}`. It prints `{task, repos, prs, missing}` for this session's task, or exits 1 if the session has no task (then tell the user and stop).
+1. `claude-board status ${CLAUDE_SESSION_ID}`. It prints `{task, repos, prs, missing}` for this session's task, or exits 1 if the session has no task (then tell the user and stop). Read `task.kind`: if it is `experiment`, follow the experiment path below instead of step 2.
 2. For each repo in `repos`, decide whether a PR is appropriate. If yes, open it with that repo's normal workflow (e.g. `/finish-feature`) and note the URL (the full `https://` link; anything else is refused). If no, write a one-line reason. If `repos` is empty (changes made through Bash, or outside a repo), still record one for the task's directory (`task.dir`, else `$PWD`): pass `--pr '<dir>=<url>'` or `--no-pr "<dir>=$reason1"` with that directory as the root.
 3. Write a self-contained, non-empty HTML explainer of the change for a reviewer (what changed, why, how to verify, risks). Get the directory with `echo "${TMPDIR:-/tmp}"` and write the file to `<that dir>/claude-board-explainer-<task id>.html`, using `task.id` from step 1; pass that same literal path to `--explainer`. (The Write tool doesn't expand `$` variables, so never put one in the path.)
 4. Record it and move to review. The summary and every no-PR reason are free text (backticks, `$`, apostrophes), so never put them inline in quotes. Put each in a variable through a flush-left single-quoted heredoc, as below, with the values filled in. If a value contains a line equal to `CLAUDE_BOARD_WRAP_END`, reword that line first. Repeat `--pr` / `--no-pr` once per repo, using the repo root exactly as listed in `repos`; add one `reason` heredoc per waived repo (reason1, reason2, ...) and omit `--pr`/`--no-pr` flags you don't need.
@@ -24,4 +24,6 @@ CLAUDE_BOARD_WRAP_END
 claude-board gate ${CLAUDE_SESSION_ID} --pr '<root>=<url>' --no-pr "<root>=$reason1" --explainer <file> --summary "$summary"
 ```
 
-5. If it prints missing items, fix them and run it again. Never tell the user the work is review-ready until it prints "In review."
+Experiment path (`task.kind` is `experiment`): skip step 2. In each repo in `repos` (or `task.dir` if `repos` is empty), create a local bookmark `exp/<id>-<slug>`, where the slug is the title lowercased, non-alphanumerics turned into `-`, cut to 30 characters. In a jj repo use `jj bookmark create <name> -r @-` if `@` is empty, else `-r @`; in a git repo use `git branch <name>`. Never push it. Then do step 3, and in step 4 pass `--bookmark '<root>=<name>'` for each repo instead of `--pr` / `--no-pr`. Success prints "Shelved." instead of "In review."
+
+5. If it prints missing items, fix them and run it again. Never tell the user the work is review-ready until it prints "In review." (or "Shelved." for an experiment)
