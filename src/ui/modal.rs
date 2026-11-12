@@ -68,6 +68,8 @@ pub fn draw_task(f: &mut Frame, area: Rect, v: &mut TaskView, gate: Vec<String>,
     };
     let t = &d.task;
     field("Stage", vec![format!("{} · {}", t.stage, age(now, t.stage_at))]);
+    field("Type", vec![t.kind.clone()]);
+    field("Link", t.link.iter().cloned().collect());
     field("Directory", t.dir.iter().map(|p| home_short(p)).collect());
     field("Repos", d.repos.iter().map(|p| home_short(p)).collect());
     let prs = d.prs.iter().map(|p| {
@@ -117,12 +119,15 @@ pub fn draw_prompt(f: &mut Frame, area: Rect, label: &str, text: &str, cursor: u
 pub fn draw_quick_add(f: &mut Frame, area: Rect, q: &Input) {
     let [boxed, preview] = Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).areas(area);
     draw_prompt(f, boxed, "Add task", &q.text, q.cursor);
-    let (title, dir, labels) = parse_quick_add(&q.text);
+    let (title, dir, labels, experiment) = parse_quick_add(&q.text);
     let mut spans = vec![Span::raw("  ")];
     if title.is_empty() {
         spans.push(Span::styled("Type a title, with @label and #directory", theme::dim()));
     } else {
         spans.push(Span::styled(title, theme::bold()));
+    }
+    if experiment {
+        spans.push(Span::styled("  experiment", theme::dim()));
     }
     for l in labels {
         spans.push(Span::raw("  "));
@@ -164,6 +169,7 @@ mod tests {
         s.set_pr(id, "/w/delta", Some("https://x/pr/1"), None).unwrap();
         s.set_pr_state(id, "/w/delta", PrState::Waiting, "sam").unwrap();
         s.add_event(id, "summary", "Refreshed tokens before expiry").unwrap();
+        s.set_kind(id, "experiment", Some("https://x/issues/4")).unwrap();
         let mut ap = app(&s, &cfg(3));
         ap.on_key_event(key(' '));
         ap.modal.as_mut().unwrap().detail = detail(&s, id).unwrap();
@@ -175,6 +181,10 @@ mod tests {
             "now summary: Refreshed tokens before expiry",
             "Stage",
             "active",
+            "Type",
+            "experiment",
+            "Link",
+            "https://x/issues/4",
             "Directory",
             "Repos",
             "/w/delta",

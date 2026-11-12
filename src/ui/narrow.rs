@@ -13,7 +13,8 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App, now: i64) -> Vec<Hit> {
     // (first line, end line, target): cards, then each group from its header to its last line.
     let mut spans = vec![];
     let mut groups = vec![];
-    for (g, cards) in &app.snap.groups {
+    for g in app.visible_groups() {
+        let cards = app.cards(*g);
         if !lines.is_empty() {
             lines.push(Line::raw(""));
         }

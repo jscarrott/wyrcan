@@ -11,7 +11,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App, now: i64) -> Vec<Hit> {
     let [rule, cols] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     f.render_widget(Line::styled(format!(" {}", "─".repeat((rule.width as usize).saturating_sub(2))), theme::dim()), rule);
     // Untracked only shows when there's something in it, and narrower.
-    let shown: Vec<Group> = Group::ALL.into_iter().filter(|g| *g != Group::Untracked || !cards(app, *g).is_empty()).collect();
+    let shown: Vec<Group> = app.visible_groups().iter().copied().filter(|g| *g != Group::Untracked || !app.cards(*g).is_empty()).collect();
     let widths = shown.iter().map(|g| Constraint::Fill(if *g == Group::Untracked { 2 } else { 3 }));
     let rects = Layout::horizontal(widths).spacing(2).horizontal_margin(1).split(cols);
     let mut hits = vec![];
@@ -22,15 +22,11 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App, now: i64) -> Vec<Hit> {
     hits
 }
 
-fn cards(app: &App, g: Group) -> &[crate::app::Card] {
-    app.snap.groups.iter().find(|x| x.0 == g).map_or(&[], |x| &x.1)
-}
-
 /// One column: a header with its count, then cards a blank line apart, scrolled on its own.
 fn column(f: &mut Frame, area: Rect, app: &mut App, g: Group, now: i64) -> Vec<Hit> {
     let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     let width = area.width as usize;
-    let cs = cards(app, g);
+    let cs = app.cards(g);
     let name = g.name();
     let count = match g {
         Group::Active => format!("{}/{}", cs.len(), app.snap.max_active),
@@ -160,6 +156,35 @@ mod tests {
         for word in long.split(' ') {
             assert!(text.contains(word), "missing {word:?} in\n{text}");
         }
+    }
+
+    #[test]
+    fn review_and_shelved_tasks_leave_my_work() {
+        let s = Store::open_in_memory();
+        add(&s, "queued work", Stage::Queue);
+        let r = add(&s, "review their PR", Stage::Queue);
+        s.set_kind(r, "review", None).unwrap();
+        let x = add(&s, "try sled storage", Stage::Shelved);
+        s.add_event(x, "summary", "sled is fast but unmaintained").unwrap();
+        s.add_event(x, "bookmark", "/w/proj=exp-sled").unwrap();
+        let mut ap = app(&s, &cfg(3));
+        let text = draw(&mut ap, 140, 30).join("\n");
+        assert!(text.contains("queued work") && text.contains("My work"), "{text}");
+        for gone in ["Requested", "review their PR", "try sled storage"] {
+            assert!(!text.contains(gone), "{gone:?} in\n{text}");
+        }
+        ap.on_key_event(ratatui::crossterm::event::KeyCode::Tab.into());
+        let rows = draw(&mut ap, 140, 30);
+        let heads = &rows[2];
+        assert!(heads.find("Requested  1").unwrap() < heads.find("Reviewing  0").unwrap(), "{heads:?}");
+        assert!(heads.contains("Waiting on author  0"), "{heads:?}");
+        assert!(rows.join("\n").contains("review their PR"));
+        ap.on_key_event(ratatui::crossterm::event::KeyCode::Tab.into());
+        let text = draw(&mut ap, 140, 30).join("\n");
+        for want in ["Shelved  1", "try sled storage", "sled is fast but unmaintained", "/w/proj → exp-sled"] {
+            assert!(text.contains(want), "missing {want:?} in\n{text}");
+        }
+        assert!(!text.contains("queued work"), "{text}");
     }
 
     #[test]

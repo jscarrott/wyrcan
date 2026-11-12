@@ -86,7 +86,7 @@ fn status(c: &Card, now: i64) -> Vec<Span<'static>> {
             vec![Span::styled(text, dim)]
         }
         Some(Stage::Parked) => vec![Span::styled(format!("parked {}", age(now, c.task.as_ref().map_or(now, |t| t.stage_at))), dim)],
-        Some(Stage::Queue) => vec![],
+        Some(Stage::Queue | Stage::Shelved) => vec![],
         _ => match &c.session {
             Some(s) => {
                 let (glyph, name, color) = theme::agent(s.state);
@@ -171,6 +171,12 @@ pub fn card_lines(c: &Card, width: usize, selected: bool, now: i64) -> Vec<Line<
         let why = format!("no PR for {}: {}", crate::gate::basename(&p.root), p.waiver.as_deref().unwrap_or_default());
         body.extend(wrap(&why, text_w).into_iter().map(|l| vec![indent(), Span::styled(l, theme::dim())]));
     }
+    // Shelved: what was learnt, where it's written up, and where the code was left.
+    let explainer = c.task.as_ref().and_then(|t| t.explainer.as_deref()).map(home_short);
+    let roots = c.bookmarks.iter().map(|(root, name)| format!("{} → {name}", home_short(root)));
+    for l in c.summary.iter().cloned().chain(explainer).chain(roots) {
+        body.extend(wrap(&l, text_w).into_iter().map(|l| vec![indent(), Span::styled(l, theme::dim())]));
+    }
     let labels = c.task.as_ref().map_or(&[][..], |t| &t.labels[..]);
     body.extend(chips(labels, text_w).into_iter().map(|row| [vec![indent()], row].concat()));
     if let Some(f) = &c.flag {
@@ -231,7 +237,7 @@ mod tests {
             edited: true,
             current: true,
         };
-        Card { task: Some(task), session: Some(session), prs: vec![], missing: vec!["no explainer".into()], flag: Some("working outside Active".into()) }
+        Card { task: Some(task), session: Some(session), prs: vec![], missing: vec!["no explainer".into()], flag: Some("working outside Active".into()), bookmarks: vec![], summary: None }
     }
 
     fn text(lines: &[Line]) -> String {

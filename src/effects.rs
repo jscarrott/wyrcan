@@ -125,6 +125,7 @@ pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
     match e {
         Effect::Start(id) => open(c, p, app, id, false)?,
         Effect::Resume(id) => open(c, p, app, id, true)?,
+        Effect::Unshelve(id) => open(c, p, app, id, false)?,
         Effect::SetDir { id, dir } => {
             let dir = crate::config::expand_home(&dir);
             is_dir(&dir)?;
@@ -195,11 +196,14 @@ pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
                 xdg_open(&u)?;
             }
         }
-        Effect::Add { title, dir, labels } => {
+        Effect::Add { title, dir, labels, experiment } => {
             if let Some(d) = &dir {
                 is_dir(d)?;
             }
             let id = c.store.add_task(NewTask { title: &title, description: "", dir: dir.as_deref(), labels: &labels, todoist_id: None })?;
+            if experiment {
+                c.store.set_kind(id, "experiment", None)?;
+            }
             app.quick = None;
             app.selected = Some(CardKey::Task(id));
         }
@@ -570,14 +574,14 @@ mod tests {
         let first = add(&s, "first", Stage::Queue);
         let mut ap = app(&s, &c);
         ap.quick = Some(Default::default());
-        let e = vec![Effect::Add { title: "second".into(), dir: None, labels: vec!["api".into()] }];
+        let e = vec![Effect::Add { title: "second".into(), dir: None, labels: vec!["api".into()], experiment: true }];
         run_all(e, &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
-        let queue: Vec<_> = s.tasks().unwrap().into_iter().filter(|t| t.stage == Stage::Queue).map(|t| (t.title, t.labels)).collect();
-        assert_eq!(queue, [("first".into(), vec![]), ("second".to_string(), vec!["api".to_string()])]);
+        let queue: Vec<_> = s.tasks().unwrap().into_iter().filter(|t| t.stage == Stage::Queue).map(|t| (t.title, t.labels, t.kind)).collect();
+        assert_eq!(queue, [("first".into(), vec![], "default".into()), ("second".to_string(), vec!["api".to_string()], "experiment".to_string())]);
         assert!(ap.quick.is_none() && ap.selected != Some(CardKey::Task(first)));
         // A directory that isn't there is refused and the box stays open.
         ap.quick = Some(Default::default());
-        let e = vec![Effect::Add { title: "x".into(), dir: Some("/nonexistent/dir".into()), labels: vec![] }];
+        let e = vec![Effect::Add { title: "x".into(), dir: Some("/nonexistent/dir".into()), labels: vec![], experiment: false }];
         run_all(e, &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
         assert_eq!(ap.message.as_deref(), Some("No such directory: /nonexistent/dir"));
         assert!(ap.quick.is_some());

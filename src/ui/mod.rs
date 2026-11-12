@@ -6,7 +6,7 @@ mod narrow;
 mod wide;
 pub mod theme;
 
-use crate::app::App;
+use crate::app::{App, View};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -14,13 +14,13 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 const KEYS: &[&str] = &[
-    "↑↓ card", "←→ group", "space view", "+ add", "n next", "s start", "P park", "w wrap", "H/L move", "x done", "D drop/dismiss",
+    "⇥ view", "↑↓ card", "←→ group", "space view", "+ add", "n next", "s start", "P park", "w wrap", "H/L move", "x done", "D drop/dismiss",
     "a adopt", "⏎ go to", "f full", "v wide", "p pen", "e explainer", "o PR", "q quit",
 ];
 const VIEW_KEYS: &[&str] = &["↑↓ scroll", "e explainer", "o PR", "w wrap", "P park", "x done", "D drop", "esc close"];
 const CLOSED_KEYS: &[&str] = &["↑↓ move", "space view", "e explainer", "o PR", "c/esc board", "q quit"];
 const CLOSED_VIEW_KEYS: &[&str] = &["↑↓ scroll", "e explainer", "o PR", "esc close"];
-const ADD_KEYS: &[&str] = &["⏎ add to queue", "esc cancel", "@label", "#directory"];
+const ADD_KEYS: &[&str] = &["⏎ add to queue", "esc cancel", "@label", "#directory", "!exp experiment"];
 const PROMPT_KEYS: &[&str] = &["⏎ ok", "esc cancel"];
 
 /// Packs items into lines of `width` columns, two spaces apart.
@@ -84,11 +84,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     .areas(area);
 
     let sn = &app.snap;
-    let left = Span::styled("Claude Board", theme::bold());
+    let mut left = vec![Span::raw(" "), Span::styled("Claude Board", theme::bold())];
+    for v in View::ALL {
+        let st = if v == app.view { Style::new().fg(theme::ACCENT) } else { theme::dim() };
+        left.extend([Span::styled(if v == View::Work { "   " } else { " · " }, theme::dim()), Span::styled(v.name(), st)]);
+    }
     let blocked = Style::new().fg(if sn.blocked > 0 { theme::ACCENT } else { theme::DIM });
     let right = [Span::styled(format!("{}/{} active · ", sn.active, sn.max_active), theme::dim()), Span::styled(format!("{} blocked", sn.blocked), blocked)];
-    let gap = (area.width as usize).saturating_sub(2 + left.width() + right.iter().map(|s| s.width()).sum::<usize>()).max(2);
-    f.render_widget(Line::from([vec![Span::raw(" "), left, Span::raw(" ".repeat(gap))], right.to_vec()].concat()), header);
+    let width = |s: &[Span]| s.iter().map(|s| s.width()).sum::<usize>();
+    // Too narrow for every view: the narrow form's group headers already say which view is on.
+    if 3 + width(&left) + width(&right) > area.width as usize {
+        left.truncate(2);
+    }
+    let gap = (area.width as usize).saturating_sub(1 + width(&left) + width(&right)).max(2);
+    f.render_widget(Line::from([left, vec![Span::raw(" ".repeat(gap))], right.to_vec()].concat()), header);
 
     let mut w = vec![Span::raw(" Pen: ")];
     if sn.writers.is_empty() {

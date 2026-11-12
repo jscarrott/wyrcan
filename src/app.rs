@@ -14,10 +14,25 @@ pub enum Group {
     Parked,
     Queue,
     Untracked,
+    Requested,
+    Reviewing,
+    Waiting,
+    Shelved,
 }
 
 impl Group {
-    pub const ALL: [Group; 5] = [Group::Active, Group::Review, Group::Parked, Group::Queue, Group::Untracked];
+    /// In declaration order, so `Group as usize` indexes it.
+    pub const ALL: [Group; 9] = [
+        Group::Active,
+        Group::Review,
+        Group::Parked,
+        Group::Queue,
+        Group::Untracked,
+        Group::Requested,
+        Group::Reviewing,
+        Group::Waiting,
+        Group::Shelved,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -26,17 +41,57 @@ impl Group {
             Group::Parked => "PARKED",
             Group::Queue => "QUEUE",
             Group::Untracked => "UNTRACKED",
+            Group::Requested => "REQUESTED",
+            Group::Reviewing => "REVIEWING",
+            Group::Waiting => "WAITING ON AUTHOR",
+            Group::Shelved => "SHELVED",
         }
     }
 
-    pub fn of(stage: Stage) -> Option<Group> {
-        match stage {
-            Stage::Active => Some(Group::Active),
-            Stage::Review => Some(Group::Review),
-            Stage::Parked => Some(Group::Parked),
-            Stage::Queue => Some(Group::Queue),
-            Stage::Shelved | Stage::Done | Stage::Dropped => None,
+    pub fn of(stage: Stage, kind: &str) -> Option<Group> {
+        match (stage, kind == "review") {
+            (Stage::Queue, true) => Some(Group::Requested),
+            (Stage::Active, true) => Some(Group::Reviewing),
+            (Stage::Parked, true) => Some(Group::Waiting),
+            (Stage::Active, _) => Some(Group::Active),
+            (Stage::Review, _) => Some(Group::Review),
+            (Stage::Parked, _) => Some(Group::Parked),
+            (Stage::Queue, _) => Some(Group::Queue),
+            (Stage::Shelved, _) => Some(Group::Shelved),
+            (Stage::Done | Stage::Dropped, _) => None,
         }
+    }
+}
+
+/// The board's views; `Tab` cycles them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Work,
+    Reviews,
+    Shelved,
+}
+
+impl View {
+    pub const ALL: [View; 3] = [View::Work, View::Reviews, View::Shelved];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            View::Work => "My work",
+            View::Reviews => "Reviews",
+            View::Shelved => "Shelved",
+        }
+    }
+
+    pub fn groups(self) -> &'static [Group] {
+        match self {
+            View::Work => &[Group::Active, Group::Review, Group::Parked, Group::Queue, Group::Untracked],
+            View::Reviews => &[Group::Requested, Group::Reviewing, Group::Waiting],
+            View::Shelved => &[Group::Shelved],
+        }
+    }
+
+    fn next(self) -> View {
+        View::ALL[(self as usize + 1) % View::ALL.len()]
     }
 }
 
@@ -50,6 +105,10 @@ pub struct Card {
     /// Review-gate checks still failing (Active cards only).
     pub missing: Vec<String>,
     pub flag: Option<String>,
+    /// Shelved cards only: (root, bookmark), or (root, git ref) when no bookmark was recorded.
+    pub bookmarks: Vec<(String, String)>,
+    /// Shelved cards only: the latest summary.
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,13 +139,21 @@ pub fn snapshot(store: &Store, cfg: &Config) -> anyhow::Result<Snapshot> {
     let sessions = store.sessions()?;
     let mut groups: Vec<(Group, Vec<Card>)> = Group::ALL.iter().map(|g| (*g, vec![])).collect();
     for t in store.tasks()? {
-        let Some(g) = Group::of(t.stage) else { continue };
+        let Some(g) = Group::of(t.stage, &t.kind) else { continue };
         let session = sessions.iter().find(|s| s.task_id == Some(t.id) && s.current).cloned();
         let prs = store.prs(t.id)?;
         // Display only, so PR URLs aren't verified with `gh` here; the real gate does that.
         let missing = if t.stage == Stage::Active { gate::evaluate(store, &t, &cfg.gate_checks(&t.kind), &|_| true) } else { vec![] };
         let flag = flag(&t, session.as_ref(), &prs).map(String::from);
-        groups[g as usize].1.push(Card { task: Some(t), session, prs, missing, flag });
+        let (mut bookmarks, mut summary) = (vec![], None);
+        if g == Group::Shelved {
+            bookmarks = store.bookmarks(t.id)?;
+            if bookmarks.is_empty() {
+                bookmarks = store.task_refs(t.id)?;
+            }
+            summary = store.events(t.id)?.into_iter().rev().find(|e| e.kind == "summary").map(|e| e.detail);
+        }
+        groups[g as usize].1.push(Card { task: Some(t), session, prs, missing, flag, bookmarks, summary });
     }
     let rank = |c: &Card| match c.session.as_ref().map(|s| s.state) {
         Some(AgentState::Blocked) => 0,
@@ -94,8 +161,12 @@ pub fn snapshot(store: &Store, cfg: &Config) -> anyhow::Result<Snapshot> {
         Some(AgentState::Working) => 2,
         _ => 3,
     };
-    groups[0].1.sort_by_key(rank);
-    groups[4].1 = store.untracked()?.into_iter().map(|s| Card { task: None, session: Some(s), prs: vec![], missing: vec![], flag: None }).collect();
+    groups[Group::Active as usize].1.sort_by_key(rank);
+    groups[Group::Untracked as usize].1 = store
+        .untracked()?
+        .into_iter()
+        .map(|s| Card { task: None, session: Some(s), prs: vec![], missing: vec![], flag: None, bookmarks: vec![], summary: None })
+        .collect();
     // A pen session whose SessionEnd never came would otherwise stay on the Pen line forever.
     let stale = crate::store::now() - 24 * 3600;
     let writers: Vec<Session> =
@@ -107,7 +178,7 @@ pub fn snapshot(store: &Store, cfg: &Config) -> anyhow::Result<Snapshot> {
         .chain(&writers)
         .filter(|s| s.state == AgentState::Blocked)
         .count();
-    Ok(Snapshot { active: groups[0].1.len(), max_active: cfg.max_active, blocked, writers, groups })
+    Ok(Snapshot { active: groups[Group::Active as usize].1.len(), max_active: cfg.max_active, blocked, writers, groups })
 }
 
 fn flag(t: &Task, s: Option<&Session>, prs: &[Pr]) -> Option<&'static str> {
@@ -147,7 +218,9 @@ pub enum Effect {
     SpawnPen,
     OpenExplainer(i64),
     OpenPr(i64),
-    Add { title: String, dir: Option<String>, labels: Vec<String> },
+    /// Starts a fresh `/next` session for a shelved experiment; the move to Active makes it a plain task.
+    Unshelve(i64),
+    Add { title: String, dir: Option<String>, labels: Vec<String>, experiment: bool },
     Quit,
 }
 
@@ -274,17 +347,19 @@ impl Input {
     }
 }
 
-/// `@word` is a label, `#path` the directory (`~` expanded), the rest the title. Only at the start of a word.
-pub fn parse_quick_add(s: &str) -> (String, Option<String>, Vec<String>) {
-    let (mut title, mut dir, mut labels) = (vec![], None, vec![]);
+/// `@word` is a label, `#path` the directory (`~` expanded), `!exp` makes it an experiment, the rest the title.
+/// Only at the start of a word.
+pub fn parse_quick_add(s: &str) -> (String, Option<String>, Vec<String>, bool) {
+    let (mut title, mut dir, mut labels, mut experiment) = (vec![], None, vec![], false);
     for w in s.split_whitespace() {
         match (w.strip_prefix('@'), w.strip_prefix('#')) {
+            _ if w == "!exp" => experiment = true,
             (Some(l), _) if !l.is_empty() => labels.push(l.to_string()),
             (_, Some(d)) if !d.is_empty() => dir = Some(crate::config::expand_home(d)),
             _ => title.push(w),
         }
     }
-    (title.join(" "), dir, labels)
+    (title.join(" "), dir, labels, experiment)
 }
 
 /// A card being dragged, and the drop target under the pointer.
@@ -296,6 +371,7 @@ pub struct Drag {
 
 pub struct App {
     pub snap: Snapshot,
+    pub view: View,
     pub selected: Option<CardKey>,
     pub message: Option<String>,
     pub prompt: Option<Prompt>,
@@ -308,7 +384,7 @@ pub struct App {
     /// The wide form is on screen (set by `ui::draw` from the width).
     pub wide: bool,
     /// Wide form: each column's scroll offset in lines, by `Group as usize`.
-    pub scroll: [usize; 5],
+    pub scroll: [usize; Group::ALL.len()],
     /// The selection the wide form last scrolled into view; a new one gets scrolled to once.
     pub followed: Option<CardKey>,
 }
@@ -317,6 +393,7 @@ impl App {
     pub fn new(snap: Snapshot) -> App {
         let mut a = App {
             snap,
+            view: View::Work,
             selected: None,
             message: None,
             prompt: None,
@@ -327,7 +404,7 @@ impl App {
             drag: None,
             hits: vec![],
             wide: false,
-            scroll: [0; 5],
+            scroll: [0; Group::ALL.len()],
             followed: None,
         };
         a.selected = a.flat().first().map(|c| c.key());
@@ -338,9 +415,17 @@ impl App {
         self.snap.groups.iter().find(|g| g.1.iter().any(|c| c.key() == *k)).map(|g| g.0)
     }
 
-    /// Every card, in screen order.
+    pub fn visible_groups(&self) -> &'static [Group] {
+        self.view.groups()
+    }
+
+    pub fn cards(&self, g: Group) -> &[Card] {
+        self.snap.groups.iter().find(|x| x.0 == g).map_or(&[], |x| &x.1)
+    }
+
+    /// Every card in the view, in screen order.
     fn flat(&self) -> Vec<&Card> {
-        self.snap.groups.iter().flat_map(|g| &g.1).collect()
+        self.visible_groups().iter().flat_map(|g| self.cards(*g)).collect()
     }
 
     fn index(&self) -> Option<usize> {
@@ -395,7 +480,7 @@ impl App {
     fn jump_group(&mut self, d: isize) -> Vec<Effect> {
         let (mut start, mut firsts, mut cur) = (0, vec![], 0);
         let sel = self.index();
-        for (gi, (_, cards)) in self.snap.groups.iter().enumerate() {
+        for (gi, cards) in self.visible_groups().iter().map(|g| self.cards(*g)).enumerate() {
             if sel.is_some_and(|i| (start..start + cards.len()).contains(&i)) {
                 cur = gi;
             }
@@ -488,16 +573,16 @@ impl App {
     /// A card dropped on a column asks for that stage the way the keys do; the store has the last word.
     fn drop_on(&mut self, g: Group) -> Vec<Effect> {
         let Some((t, _)) = self.task() else { return vec![] };
-        if Group::of(t.stage) == Some(g) {
+        if Group::of(t.stage, &t.kind) == Some(g) {
             return vec![];
         }
         match g {
-            Group::Active if t.stage == Stage::Queue => vec![Effect::Start(t.id)],
-            Group::Active => vec![Effect::Resume(t.id)],
+            Group::Active | Group::Reviewing if t.stage == Stage::Queue => vec![Effect::Start(t.id)],
+            Group::Active | Group::Reviewing => vec![Effect::Resume(t.id)],
             Group::Review => vec![Effect::ToReview(t.id)],
-            Group::Queue => vec![Effect::Requeue(t.id)],
-            Group::Parked => self.guarded("Park", Effect::Park),
-            Group::Untracked => vec![],
+            Group::Queue | Group::Requested => vec![Effect::Requeue(t.id)],
+            Group::Parked | Group::Waiting => self.guarded("Park", Effect::Park),
+            Group::Untracked | Group::Shelved => vec![],
         }
     }
 
@@ -517,10 +602,10 @@ impl App {
             match k.code {
                 KeyCode::Esc => self.quick = None,
                 KeyCode::Enter => {
-                    let (title, dir, labels) = parse_quick_add(&q.text);
+                    let (title, dir, labels, experiment) = parse_quick_add(&q.text);
                     if !title.is_empty() {
                         // Stays open until the add succeeds, so a bad directory can be fixed.
-                        return vec![Effect::Add { title, dir, labels }];
+                        return vec![Effect::Add { title, dir, labels, experiment }];
                     }
                     self.quick = None;
                 }
@@ -549,7 +634,14 @@ impl App {
         };
         let id = self.task().map(|t| t.0.id);
         let on = |f: fn(i64) -> Effect| id.map(f).into_iter().collect();
+        let shelved = self.task().is_some_and(|t| t.0.stage == Stage::Shelved);
         match code {
+            KeyCode::Tab => {
+                self.view = self.view.next();
+                self.selected = self.flat().first().map(|c| c.key());
+                vec![]
+            }
+            KeyCode::Char('s') | KeyCode::Enter if shelved => on(Effect::Unshelve),
             KeyCode::Up | KeyCode::Char('k') => self.step(-1),
             KeyCode::Down | KeyCode::Char('j') => self.step(1),
             KeyCode::Left | KeyCode::Char('h') => self.jump_group(-1),
@@ -684,7 +776,10 @@ impl App {
     }
 
     fn next(&mut self) -> Vec<Effect> {
-        let top = self.snap.groups.iter().find(|g| g.0 == Group::Queue).and_then(|g| g.1.first());
+        if !self.visible_groups().contains(&Group::Queue) {
+            return vec![];
+        }
+        let top = self.cards(Group::Queue).first();
         match top.and_then(|c| c.task.as_ref()) {
             Some(t) => vec![Effect::Start(t.id)],
             None => {
@@ -956,12 +1051,15 @@ pub(crate) mod tests {
     #[test]
     fn parse_quick_add_parses_tokens() {
         let home = crate::config::home().to_string_lossy().into_owned();
-        let (t, d, l) = parse_quick_add("Fix login @delta @api #~/git-work/delta");
-        assert_eq!((t.as_str(), d, l), ("Fix login", Some(format!("{home}/git-work/delta")), vec!["delta".to_string(), "api".to_string()]));
+        let (t, d, l, e) = parse_quick_add("Fix login @delta @api #~/git-work/delta");
+        assert_eq!((t.as_str(), d, l, e), ("Fix login", Some(format!("{home}/git-work/delta")), vec!["delta".to_string(), "api".to_string()], false));
         // `@` and `#` only count at the start of a word; a bare one is text.
-        assert_eq!(parse_quick_add("email me@example.com about issue#4 @ #"), ("email me@example.com about issue#4 @ #".into(), None, vec![]));
-        assert_eq!(parse_quick_add("   "), (String::new(), None, vec![]));
+        assert_eq!(parse_quick_add("email me@example.com about issue#4 @ #"), ("email me@example.com about issue#4 @ #".into(), None, vec![], false));
+        assert_eq!(parse_quick_add("   "), (String::new(), None, vec![], false));
         assert_eq!(parse_quick_add("x #~").1, Some(home));
+        // `!exp` as a whole word makes it an experiment.
+        assert_eq!(parse_quick_add("try sled !exp"), ("try sled".into(), None, vec![], true));
+        assert!(!parse_quick_add("try !explode").3);
     }
 
     fn type_into(ap: &mut App, s: &str) {
@@ -985,7 +1083,7 @@ pub(crate) mod tests {
         assert_eq!(ap.quick.as_ref().unwrap().text, "Dq fix login @ai");
         assert!(ap.confirm.is_none());
         let e = ap.on_key_event(KeyCode::Enter.into());
-        assert_eq!(e, [Effect::Add { title: "Dq fix login".into(), dir: None, labels: vec!["ai".into()] }]);
+        assert_eq!(e, [Effect::Add { title: "Dq fix login".into(), dir: None, labels: vec!["ai".into()], experiment: false }]);
         ap.on_key_event(KeyCode::Esc.into());
         assert!(ap.quick.is_none());
     }
@@ -1040,6 +1138,64 @@ pub(crate) mod tests {
         assert_eq!((ap.selected.clone(), ap.scroll[Group::Queue as usize]), (Some(CardKey::Task(a)), 3));
         ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 6));
         assert!(ap.quick.is_some());
+    }
+
+    #[test]
+    fn tab_cycles_views_and_selection_stays_in_view() {
+        let s = Store::open_in_memory();
+        let q = add(&s, "q", Stage::Queue);
+        let r = add(&s, "r", Stage::Active);
+        s.set_kind(r, "review", None).unwrap();
+        let (sh1, sh2) = (add(&s, "sh1", Stage::Shelved), add(&s, "sh2", Stage::Shelved));
+        let mut ap = app(&s, &cfg(3));
+        assert_eq!((ap.view, ap.selected.clone()), (View::Work, Some(CardKey::Task(q))));
+        assert_eq!(ap.visible_groups(), [Group::Active, Group::Review, Group::Parked, Group::Queue, Group::Untracked]);
+        // A review task leaves Active (and the active count) for Reviewing.
+        assert_eq!((ids(&ap.snap, Group::Reviewing), ap.snap.active), (vec![r], 0));
+        ap.on_key_event(KeyCode::Tab.into());
+        assert_eq!((ap.view, ap.selected.clone()), (View::Reviews, Some(CardKey::Task(r))));
+        assert_eq!(ap.visible_groups(), [Group::Requested, Group::Reviewing, Group::Waiting]);
+        // Moving never leaves the view.
+        for k in ['j', 'l', 'j', 'h', 'k'] {
+            ap.on_key_event(key(k));
+            assert_eq!(ap.selected, Some(CardKey::Task(r)), "{k}");
+        }
+        assert!(ap.on_key_event(key('n')).is_empty());
+        ap.on_key_event(KeyCode::Tab.into());
+        assert_eq!((ap.view, ap.selected.clone()), (View::Shelved, Some(CardKey::Task(sh1))));
+        ap.on_key_event(key('j'));
+        ap.on_key_event(key('j'));
+        assert_eq!(ap.selected, Some(CardKey::Task(sh2)));
+        ap.on_key_event(KeyCode::Tab.into());
+        assert_eq!((ap.view, ap.selected.clone()), (View::Work, Some(CardKey::Task(q))));
+    }
+
+    #[test]
+    fn shelved_card_carries_summary_and_falls_back_to_repo_refs() {
+        let s = Store::open_in_memory();
+        let id = add(&s, "sled", Stage::Active);
+        session(&s, "s1", Some(id), AgentState::Waiting);
+        s.mark_edited("s1", "/w/proj", "git exp-sled").unwrap();
+        s.add_event(id, "summary", "old").unwrap();
+        s.add_event(id, "summary", "new").unwrap();
+        s.conn.execute("UPDATE tasks SET stage='shelved' WHERE id=?1", [id]).unwrap();
+        let sn = snapshot(&s, &cfg(3)).unwrap();
+        let c = &sn.groups[Group::Shelved as usize].1[0];
+        assert_eq!((c.summary.as_deref(), c.bookmarks.clone()), (Some("new"), vec![("/w/proj".into(), "git exp-sled".into())]));
+        s.add_event(id, "bookmark", "/w/proj=exp-sled").unwrap();
+        let sn = snapshot(&s, &cfg(3)).unwrap();
+        assert_eq!(sn.groups[Group::Shelved as usize].1[0].bookmarks, [("/w/proj".to_string(), "exp-sled".to_string())]);
+    }
+
+    #[test]
+    fn enter_on_shelved_card_unshelves() {
+        let s = Store::open_in_memory();
+        let id = add(&s, "sled", Stage::Shelved);
+        let mut ap = app(&s, &cfg(3));
+        ap.on_key_event(KeyCode::Tab.into());
+        ap.on_key_event(KeyCode::Tab.into());
+        assert_eq!(ap.on_key_event(KeyCode::Enter.into()), [Effect::Unshelve(id)]);
+        assert_eq!(ap.on_key_event(key('s')), [Effect::Unshelve(id)]);
     }
 
     /// Presses `c` and loads the rows the way the loop does.

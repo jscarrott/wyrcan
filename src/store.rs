@@ -372,6 +372,16 @@ impl Store {
         Ok(rows)
     }
 
+    /// (root, git ref) per repo the task's sessions edited; the latest-recorded ref wins.
+    pub fn task_refs(&self, task_id: i64) -> Result<Vec<(String, String)>> {
+        let mut q = self.conn.prepare(
+            "SELECT r.root, r.git_ref, MAX(r.rowid) FROM repos r JOIN sessions s ON s.id=r.session_id
+             WHERE s.task_id=?1 GROUP BY r.root ORDER BY r.root",
+        )?;
+        let rows = q.query_map([task_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// A different url or waiver is a different PR, so its known state starts over.
     pub fn set_pr(&self, task_id: i64, root: &str, url: Option<&str>, waiver: Option<&str>) -> Result<()> {
         self.conn.execute(
