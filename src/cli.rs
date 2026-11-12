@@ -6,11 +6,11 @@ use crate::store::{NewTask, Store};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. | next | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] | drop TASK_ID | closed [--days N] | export | sync";
+const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. | next | list [--stage S].. | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] | edit TASK_ID [--title T] [--desc D] [--dir DIR] [--label L].. | requeue TASK_ID | drop TASK_ID | closed [--days N] | export | sync";
 
 pub fn run(args: &[String], cfg: &Config) -> Result<i32> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    if !matches!(a.first(), Some(&("add" | "next" | "claim" | "register-pen" | "status" | "gate" | "drop" | "closed" | "export" | "sync"))) {
+    if !matches!(a.first(), Some(&("add" | "next" | "list" | "claim" | "register-pen" | "status" | "gate" | "edit" | "requeue" | "drop" | "closed" | "export" | "sync"))) {
         eprintln!("{USAGE}");
         return Ok(2);
     }
@@ -122,6 +122,21 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
             Some(t) => ok(task_json(&t).to_string()),
             None => Ok((1, "Queue is empty".into())),
         },
+        "list" => {
+            let (pos, fl) = parse(rest, &["--stage"])?;
+            if !pos.is_empty() {
+                return usage("list takes only --stage S");
+            }
+            let mut stages = vec![];
+            for f in &fl {
+                let Some(st) = Stage::from_str(f.1) else { return usage("--stage is one of queue, active, review, parked, done, dropped") };
+                stages.push(st);
+            }
+            // Closed tasks pile up, so they show only when asked for.
+            let want = |st: Stage| if stages.is_empty() { !matches!(st, Stage::Done | Stage::Dropped) } else { stages.contains(&st) };
+            let rows: Vec<Value> = store.tasks()?.iter().filter(|t| want(t.stage)).map(|t| json!({"id": t.id, "title": t.title, "stage": t.stage.as_str(), "dir": t.dir, "labels": t.labels})).collect();
+            ok(Value::Array(rows).to_string())
+        }
         "claim" => {
             let [session, id, cwd] = rest[..] else { return usage("claim takes SESSION TASK_ID CWD") };
             let Ok(id) = id.parse::<i64>() else { return usage("TASK_ID must be a number") };
@@ -186,11 +201,32 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
                 Err(r) => refused(r),
             }
         }
-        "drop" => {
-            let [id] = rest[..] else { return usage("drop takes TASK_ID") };
+        "edit" => {
+            let (pos, fl) = parse(rest, &["--title", "--desc", "--dir", "--label"])?;
+            let [id] = pos[..] else { return usage("edit takes one TASK_ID") };
             let Ok(id) = id.parse::<i64>() else { return usage("TASK_ID must be a number") };
-            match store.transition(id, Stage::Dropped, cfg.max_active, &|_, _| vec![])? {
-                Ok(()) => ok("Dropped.".into()),
+            let Some(t) = store.task(id)? else { return refused(Refusal::NoSuchTask) };
+            let val = |k| fl.iter().rev().find(|f| f.0 == k).map(|f| f.1);
+            let title = val("--title").unwrap_or(&t.title);
+            if title.trim().is_empty() {
+                return usage("TITLE can't be blank");
+            }
+            // Any --label replaces the whole set; --dir "" clears the dir.
+            let labels: Vec<String> = fl.iter().filter(|f| f.0 == "--label").map(|f| f.1.to_string()).collect();
+            let labels = if labels.is_empty() { t.labels.clone() } else { labels };
+            let dir = match val("--dir") {
+                Some(d) => Some(d).filter(|d| !d.is_empty()),
+                None => t.dir.as_deref(),
+            };
+            store.update_task(id, title, val("--desc").unwrap_or(&t.description), dir, &labels)?;
+            ok(task_json(&store.task(id)?.expect("just read")).to_string())
+        }
+        "requeue" | "drop" => {
+            let [id] = rest[..] else { return usage(&format!("{} takes TASK_ID", a[0])) };
+            let Ok(id) = id.parse::<i64>() else { return usage("TASK_ID must be a number") };
+            let (to, msg) = if a[0] == "drop" { (Stage::Dropped, "Dropped.") } else { (Stage::Queue, "Back in the queue.") };
+            match store.transition(id, to, cfg.max_active, &|_, _| vec![])? {
+                Ok(()) => ok(msg.into()),
                 Err(r) => refused(r),
             }
         }
@@ -418,5 +454,56 @@ mod tests {
         let (_, all) = go(&s, &c, &["closed", "--days", "0"], true);
         assert!(all.contains("2 done · 1 dropped") && all.contains("### Old win"));
         assert!(exec(&s, &["closed", "--days", "x"], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
+    }
+
+    #[test]
+    fn edit_changes_fields_in_place_and_keeps_stage_and_position() {
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        let a: i64 = go(&s, &c, &["add", "a", "--desc", "old", "--dir", "/d", "--label", "x"], true).1.parse().unwrap();
+        go(&s, &c, &["add", "b"], true);
+        let before = s.task(a).unwrap().unwrap();
+        let (code, out) = go(&s, &c, &["edit", &a.to_string(), "--title", "A", "--label", "y", "--label", "z"], true);
+        assert_eq!(code, 0, "{out}");
+        let t = s.task(a).unwrap().unwrap();
+        assert_eq!((t.title.as_str(), t.description.as_str(), t.dir.as_deref(), t.labels.clone()), ("A", "old", Some("/d"), vec!["y".to_string(), "z".into()]));
+        assert_eq!((t.stage, t.position), (before.stage, before.position));
+        go(&s, &c, &["edit", &a.to_string(), "--desc", "new", "--dir", ""], true);
+        let t = s.task(a).unwrap().unwrap();
+        assert_eq!((t.description.as_str(), t.dir), ("new", None));
+        assert_eq!(go(&s, &c, &["edit", "999", "--title", "x"], true).0, 1);
+        assert!(exec(&s, &["edit", &a.to_string(), "--title", " "], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
+    }
+
+    #[test]
+    fn requeue_puts_a_claimed_task_back_at_the_bottom_of_the_queue() {
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        let id = claimed(&s, &c);
+        let other: i64 = go(&s, &c, &["add", "q"], true).1.parse().unwrap();
+        assert_eq!(go(&s, &c, &["requeue", &id.to_string()], true), (0, "Back in the queue.".into()));
+        assert_eq!(stage(&s, id), Stage::Queue);
+        assert!(s.task(id).unwrap().unwrap().position > s.task(other).unwrap().unwrap().position);
+        assert_eq!(go(&s, &c, &["requeue", &id.to_string()], true).0, 1);
+    }
+
+    #[test]
+    fn list_shows_open_tasks_unless_a_stage_is_asked_for() {
+        let (c, _) = cfg(3);
+        let s = Store::open_in_memory();
+        let a = claimed(&s, &c);
+        let q: i64 = go(&s, &c, &["add", "q"], true).1.parse().unwrap();
+        let d: i64 = go(&s, &c, &["add", "d"], true).1.parse().unwrap();
+        go(&s, &c, &["drop", &d.to_string()], true);
+        let ids = |args: &[&str]| -> Vec<i64> {
+            let out: Value = serde_json::from_str(&go(&s, &c, args, true).1).unwrap();
+            out.as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect()
+        };
+        let mut open = ids(&["list"]);
+        open.sort();
+        assert_eq!(open, vec![a, q]);
+        assert_eq!(ids(&["list", "--stage", "dropped"]), vec![d]);
+        assert_eq!(ids(&["list", "--stage", "queue", "--stage", "active"]).len(), 2);
+        assert!(exec(&s, &["list", "--stage", "nope"], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
     }
 }
