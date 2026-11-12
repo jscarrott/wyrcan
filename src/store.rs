@@ -152,6 +152,10 @@ impl Store {
         Ok(self.conn.query_row(&format!("SELECT {TASK_COLS} FROM tasks WHERE id=?1"), [id], task_row).optional()?)
     }
 
+    pub fn review_task(&self, url: &str) -> Result<Option<Task>> {
+        Ok(self.conn.query_row(&format!("SELECT {TASK_COLS} FROM tasks WHERE kind='review' AND link=?1"), [url], task_row).optional()?)
+    }
+
     pub fn tasks(&self) -> Result<Vec<Task>> {
         let mut q = self.conn.prepare(&format!(
             "SELECT {TASK_COLS} FROM tasks ORDER BY CASE WHEN stage='queue' THEN position END, stage_at DESC, id"
