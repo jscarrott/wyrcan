@@ -109,6 +109,8 @@ pub struct Card {
     pub bookmarks: Vec<(String, String)>,
     /// Shelved cards only: the latest summary.
     pub summary: Option<String>,
+    /// Review tasks only: the latest review event when the PR is no longer asking for you.
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,7 +155,12 @@ pub fn snapshot(store: &Store, cfg: &Config) -> anyhow::Result<Snapshot> {
             }
             summary = store.events(t.id)?.into_iter().rev().find(|e| e.kind == "summary").map(|e| e.detail);
         }
-        groups[g as usize].1.push(Card { task: Some(t), session, prs, missing, flag, bookmarks, summary });
+        let note = if t.kind == "review" {
+            store.events(t.id)?.into_iter().rev().find(|e| e.kind == "review").map(|e| e.detail).filter(|d| d != "requested")
+        } else {
+            None
+        };
+        groups[g as usize].1.push(Card { task: Some(t), session, prs, missing, flag, bookmarks, summary, note });
     }
     let rank = |c: &Card| match c.session.as_ref().map(|s| s.state) {
         Some(AgentState::Blocked) => 0,
@@ -165,7 +172,7 @@ pub fn snapshot(store: &Store, cfg: &Config) -> anyhow::Result<Snapshot> {
     groups[Group::Untracked as usize].1 = store
         .untracked()?
         .into_iter()
-        .map(|s| Card { task: None, session: Some(s), prs: vec![], missing: vec![], flag: None, bookmarks: vec![], summary: None })
+        .map(|s| Card { task: None, session: Some(s), prs: vec![], missing: vec![], flag: None, bookmarks: vec![], summary: None, note: None })
         .collect();
     // A pen session whose SessionEnd never came would otherwise stay on the Pen line forever.
     let stale = crate::store::now() - 24 * 3600;
@@ -649,6 +656,7 @@ impl App {
                 vec![]
             }
             KeyCode::Char('s') | KeyCode::Enter if shelved => on(Effect::Unshelve),
+            KeyCode::Enter if self.task().is_some_and(|t| t.0.kind == "review" && t.0.stage == Stage::Queue) => self.start(),
             KeyCode::Up | KeyCode::Char('k') => self.step(-1),
             KeyCode::Down | KeyCode::Char('j') => self.step(1),
             KeyCode::Left | KeyCode::Char('h') => self.jump_group(-1),

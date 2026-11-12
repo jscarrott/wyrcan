@@ -196,7 +196,7 @@ pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
         }
         Effect::OpenExplainer(id) => xdg_open(&c.task(id)?.explainer.context("No explainer yet.")?)?,
         Effect::OpenPr(id) => {
-            let urls: Vec<String> = c.store.prs(id)?.into_iter().filter_map(|p| p.url).collect();
+            let urls = pr_urls(&c.task(id)?, c.store.prs(id)?);
             if urls.is_empty() {
                 bail!("No PR yet.");
             }
@@ -316,6 +316,12 @@ fn review_workspace(c: &Ctx, app: &mut App, t: &Task) -> Result<Option<String>> 
 
 /// Detached: Command::output() would block until the browser closes its inherited pipes.
 // shortcut: the child is never waited on (zombie until exit), fine for a short-lived TUI.
+/// The PR URLs to open: the recorded PRs, else a review task's own link.
+fn pr_urls(task: &Task, prs: Vec<crate::model::Pr>) -> Vec<String> {
+    let urls: Vec<String> = prs.into_iter().filter_map(|p| p.url).collect();
+    if urls.is_empty() { task.link.iter().cloned().collect() } else { urls }
+}
+
 fn xdg_open(target: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(target)
@@ -437,6 +443,17 @@ mod tests {
         r.calls.borrow_mut().clear();
         run_all(vec![Effect::Enter(q)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
         assert_eq!(r.calls.borrow().last().unwrap(), &format!("{P} focus --args pane=terminal_9"));
+    }
+
+    #[test]
+    fn open_pr_falls_back_to_link() {
+        let (s, _c) = (Store::open_in_memory(), cfg(3));
+        let q = s.add_task(NewTask { title: "r", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        s.set_kind(q, "review", Some("https://github.com/o/r/pull/1")).unwrap();
+        let t = s.task(q).unwrap().unwrap();
+        assert_eq!(pr_urls(&t, vec![]), ["https://github.com/o/r/pull/1"]);
+        s.set_pr(q, "/r/app", Some("https://x/pr/2"), None).unwrap();
+        assert_eq!(pr_urls(&t, s.prs(q).unwrap()), ["https://x/pr/2"]);
     }
 
     #[test]

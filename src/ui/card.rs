@@ -68,6 +68,13 @@ pub fn home_short(path: &str) -> String {
 fn status(c: &Card, now: i64) -> Vec<Span<'static>> {
     use crate::model::{PrState, Stage};
     let dim = theme::dim();
+    if let Some(t) = c.task.as_ref().filter(|t| t.kind == "review") {
+        let author = t.description.strip_prefix("PR by ").unwrap_or("");
+        let mut path = t.link.as_deref().unwrap_or("").rsplit('/');
+        let (n, _, repo) = (path.next().unwrap_or(""), path.next(), path.next().unwrap_or(""));
+        let parts: Vec<String> = [author.to_string(), format!("{repo}#{n}"), age(now, t.created_at)].into_iter().filter(|p| p.len() > 1).collect();
+        return vec![Span::styled(parts.join(" · "), dim)];
+    }
     match c.task.as_ref().map(|t| t.stage) {
         Some(Stage::Review) => {
             let open: Vec<_> = c.prs.iter().filter(|p| p.waiver.is_none()).cloned().collect();
@@ -167,6 +174,9 @@ pub fn card_lines(c: &Card, width: usize, selected: bool, now: i64) -> Vec<Line<
     if !st.is_empty() {
         body.push([vec![indent()], st].concat());
     }
+    if let Some(n) = &c.note {
+        body.push(vec![indent(), Span::styled(n.clone(), theme::dim())]);
+    }
     for p in c.prs.iter().filter(|p| p.waiver.is_some()) {
         let why = format!("no PR for {}: {}", crate::gate::basename(&p.root), p.waiver.as_deref().unwrap_or_default());
         body.extend(wrap(&why, text_w).into_iter().map(|l| vec![indent(), Span::styled(l, theme::dim())]));
@@ -237,7 +247,7 @@ mod tests {
             edited: true,
             current: true,
         };
-        Card { task: Some(task), session: Some(session), prs: vec![], missing: vec!["no explainer".into()], flag: Some("working outside Active".into()), bookmarks: vec![], summary: None }
+        Card { task: Some(task), session: Some(session), prs: vec![], missing: vec!["no explainer".into()], flag: Some("working outside Active".into()), bookmarks: vec![], summary: None, note: None }
     }
 
     fn text(lines: &[Line]) -> String {
@@ -251,6 +261,20 @@ mod tests {
         assert_eq!(wrap("", 4), [""]);
         assert_eq!(wrap("two\nlines", 20), ["two lines"]);
         assert_eq!(wrap("修复登录", 4), ["修复", "登录"]);
+    }
+
+    #[test]
+    fn review_card_shows_author_number_and_note() {
+        let mut c = card("Add retries");
+        let t = c.task.as_mut().unwrap();
+        (t.kind, t.stage, t.description, t.link) =
+            ("review".into(), Stage::Queue, "PR by @ann".into(), Some("https://github.com/acme/delta/pull/812".into()));
+        c.session = None;
+        let out = text(&card_lines(&c, 40, false, 7200));
+        assert!(out.contains("@ann · delta#812 · 2h"), "{out}");
+        assert!(!out.contains("no longer requested"), "{out}");
+        c.note = Some("no longer requested".into());
+        assert!(text(&card_lines(&c, 40, false, 0)).contains("no longer requested"));
     }
 
     #[test]
