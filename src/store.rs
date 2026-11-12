@@ -256,7 +256,7 @@ impl Store {
                 | (Active, Review | Parked | Queue | Dropped)
                 | (Parked, Active | Queue | Dropped)
                 | (Review, Active | Done | Dropped)
-                | (Active, Shelved)
+                | (Active | Review, Shelved)
                 | (Shelved, Active | Dropped)
         ) || (task.kind == "review" && matches!((from, to), (Queue | Active | Parked, Done))))
         {
@@ -265,7 +265,7 @@ impl Store {
         if to == Active && task.kind != "review" && self.active_count()? >= max_active {
             return Ok(Err(Refusal::CapFull { max: max_active }));
         }
-        if matches!((from, to), (Active, Review | Shelved)) {
+        if matches!((from, to), (Active, Review | Shelved) | (Review, Shelved)) {
             let missing = gate(self, &task);
             if !missing.is_empty() {
                 return Ok(Err(Refusal::Gate(missing)));
@@ -622,7 +622,7 @@ mod tests {
             (Active, Review), (Active, Parked), (Active, Queue), (Active, Dropped),
             (Parked, Active), (Parked, Queue), (Parked, Dropped),
             (Review, Active), (Review, Done), (Review, Dropped),
-            (Active, Shelved), (Shelved, Active), (Shelved, Dropped),
+            (Active, Shelved), (Review, Shelved), (Shelved, Active), (Shelved, Dropped),
         ];
         let s = Store::open_in_memory();
         for &from in Stage::ALL {

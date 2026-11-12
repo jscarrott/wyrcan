@@ -6,11 +6,11 @@ use crate::store::{NewTask, Store};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. [--kind K] [--link URL] | next | list [--stage S].. | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] [--bookmark ROOT=NAME].. | edit TASK_ID [--title T] [--desc D] [--dir DIR] [--label L].. [--kind K] [--link URL] | requeue TASK_ID | drop TASK_ID | closed [--days N] | export | sync";
+const USAGE: &str = "usage: claude-board add TITLE [--desc D] [--dir DIR] [--label L].. [--kind K] [--link URL] | next | list [--stage S].. | claim SESSION TASK_ID CWD | register-pen SESSION CWD | status SESSION | gate SESSION [--pr ROOT=URL].. [--no-pr ROOT=REASON].. [--explainer FILE] [--summary TEXT] [--bookmark ROOT=NAME].. | edit TASK_ID [--title T] [--desc D] [--dir DIR] [--label L].. [--kind K] [--link URL] | shelve TASK_ID [--bookmark ROOT=NAME].. | requeue TASK_ID | drop TASK_ID | closed [--days N] | export | sync";
 
 pub fn run(args: &[String], cfg: &Config) -> Result<i32> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    if !matches!(a.first(), Some(&("add" | "next" | "list" | "claim" | "register-pen" | "status" | "gate" | "edit" | "requeue" | "drop" | "closed" | "export" | "sync"))) {
+    if !matches!(a.first(), Some(&("add" | "next" | "list" | "claim" | "register-pen" | "status" | "gate" | "edit" | "shelve" | "requeue" | "drop" | "closed" | "export" | "sync"))) {
         eprintln!("{USAGE}");
         return Ok(2);
     }
@@ -261,6 +261,30 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
             store.update_task(id, title, val("--desc").unwrap_or(&t.description), dir, &labels)?;
             store.set_kind(id, kind, link)?;
             ok(task_full_json(store, &store.task(id)?.expect("just read"))?.to_string())
+        }
+        "shelve" => {
+            let (pos, fl) = parse(rest, &["--bookmark"])?;
+            let [id] = pos[..] else { return usage("shelve takes one TASK_ID") };
+            let Ok(id) = id.parse::<i64>() else { return usage("TASK_ID must be a number") };
+            if fl.iter().any(|f| !f.1.split_once('=').is_some_and(|(r, n)| !r.is_empty() && !n.is_empty())) {
+                return usage("--bookmark wants ROOT=NAME");
+            }
+            let Some(t) = store.task(id)? else { return refused(Refusal::NoSuchTask) };
+            if t.kind == "review" {
+                return Ok((1, "A review can't be shelved.".into()));
+            }
+            // Gated as the experiment it becomes; the kind only changes once the move succeeds.
+            let checks = cfg.gate_checks("experiment");
+            match store.transition(id, Stage::Shelved, cfg.max_active, &|s, t| gate::evaluate(s, t, &checks, verify))? {
+                Ok(()) => {}
+                Err(Refusal::Gate(m)) => return Ok((1, format!("Can't shelve yet. Missing:\n- {}", m.join("\n- ")))),
+                Err(r) => return refused(r),
+            }
+            store.set_kind(id, "experiment", t.link.as_deref())?;
+            for f in &fl {
+                store.add_event(id, "bookmark", f.1)?;
+            }
+            ok("Shelved.".into())
         }
         "requeue" | "drop" => {
             let [id] = rest[..] else { return usage(&format!("{} takes TASK_ID", a[0])) };
@@ -569,6 +593,32 @@ mod tests {
         assert_eq!((t.description.as_str(), t.dir), ("new", None));
         assert_eq!(go(&s, &c, &["edit", "999", "--title", "x"], true).0, 1);
         assert!(exec(&s, &["edit", &a.to_string(), "--title", " "], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
+    }
+
+    #[test]
+    fn shelve_turns_a_finished_task_into_a_shelved_experiment() {
+        let (c, dir) = cfg(3);
+        let s = Store::open_in_memory();
+        let id = claimed(&s, &c);
+        s.transition(id, Stage::Review, 3, &|_, _| vec![]).unwrap().unwrap();
+        let sid = id.to_string();
+        let (code, msg) = go(&s, &c, &["shelve", &sid], true);
+        assert!(code == 1 && msg.contains("no explainer"), "{msg}");
+        assert_eq!((stage(&s, id), s.task(id).unwrap().unwrap().kind.as_str()), (Stage::Review, "default"));
+        assert!(exec(&s, &["shelve", &sid, "--bookmark", "nope"], &c, &|_| true).unwrap_err().downcast_ref::<Usage>().is_some());
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("e.html");
+        std::fs::write(&f, "<p>x</p>").unwrap();
+        s.set_explainer(id, f.to_str().unwrap()).unwrap();
+        assert_eq!(go(&s, &c, &["shelve", &sid, "--bookmark", "/r/app=feature/x"], true), (0, "Shelved.".into()));
+        let t = s.task(id).unwrap().unwrap();
+        assert_eq!((t.stage, t.kind.as_str()), (Stage::Shelved, "experiment"));
+        assert_eq!(s.bookmarks(id).unwrap(), vec![("/r/app".to_string(), "feature/x".to_string())]);
+        // Reviews are never experiments.
+        let r: i64 = go(&s, &c, &["add", "r"], true).1.parse().unwrap();
+        s.set_kind(r, "review", Some("https://github.com/o/r/pull/1")).unwrap();
+        assert_eq!(go(&s, &c, &["shelve", &r.to_string()], true).0, 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

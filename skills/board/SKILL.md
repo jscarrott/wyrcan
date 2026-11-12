@@ -14,6 +14,7 @@ Find ids first: `claude-board list` prints open tasks (`queue`, `active`, `revie
 | Add a task to the Queue | `claude-board add "TITLE" --desc "D" --dir DIR --label L --label L2 --kind K --link URL` → prints the new id |
 | Change a task in place (keeps id, stage, position) | `claude-board edit ID --title T --desc D --dir DIR --label L.. --kind K --link URL` — only the flags given change; any `--label` replaces the whole set; `--dir ""` clears it; `--link ""` clears the link |
 | Release an Active or Parked task back to the bottom of the Queue | `claude-board requeue ID` |
+| Shelve an Active or Review task as a finished experiment (needs its explainer; keeps id) | `claude-board shelve ID --bookmark '<root>=<name>'..` — makes it kind `experiment`; one `--bookmark` per repo so it can be resumed |
 | Drop a task (closes it for good) | `claude-board drop ID` — ask the user first |
 | Everything, including sessions and events | `claude-board export` |
 
