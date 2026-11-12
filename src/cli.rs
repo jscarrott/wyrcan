@@ -152,7 +152,7 @@ fn exec(store: &Store, a: &[&str], cfg: &Config, verify: &PrVerifier) -> Result<
             }
             let mut stages = vec![];
             for f in &fl {
-                let Some(st) = Stage::from_str(f.1) else { return usage("--stage is one of queue, active, review, parked, done, dropped") };
+                let Some(st) = Stage::from_str(f.1) else { return usage("--stage is one of queue, active, review, shelved, parked, done, dropped") };
                 stages.push(st);
             }
             // Closed tasks pile up, so they show only when asked for.
@@ -352,6 +352,7 @@ mod tests {
         std::fs::write(&ex, "<p>x</p>").unwrap();
         let g = go(&s, &c, &["gate", "s", "--pr", "/r/app=https://x/1", "--explainer", ex.to_str().unwrap(), "--bookmark", "/r/app=exp/1-try-sled"], true);
         assert_eq!(g, (0, "Shelved.".into()));
+        assert_eq!(stage(&s, e.parse().unwrap()), Stage::Shelved);
         let j: Value = serde_json::from_str(&go(&s, &c, &["claim", "s2", &e, "/w"], true).1).unwrap();
         assert_eq!(stage(&s, e.parse().unwrap()), Stage::Active);
         assert_eq!(j["kind"], "default");
