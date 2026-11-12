@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS prs(
     task_id INTEGER NOT NULL, root TEXT NOT NULL, url TEXT, waiver TEXT,
     state TEXT NOT NULL DEFAULT 'unknown', reviewers TEXT NOT NULL DEFAULT '', UNIQUE(task_id, root));
 CREATE TABLE IF NOT EXISTS events(
-    id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');";
+    id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS review_parents(repo TEXT PRIMARY KEY, parent TEXT NOT NULL);";
 
 /// Switching a file to WAL needs a lock the busy timeout doesn't reliably wait for, so retry
 /// within the caller's budget; failing that, carry on in the current journal mode.
@@ -464,6 +465,22 @@ impl Store {
     pub fn replace_event(&self, task_id: i64, kind: &str, detail: &str) -> Result<()> {
         self.conn.execute("DELETE FROM events WHERE task_id=?1 AND kind=?2", params![task_id, kind])?;
         self.add_event(task_id, kind, detail)
+    }
+
+    /// The local jj repo that review workspaces for `repo` (a repo name) branch from.
+    pub fn set_review_parent(&self, repo: &str, parent: &str) -> Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO review_parents(repo,parent) VALUES(?1,?2)", params![repo, parent])?;
+        Ok(())
+    }
+
+    pub fn review_parent(&self, repo: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT parent FROM review_parents WHERE repo=?1", [repo], |r| r.get(0)).optional()?)
+    }
+
+    pub fn review_parents(&self) -> Result<Vec<String>> {
+        let mut q = self.conn.prepare("SELECT parent FROM review_parents")?;
+        let rows = q.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     pub fn events(&self, task_id: i64) -> Result<Vec<Event>> {

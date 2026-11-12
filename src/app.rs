@@ -210,6 +210,8 @@ pub enum Effect {
     Dismiss(String),
     /// Saves the directory typed into the prompt; the Start/Resume after it then goes ahead.
     SetDir { id: i64, dir: String },
+    /// Saves the local jj repo typed for a review's GitHub repo; the Start after it then makes the workspace.
+    SetReviewParent { id: i64, repo: String, dir: String },
     Show(i64),
     Enter(i64),
     Fullscreen(i64),
@@ -235,6 +237,7 @@ pub struct Pending {
 enum PromptKind {
     Dir { id: i64, resume: bool },
     Adopt { session: String },
+    ReviewParent { id: i64, repo: String },
 }
 
 /// A one-line text box in the footer.
@@ -248,6 +251,10 @@ pub struct Prompt {
 impl Prompt {
     pub fn dir(id: i64, resume: bool, title: &str, prefill: String) -> Prompt {
         Prompt { label: format!("Directory for '{title}':"), text: prefill, kind: PromptKind::Dir { id, resume } }
+    }
+
+    pub fn review_parent(id: i64, repo: &str) -> Prompt {
+        Prompt { label: format!("Local jj repo for '{repo}':"), text: "~/git-work/".into(), kind: PromptKind::ReviewParent { id, repo: repo.into() } }
     }
 }
 
@@ -739,6 +746,7 @@ impl App {
                         vec![Effect::SetDir { id, dir: text }, if resume { Effect::Resume(id) } else { Effect::Start(id) }]
                     }
                     PromptKind::Adopt { session } => vec![Effect::Adopt { session, title: text }],
+                    PromptKind::ReviewParent { id, repo } => vec![Effect::SetReviewParent { id, repo, dir: text }, Effect::Start(id)],
                 };
             }
             _ => {}
@@ -1047,6 +1055,16 @@ pub(crate) mod tests {
         ap.confirm = None;
         ap.prompt = Some(Prompt::dir(1, false, "t", String::new()));
         assert_eq!(ap.on_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), [Effect::Quit]);
+    }
+
+    #[test]
+    fn review_parent_prompt_saves_then_starts() {
+        let s = Store::open_in_memory();
+        let mut ap = app(&s, &cfg(3));
+        ap.prompt = Some(Prompt::review_parent(7, "delta"));
+        ap.on_key_event(key('d'));
+        let e = ap.on_key_event(KeyCode::Enter.into());
+        assert_eq!(e, [Effect::SetReviewParent { id: 7, repo: "delta".into(), dir: "~/git-work/d".into() }, Effect::Start(7)]);
     }
 
     #[test]

@@ -1,10 +1,12 @@
-//! Parsers for `gh` output used to import PRs awaiting the user's review. Pure: no process calls.
+//! Imports PRs awaiting the user's review, moves them by what GitHub says, and makes and removes their jj workspaces.
 use crate::config::Config;
 use crate::model::{AgentState, PrState, Stage};
 use crate::pr;
 use crate::store::{NewTask, Store};
+use crate::zellij::Runner;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, PartialEq)]
 pub struct Found {
@@ -69,6 +71,71 @@ pub fn parse_remote(url: &str) -> Option<String> {
     (!o.is_empty() && !r.is_empty() && !r.contains('/')).then(|| rest.to_string())
 }
 
+/// `https://host/o/r/pull/7` -> ("r", 7); `None` unless the repo name is plain enough to put in a path.
+pub fn pr_ref(link: &str) -> Option<(&str, u64)> {
+    let (base, n) = link.strip_prefix("https://")?.rsplit_once("/pull/")?;
+    let repo = base.rsplit('/').next()?;
+    let plain = !repo.is_empty() && !repo.starts_with(['-', '.']) && repo.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    plain.then_some((repo, n.parse().ok()?))
+}
+
+pub fn workspace_path(home: &Path, repo_name: &str, number: u64) -> PathBuf {
+    home.join("git-work").join(format!("{repo_name}-{number}-review"))
+}
+
+/// Fetch the PR's head from origin, then add workspace `name` at it in `path`; both in the parent repo.
+pub fn workspace_cmds(parent: &str, path: &str, name: &str, head: &str) -> Vec<Vec<String>> {
+    let jj = |a: &[&str]| ["jj", "-R", parent].iter().chain(a).map(|s| s.to_string()).collect();
+    vec![jj(&["git", "fetch", "--branch", head]), jj(&["workspace", "add", "--name", name, "-r", &format!("{head}@origin"), path])]
+}
+
+/// True only for the folder the board recorded making: a real directory (no symlink) holding `.jj`,
+/// directly under `home/git-work`, named `*-review`, with no `..`. `apply` also refuses registered parents.
+pub fn removable(path: &Path, recorded: Option<&str>, home: &Path) -> bool {
+    let is_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    recorded.is_some()
+        && recorded == path.to_str()
+        && path.is_absolute()
+        && path.components().all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+        && path.parent() == Some(&home.join("git-work"))
+        && name.ends_with("-review")
+        && !name.starts_with('-')
+        && is_dir(path)
+        && is_dir(&path.join(".jj"))
+}
+
+/// Deletes a finished review's workspace, once jj in its parent repo confirms it and forgets it.
+/// Anything doubtful leaves the folder and says why in the task's "workspace" event.
+fn remove_workspace(store: &Store, id: i64, link: &str, run: &dyn Runner, home: &Path) -> Result<()> {
+    let Some(recorded) = store.events(id)?.into_iter().rfind(|e| e.kind == "workspace").map(|e| e.detail) else { return Ok(()) };
+    let path = Path::new(&recorded);
+    let canon = |p: &Path| std::fs::canonicalize(p).ok();
+    let parents = store.review_parents()?;
+    if !removable(path, Some(&recorded), home) || parents.iter().any(|p| Path::new(p) == path || canon(Path::new(p)) == canon(path)) {
+        return Ok(());
+    }
+    let left = |why: String| store.replace_event(id, "workspace", &format!("left {recorded}: {why}"));
+    let Some(parent) = pr_ref(link).map(|(repo, _)| store.review_parent(repo)).transpose()?.flatten() else {
+        return left("no parent repo recorded".into());
+    };
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let jj = |a: &[&str]| run.run(&["jj", "-R", &parent].iter().chain(a).map(|s| s.to_string()).collect::<Vec<_>>());
+    // `forget` succeeds even for an unknown name, so first have jj confirm this folder is that workspace.
+    match jj(&["workspace", "root", "--name", name]) {
+        Ok(root) if canon(Path::new(root.trim())).is_some_and(|r| Some(r) == canon(path)) => {}
+        Ok(root) => return left(format!("jj puts {name} at {}", root.trim())),
+        Err(e) => return left(format!("{e:#}")),
+    }
+    if let Err(e) = jj(&["workspace", "forget", name]) {
+        return left(format!("{e:#}"));
+    }
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        return left(e.to_string());
+    }
+    Ok(())
+}
+
 /// One poll of GitHub. `None` means that `gh` call failed.
 pub struct Poll {
     pub requested: Option<Vec<Found>>,
@@ -121,8 +188,9 @@ pub fn fetch(store: &Store, cfg: &Config) -> Poll {
 }
 
 /// Import new PRs as review tasks, then move known ones by what GitHub says. Missing data never moves anything.
-pub fn apply(store: &Store, poll: &Poll) -> Result<()> {
-    let go = |id: i64, to: Stage| store.transition(id, to, usize::MAX, &|_, _| vec![]).map(|_| ());
+/// A review that moves to Done or Dropped loses its workspace under `home/git-work`.
+pub fn apply(store: &Store, poll: &Poll, run: &dyn Runner, home: &Path) -> Result<()> {
+    let go = |id: i64, to: Stage| store.transition(id, to, usize::MAX, &|_, _| vec![]).map(|r| r.is_ok());
     let sources = [(&poll.requested, "requested"), (&poll.open_in_repos, "not requested")];
     for (found, why) in sources {
         for f in found.iter().flatten().filter(|f| !f.repo.is_empty() && f.number != 0) {
@@ -155,8 +223,11 @@ pub fn apply(store: &Store, poll: &Poll) -> Result<()> {
         }
         let Some(pr) = pr else { continue };
         match pr.state {
-            PrState::Merged => go(t.id, Stage::Done)?,
-            PrState::Closed => go(t.id, Stage::Dropped)?,
+            PrState::Merged | PrState::Closed => {
+                if go(t.id, if pr.state == PrState::Merged { Stage::Done } else { Stage::Dropped })? {
+                    remove_workspace(store, t.id, url, run, home)?;
+                }
+            }
             _ => {
                 let ended = store.current_session(t.id)?.is_none_or(|s| s.state == AgentState::Ended);
                 if stage == Stage::Active && pr.reviewed_by.contains(&poll.me) && ended {
@@ -237,10 +308,13 @@ mod tests {
     fn stage(s: &Store, id: i64) -> Stage {
         s.task(id).unwrap().unwrap().stage
     }
+    fn none() -> Jj {
+        Jj { calls: Default::default(), root: String::new(), fail: false }
+    }
     fn imported(req: bool) -> (Store, i64) {
         let s = Store::open_in_memory();
         let f = vec![found(U, "o/r")];
-        apply(&s, &poll(req.then(|| f), None, vec![])).unwrap();
+        apply(&s, &poll(req.then(|| f), None, vec![]), &none(), Path::new("/nonexistent")).unwrap();
         let id = s.review_task(U).unwrap().unwrap().id;
         (s, id)
     }
@@ -260,14 +334,14 @@ mod tests {
     #[test]
     fn open_only_pr_is_not_requested() {
         let s = Store::open_in_memory();
-        apply(&s, &poll(Some(vec![]), Some(vec![found(U, "o/r")]), vec![])).unwrap();
+        apply(&s, &poll(Some(vec![]), Some(vec![found(U, "o/r")]), vec![]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!(ev(&s, s.review_task(U).unwrap().unwrap().id), "not requested");
     }
 
     #[test]
     fn same_pr_twice_makes_one_task() {
         let s = Store::open_in_memory();
-        apply(&s, &poll(Some(vec![found(U, "o/r")]), Some(vec![found(U, "o/r")]), vec![])).unwrap();
+        apply(&s, &poll(Some(vec![found(U, "o/r")]), Some(vec![found(U, "o/r")]), vec![]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!(s.tasks().unwrap().len(), 1);
         assert_eq!(ev(&s, s.tasks().unwrap()[0].id), "requested");
     }
@@ -277,7 +351,7 @@ mod tests {
         let s = Store::open_in_memory();
         let mut z = found(U, "o/r");
         z.number = 0;
-        apply(&s, &poll(Some(vec![z, found("https://x/2", "")]), None, vec![])).unwrap();
+        apply(&s, &poll(Some(vec![z, found("https://x/2", "")]), None, vec![]), &none(), Path::new("/nonexistent")).unwrap();
         assert!(s.tasks().unwrap().is_empty());
     }
 
@@ -287,7 +361,7 @@ mod tests {
         go(&s, id, Stage::Active);
         go(&s, id, Stage::Parked);
         s.replace_event(id, "review", "no longer requested").unwrap();
-        apply(&s, &poll(Some(vec![found(U, "o/r")]), None, vec![])).unwrap();
+        apply(&s, &poll(Some(vec![found(U, "o/r")]), None, vec![]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!((stage(&s, id), ev(&s, id).as_str()), (Stage::Queue, "requested"));
     }
 
@@ -295,9 +369,9 @@ mod tests {
     fn dropped_request_is_noted_unless_reviewed() {
         let (s, id) = imported(true);
         let p = |by: &[&str]| poll(Some(vec![]), None, vec![(U, pr(PrState::Waiting, by))]);
-        apply(&s, &p(&["me"])).unwrap();
+        apply(&s, &p(&["me"]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!(ev(&s, id), "requested");
-        apply(&s, &p(&[])).unwrap();
+        apply(&s, &p(&[]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!(ev(&s, id), "no longer requested");
     }
 
@@ -305,7 +379,7 @@ mod tests {
     fn merged_is_done_and_closed_is_dropped() {
         for (st, want) in [(PrState::Merged, Stage::Done), (PrState::Closed, Stage::Dropped)] {
             let (s, id) = imported(true);
-            apply(&s, &poll(None, None, vec![(U, pr(st, &[]))])).unwrap();
+            apply(&s, &poll(None, None, vec![(U, pr(st, &[]))]), &none(), Path::new("/nonexistent")).unwrap();
             assert_eq!(stage(&s, id), want);
         }
     }
@@ -314,7 +388,7 @@ mod tests {
     fn finished_task_is_not_reimported_or_revived() {
         let (s, id) = imported(true);
         go(&s, id, Stage::Done);
-        apply(&s, &poll(Some(vec![found(U, "o/r")]), None, vec![])).unwrap();
+        apply(&s, &poll(Some(vec![found(U, "o/r")]), None, vec![]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!((s.tasks().unwrap().len(), stage(&s, id)), (1, Stage::Done));
     }
 
@@ -325,7 +399,7 @@ mod tests {
         let p = poll(None, None, vec![(U, pr(PrState::Waiting, &["me"]))]);
         s.link_session("s", id, "/w").unwrap();
         s.end_session("s").unwrap();
-        apply(&s, &p).unwrap();
+        apply(&s, &p, &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!(stage(&s, id), Stage::Parked);
     }
 
@@ -333,7 +407,7 @@ mod tests {
     fn reviewed_active_task_with_no_session_parks() {
         let (s, id) = imported(true);
         go(&s, id, Stage::Active);
-        apply(&s, &poll(None, None, vec![(U, pr(PrState::Waiting, &["me"]))])).unwrap();
+        apply(&s, &poll(None, None, vec![(U, pr(PrState::Waiting, &["me"]))]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!(stage(&s, id), Stage::Parked);
     }
 
@@ -343,8 +417,122 @@ mod tests {
         go(&s, id, Stage::Active);
         s.link_session("s", id, "/w").unwrap();
         s.touch_session(crate::store::SessionUpdate { id: "s", cwd: "/w", state: AgentState::Waiting, zellij_session: None, zellij_pane: None }, false).unwrap();
-        apply(&s, &poll(None, None, vec![(U, pr(PrState::Waiting, &["me"]))])).unwrap();
+        apply(&s, &poll(None, None, vec![(U, pr(PrState::Waiting, &["me"]))]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!(stage(&s, id), Stage::Active);
+    }
+
+    #[test]
+    fn workspace_cmds_fetch_then_add() {
+        let path = workspace_path(Path::new("/h"), "delta", 812);
+        assert_eq!(path, Path::new("/h/git-work/delta-812-review"));
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            workspace_cmds("/h/git-work/delta", "/h/git-work/delta-812-review", "delta-812-review", "feat/x"),
+            vec![
+                s(&["jj", "-R", "/h/git-work/delta", "git", "fetch", "--branch", "feat/x"]),
+                s(&["jj", "-R", "/h/git-work/delta", "workspace", "add", "--name", "delta-812-review", "-r", "feat/x@origin", "/h/git-work/delta-812-review"]),
+            ]
+        );
+    }
+
+    /// A fake home with git-work/{delta (parent), delta-812-review (workspace), plain, link-review -> workspace} and other-review outside.
+    fn fake_home(tag: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("wyrcan-ws-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        let gw = home.join("git-work");
+        for d in ["delta/.jj", "delta-812-review/.jj", "plain/.jj", "plain-review", "../other-review/.jj"] {
+            std::fs::create_dir_all(gw.join(d)).unwrap();
+        }
+        std::os::unix::fs::symlink(gw.join("delta-812-review"), gw.join("link-review")).unwrap();
+        home
+    }
+
+    #[test]
+    fn removable_refuses_everything_but_the_recorded_review_folder() {
+        let home = fake_home("rm");
+        let gw = home.join("git-work");
+        let ok = |p: &Path| removable(p, p.to_str(), &home);
+        assert!(ok(&gw.join("delta-812-review")));
+        assert!(!ok(&gw.join("delta")), "the parent repo");
+        assert!(!ok(&gw.join("link-review")), "a symlink");
+        assert!(!ok(&home.join("other-review")), "outside git-work");
+        assert!(!ok(&gw.join("plain")), "no -review suffix");
+        assert!(!ok(&gw.join("plain-review")), "not a jj workspace");
+        assert!(!ok(&gw.join("delta/../delta-812-review")), "a .. component");
+        assert!(!ok(&gw.join("missing-review")), "not there");
+        assert!(!ok(&gw), "git-work itself");
+        assert!(!removable(&gw.join("delta-812-review"), None, &home), "nothing recorded");
+        assert!(!removable(&gw.join("delta-812-review"), Some("/elsewhere-review"), &home), "recorded something else");
+        assert!(!removable(Path::new("git-work/delta-812-review"), Some("git-work/delta-812-review"), Path::new("")), "empty home");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Records commands; `workspace root` answers `root`, and `forget` fails when `fail` is set.
+    struct Jj {
+        calls: std::cell::RefCell<Vec<String>>,
+        root: String,
+        fail: bool,
+    }
+    impl Runner for Jj {
+        fn run(&self, cmd: &[String]) -> Result<String> {
+            let line = cmd.join(" ");
+            self.calls.borrow_mut().push(line.clone());
+            if line.contains("workspace root") {
+                return Ok(format!("{}\n", self.root));
+            }
+            if self.fail && line.contains("forget") {
+                anyhow::bail!("boom");
+            }
+            Ok(String::new())
+        }
+    }
+
+    /// An imported review task for `U` (repo `r`) whose workspace was recorded at `ws`, with parent `parent`.
+    fn with_workspace(ws: &Path, parent: &Path) -> (Store, i64) {
+        let (s, id) = imported(true);
+        s.set_review_parent("r", parent.to_str().unwrap()).unwrap();
+        s.add_event(id, "workspace", ws.to_str().unwrap()).unwrap();
+        (s, id)
+    }
+
+    #[test]
+    fn merged_review_forgets_and_deletes_its_workspace() {
+        let home = fake_home("merged");
+        let (ws, parent) = (home.join("git-work/delta-812-review"), home.join("git-work/delta"));
+        let (s, id) = with_workspace(&ws, &parent);
+        let jj = Jj { calls: Default::default(), root: ws.to_str().unwrap().into(), fail: false };
+        apply(&s, &poll(None, None, vec![(U, pr(PrState::Merged, &[]))]), &jj, &home).unwrap();
+        assert_eq!(stage(&s, id), Stage::Done);
+        let p = parent.to_str().unwrap();
+        assert_eq!(*jj.calls.borrow(), [format!("jj -R {p} workspace root --name delta-812-review"), format!("jj -R {p} workspace forget delta-812-review")]);
+        assert!(!ws.exists() && parent.exists());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn workspace_is_kept_when_forget_fails_or_it_is_not_the_parents() {
+        let home = fake_home("kept");
+        let (ws, parent) = (home.join("git-work/delta-812-review"), home.join("git-work/delta"));
+        // forget fails
+        let (s, id) = with_workspace(&ws, &parent);
+        let jj = Jj { calls: Default::default(), root: ws.to_str().unwrap().into(), fail: true };
+        apply(&s, &poll(None, None, vec![(U, pr(PrState::Closed, &[]))]), &jj, &home).unwrap();
+        assert_eq!(stage(&s, id), Stage::Dropped);
+        assert!(ws.exists());
+        let e = s.events(id).unwrap().into_iter().rfind(|e| e.kind == "workspace").unwrap().detail;
+        assert_eq!(e, format!("left {}: boom", ws.display()));
+        // jj says the workspace lives elsewhere: no forget, no delete
+        let (s, _) = with_workspace(&ws, &parent);
+        let jj = Jj { calls: Default::default(), root: "/elsewhere".into(), fail: false };
+        apply(&s, &poll(None, None, vec![(U, pr(PrState::Merged, &[]))]), &jj, &home).unwrap();
+        assert!(ws.exists() && !jj.calls.borrow().iter().any(|c| c.contains("forget")));
+        // the recorded folder is a registered parent: nothing runs
+        let (s, _) = with_workspace(&ws, &parent);
+        s.set_review_parent("other", ws.to_str().unwrap()).unwrap();
+        let jj = Jj { calls: Default::default(), root: ws.to_str().unwrap().into(), fail: false };
+        apply(&s, &poll(None, None, vec![(U, pr(PrState::Merged, &[]))]), &jj, &home).unwrap();
+        assert!(ws.exists() && jj.calls.borrow().is_empty());
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
@@ -352,7 +540,7 @@ mod tests {
         let (s, id) = imported(true);
         go(&s, id, Stage::Active);
         go(&s, id, Stage::Parked);
-        apply(&s, &poll(None, None, vec![])).unwrap();
+        apply(&s, &poll(None, None, vec![]), &none(), Path::new("/nonexistent")).unwrap();
         assert_eq!((stage(&s, id), ev(&s, id).as_str()), (Stage::Parked, "requested"));
     }
 }

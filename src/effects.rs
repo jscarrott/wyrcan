@@ -3,6 +3,7 @@ use crate::app::{App, CardKey, Effect, Prompt};
 use crate::config::Config;
 use crate::gate::{self, PrVerifier};
 use crate::model::{AgentState, Refusal, SessionKind, Stage, Task};
+use crate::reviews;
 use crate::store::{NewTask, Store};
 use crate::zellij::{Runner, Zellij};
 use anyhow::{bail, Context, Result};
@@ -132,6 +133,14 @@ pub fn handle(e: Effect, c: &Ctx, p: &mut Panes, app: &mut App) -> Result<()> {
             let t = c.task(id)?;
             c.store.update_task(id, &t.title, &t.description, Some(&dir), &t.labels)?;
         }
+        Effect::SetReviewParent { id, repo, dir } => {
+            let dir = crate::config::expand_home(&dir);
+            if !std::path::Path::new(&dir).join(".jj").is_dir() {
+                bail!("Not a jj repo: {dir}");
+            }
+            c.task(id)?;
+            c.store.set_review_parent(&repo, &dir)?;
+        }
         Effect::Park(id) => {
             // Parking works outside zellij too; there's just no pane to close.
             if c.move_to(id, Stage::Parked, app)? && c.zj.board().is_ok() {
@@ -225,12 +234,13 @@ fn open(c: &Ctx, p: &mut Panes, app: &mut App, id: i64, resume: bool) -> Result<
     let session = c.store.current_session(id)?.filter(|_| resume);
     // A resumed session has to run where it was started.
     let cwd = session.as_ref().map(|s| s.cwd.clone()).filter(|d| !d.is_empty()).or(t.dir.clone());
-    let Some(cwd) = cwd else {
-        let mut dirs: Vec<Task> = c.store.tasks()?.into_iter().filter(|o| o.id != id && o.dir.is_some()).collect();
-        dirs.sort_by_key(|o| -o.stage_at);
-        let recent = dirs.into_iter().next().and_then(|o| o.dir).unwrap_or_default();
-        app.prompt = Some(Prompt::dir(id, resume, &t.title, recent));
-        return Ok(());
+    let cwd = match cwd {
+        Some(d) => d,
+        None if t.kind == "review" => match review_workspace(c, app, &t)? {
+            Some(d) => d,
+            None => return Ok(()),
+        },
+        None => return ask_dir(c, app, &t, resume),
     };
     // Checked before the stage changes, so a board outside zellij can't start what it can't open.
     c.zj.board()?;
@@ -241,7 +251,7 @@ fn open(c: &Ctx, p: &mut Panes, app: &mut App, id: i64, resume: bool) -> Result<
     if let Some(x) = c.pane(p, id)? {
         return c.zj.show(c.run, &x);
     }
-    let next = format!("/next {id}");
+    let next = if t.kind == "review" { format!("/review-pr {id}") } else { format!("/next {id}") };
     let args = match &session {
         Some(s) => vec!["--resume", s.id.as_str()],
         None => vec![next.as_str()],
@@ -250,6 +260,56 @@ fn open(c: &Ctx, p: &mut Panes, app: &mut App, id: i64, resume: bool) -> Result<
     p.opened.insert(id, x.clone());
     p.live.push(x);
     Ok(())
+}
+
+/// Prefills the directory prompt with the most recently moved task's directory.
+fn ask_dir(c: &Ctx, app: &mut App, t: &Task, resume: bool) -> Result<()> {
+    let mut dirs: Vec<Task> = c.store.tasks()?.into_iter().filter(|o| o.id != t.id && o.dir.is_some()).collect();
+    dirs.sort_by_key(|o| -o.stage_at);
+    let recent = dirs.into_iter().next().and_then(|o| o.dir).unwrap_or_default();
+    app.prompt = Some(Prompt::dir(t.id, resume, &t.title, recent));
+    Ok(())
+}
+
+/// Makes a review task its own jj workspace at the PR's head under ~/git-work and points the task at it.
+/// `None`: it asked for the parent repo instead.
+fn review_workspace(c: &Ctx, app: &mut App, t: &Task) -> Result<Option<String>> {
+    let link = t.link.as_deref().unwrap_or_default();
+    let (repo, number) = reviews::pr_ref(link).with_context(|| format!("Can't read a PR from {link:?}."))?;
+    let home = crate::config::home();
+    let guess = home.join("git-work").join(repo);
+    let parent = match c.store.review_parent(repo)? {
+        Some(p) => p,
+        None if guess.join(".jj").is_dir() => {
+            let p = guess.to_string_lossy().into_owned();
+            c.store.set_review_parent(repo, &p)?;
+            p
+        }
+        None => {
+            app.prompt = Some(Prompt::review_parent(t.id, repo));
+            return Ok(None);
+        }
+    };
+    c.zj.board()?;
+    let cmd = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let json = c.run.run(&cmd(&["gh", "pr", "view", link, "--json", "headRefName"]))?;
+    let head = serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| v["headRefName"].as_str().map(String::from)).unwrap_or_default();
+    // The head goes into jj args and a revset: refuse anything unusual rather than quote it.
+    if head.is_empty() || head.starts_with('-') || !head.chars().all(|ch| ch.is_ascii_alphanumeric() || "/_.-".contains(ch)) {
+        bail!("Can't use the PR's head branch {head:?}.");
+    }
+    let path = reviews::workspace_path(&home, repo, number).to_string_lossy().into_owned();
+    let [fetch, add] = <[_; 2]>::try_from(reviews::workspace_cmds(&parent, &path, &format!("{repo}-{number}-review"), &head)).expect("two commands");
+    c.run.run(&fetch).with_context(|| format!("Can't fetch {head} from origin"))?;
+    // `jj git fetch` only warns about a missing branch, and a failed `workspace add` leaves a half-made workspace, so check first.
+    // shortcut: fork PRs aren't supported (head not on origin); add `gh pr checkout` in a colocated workspace if they come up.
+    if c.run.run(&cmd(&["jj", "-R", &parent, "log", "-r", &format!("{head}@origin"), "--no-graph", "-T", "commit_id"])).is_err() {
+        bail!("Can't fetch {head} from origin (fork PR?)");
+    }
+    c.run.run(&add)?;
+    c.store.add_event(t.id, "workspace", &path)?;
+    c.store.update_task(t.id, &t.title, &t.description, Some(&path), &t.labels)?;
+    Ok(Some(path))
 }
 
 /// Detached: Command::output() would block until the browser closes its inherited pipes.
@@ -304,7 +364,13 @@ mod tests {
         fn run(&self, cmd: &[String]) -> Result<String> {
             let line = cmd.join(" ");
             self.calls.borrow_mut().push(line.clone());
-            Ok(if line.contains("--name open") { "terminal_9\n".into() } else { String::new() })
+            Ok(if line.contains("--name open") {
+                "terminal_9\n".into()
+            } else if line.starts_with("gh pr view") {
+                r#"{"headRefName":"feat/x"}"#.into()
+            } else {
+                String::new()
+            })
         }
     }
     fn rec(live: &[&'static str]) -> Rec {
@@ -384,6 +450,45 @@ mod tests {
         run_all(vec![Effect::SetDir { id: q, dir: dir.clone() }, Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
         assert_eq!(s.task(q).unwrap().unwrap().dir.as_deref(), Some(dir.as_str()));
         assert_eq!(stage(&s, q), Stage::Active);
+    }
+
+    #[test]
+    fn start_review_creates_workspace_and_runs_review_pr() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&["terminal_0", "terminal_9"]));
+        let q = s.add_task(NewTask { title: "Add filter", description: "PR by @al", dir: None, labels: &["delta".into()], todoist_id: None }).unwrap();
+        s.set_kind(q, "review", Some("https://github.com/acme/delta/pull/812")).unwrap();
+        s.set_review_parent("delta", "/h/git-work/delta").unwrap();
+        let mut ap = app(&s, &c);
+        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
+        assert_eq!(ap.message, None);
+        let ws = crate::reviews::workspace_path(&crate::config::home(), "delta", 812).to_string_lossy().into_owned();
+        let calls = r.calls.borrow();
+        let at = |want: &str| calls.iter().position(|l| l.starts_with(want)).unwrap_or_else(|| panic!("no {want} in {calls:?}"));
+        let fetch = at("jj -R /h/git-work/delta git fetch --branch feat/x");
+        let add = at(&format!("jj -R /h/git-work/delta workspace add --name delta-812-review -r feat/x@origin {ws}"));
+        let open = at(&format!("{P} open"));
+        assert!(fetch < add && add < open, "{calls:?}");
+        assert!(calls[open].contains(&format!(r#""claude","/review-pr {q}"]"#)), "{}", calls[open]);
+        assert_eq!(s.task(q).unwrap().unwrap().dir.as_deref(), Some(ws.as_str()));
+        assert_eq!(s.events(q).unwrap().into_iter().rfind(|e| e.kind == "workspace").unwrap().detail, ws);
+        assert_eq!(stage(&s, q), Stage::Active);
+    }
+
+    #[test]
+    fn start_review_without_a_parent_asks_for_one() {
+        let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&[]));
+        let q = s.add_task(NewTask { title: "t", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+        s.set_kind(q, "review", Some("https://github.com/acme/no-such-repo-xyz/pull/3")).unwrap();
+        let mut ap = app(&s, &c);
+        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
+        assert_eq!(ap.prompt.as_ref().unwrap().label, "Local jj repo for 'no-such-repo-xyz':");
+        assert!(r.calls.borrow().is_empty());
+        let dir = std::env::temp_dir().join(format!("wyrcan-parent-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".jj")).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+        run_all(vec![Effect::SetReviewParent { id: q, repo: "no-such-repo-xyz".into(), dir: dir.clone() }], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
+        assert_eq!(s.review_parent("no-such-repo-xyz").unwrap(), Some(dir.clone()));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
