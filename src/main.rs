@@ -61,6 +61,10 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, store: &store:
     let mut last_read = Instant::now();
     let (tx, rx) = mpsc::channel::<(i64, Option<String>)>();
     let mut checking: HashSet<i64> = HashSet::new();
+    let (live_tx, live_rx) = mpsc::channel::<Vec<String>>();
+    if zj.board().is_ok() {
+        zellij::spawn_events(zj.bin.clone(), live_tx);
+    }
     spawn_poller();
     sync::spawn(cfg, tx.clone());
 
@@ -73,6 +77,9 @@ fn run(term: &mut ratatui::DefaultTerminal, cfg: &config::Config, store: &store:
         }
         if done {
             refresh(&mut app, store, cfg);
+        }
+        if let Some(live) = live_rx.try_iter().last() {
+            panes.set_live(live);
         }
         if last_read.elapsed() >= Duration::from_secs(1) {
             if let Err(e) = effects::tick(&ctx, &mut panes) {

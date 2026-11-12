@@ -1,10 +1,9 @@
+//! Pane control through wyrcan's bundled plugin (`wyrcan/plugin`): one `wyrcan pipe` call per action,
+//! plus a long-lived `events` pipe that reports the live panes whenever they change.
 use crate::model::Session;
 use anyhow::{bail, Context, Result};
-
-/// shortcut: unverified against a live zellij client; Task 10's run-through must check Alt b.
-pub const RETURN_KEYBIND: &str = r#"shared_except "locked" {
-    bind "Alt b" { ToggleFocusFullscreen; MoveFocus "Left"; }
-}"#;
+use std::io::BufRead;
+use std::process::{Command, Stdio};
 
 pub trait Runner {
     /// Runs the command and returns its stdout.
@@ -16,9 +15,12 @@ pub struct ShellRunner;
 impl Runner for ShellRunner {
     fn run(&self, cmd: &[String]) -> Result<String> {
         let (prog, args) = cmd.split_first().context("empty command")?;
-        let out = std::process::Command::new(prog).args(args).output().with_context(|| format!("running {prog}"))?;
+        // A null stdin: `wyrcan pipe` would otherwise wait for more input on a piped stdin.
+        let out = Command::new(prog).args(args).stdin(Stdio::null()).output().with_context(|| format!("running {prog}"))?;
         if !out.status.success() {
-            bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+            // The plugin reports errors on stdout.
+            let (e, o) = (String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
+            bail!("{}", if e.trim().is_empty() { o.trim() } else { e.trim() });
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -27,40 +29,41 @@ impl Runner for ShellRunner {
 pub struct Zellij {
     pub session: Option<String>,
     pub board_pane: Option<String>,
+    /// The wyrcan binary the board runs in, from `$WYRCAN`.
+    pub bin: String,
 }
 
-fn argv(parts: &[&str]) -> Vec<String> {
-    parts.iter().map(|s| s.to_string()).collect()
+fn pipe_cmd(bin: &str, name: &str, pane: Option<&str>, payload: Option<&str>) -> Vec<String> {
+    let mut v: Vec<String> = [bin, "pipe", "--plugin", "zellij:wyrcan", "--name", name].iter().map(|s| s.to_string()).collect();
+    if let Some(p) = pane {
+        v.extend(["--args".into(), format!("pane={p}")]);
+    }
+    if let Some(p) = payload {
+        v.extend(["--".into(), p.into()]);
+    }
+    v
 }
 
 impl Zellij {
+    /// Inside wyrcan only: stock zellij has no plugin to talk to.
     pub fn from_env() -> Zellij {
-        let inside = std::env::var_os("ZELLIJ").is_some();
+        let bin = std::env::var("WYRCAN").unwrap_or_default();
+        let inside = std::env::var_os("ZELLIJ").is_some() && !bin.is_empty();
         let var = |k| std::env::var(k).ok().filter(|_| inside);
-        Zellij { session: var("ZELLIJ_SESSION_NAME"), board_pane: var("ZELLIJ_PANE_ID").map(|n| format!("terminal_{n}")) }
+        Zellij { session: var("ZELLIJ_SESSION_NAME"), board_pane: var("ZELLIJ_PANE_ID").map(|n| format!("terminal_{n}")), bin }
     }
 
-    /// The board's pane; errors "not inside zellij" when there's none.
+    /// The board's pane; errors "not inside wyrcan" when there's none.
     pub fn board(&self) -> Result<&str> {
         match (&self.session, &self.board_pane) {
             (Some(_), Some(b)) => Ok(b),
-            _ => bail!("not inside zellij"),
+            _ => bail!("not inside wyrcan (start the board with `wyrcan`)"),
         }
     }
 
-    fn act(&self, r: &dyn Runner, parts: &[&str]) -> Result<String> {
+    fn pipe(&self, r: &dyn Runner, name: &str, pane: Option<&str>, payload: Option<&str>) -> Result<String> {
         self.board()?;
-        r.run(&[&["zellij", "action"][..], parts].concat().iter().map(|s| s.to_string()).collect::<Vec<_>>())
-    }
-
-    pub fn live_panes(&self, r: &dyn Runner) -> Result<Vec<String>> {
-        let out = self.act(r, &["list-panes"])?;
-        Ok(out
-            .lines()
-            .filter_map(|l| l.split_whitespace().next())
-            .filter(|id| id.starts_with("terminal_"))
-            .map(String::from)
-            .collect())
+        Ok(r.run(&pipe_cmd(&self.bin, name, pane, payload))?.trim().to_string())
     }
 
     /// A session's pane, only if it's in this zellij session and still exists.
@@ -69,14 +72,7 @@ impl Zellij {
         (s.zellij_session.is_some() && s.zellij_session == self.session && live.iter().any(|l| l == pane)).then_some(pane)
     }
 
-    /// zellij refuses to focus the pane that already has focus; that is the state we wanted.
-    fn focus(&self, r: &dyn Runner, pane: &str) -> Result<()> {
-        match self.act(r, &["focus-pane-id", pane]) {
-            Err(e) if !e.to_string().contains("already focused") => Err(e),
-            _ => Ok(()),
-        }
-    }
-
+    /// Opens Claude in a pane beside the board (joining `stack` if any) without taking focus.
     pub fn open(
         &self,
         r: &dyn Runner,
@@ -91,56 +87,75 @@ impl Zellij {
         self.open_with(r, name, cwd, &cmd, stack)
     }
 
-    fn open_with(&self, r: &dyn Runner, name: &str, cwd: &str, cmd: &[String], stack: &[String]) -> Result<String> {
-        let board = self.board()?.to_string();
+    fn open_with(&self, r: &dyn Runner, name: &str, cwd: &str, argv: &[String], stack: &[String]) -> Result<String> {
         let name: String = name.chars().take(30).collect();
-        // `--name=` keeps a title starting with `-` from being read as a flag.
-        let mut run = argv(&["zellij", "run", &format!("--name={name}"), "--cwd", cwd, "--no-focus"]);
-        if stack.is_empty() {
-            run.extend(argv(&["--direction", "right"]));
+        let payload = serde_json::json!({ "name": name, "cwd": cwd, "argv": argv, "stack": stack }).to_string();
+        let id = self.pipe(r, "open", None, Some(&payload))?;
+        if !id.starts_with("terminal_") {
+            bail!("wyrcan opened no pane: {id}");
         }
-        run.push("--".into());
-        run.extend_from_slice(cmd);
-        let id = r.run(&run)?.trim().to_string();
-        if id.is_empty() {
-            bail!("zellij run returned no pane id");
-        }
-        if !stack.is_empty() {
-            let mut sp = argv(&["zellij", "action", "stack-panes", "--"]);
-            sp.extend(stack.iter().cloned());
-            sp.push(id.clone());
-            r.run(&sp)?;
-        }
-        self.focus(r, &board)?;
         Ok(id)
     }
 
     pub fn show(&self, r: &dyn Runner, pane: &str) -> Result<()> {
         self.enter(r, pane)?;
-        self.focus(r, self.board()?)
+        self.enter(r, self.board()?)
     }
 
     pub fn enter(&self, r: &dyn Runner, pane: &str) -> Result<()> {
-        self.focus(r, pane)
+        self.pipe(r, "focus", Some(pane), None).map(drop)
     }
 
     pub fn fullscreen(&self, r: &dyn Runner, pane: &str) -> Result<()> {
         self.enter(r, pane)?;
-        self.act(r, &["toggle-fullscreen", "--pane-id", pane]).map(drop)
+        self.pipe(r, "fullscreen", Some(pane), None).map(drop)
     }
 
     pub fn toggle_board_fullscreen(&self, r: &dyn Runner) -> Result<()> {
-        self.act(r, &["toggle-fullscreen", "--pane-id", self.board()?]).map(drop)
+        self.pipe(r, "fullscreen", Some(self.board()?), None).map(drop)
     }
 
     pub fn close(&self, r: &dyn Runner, pane: &str) -> Result<()> {
-        self.act(r, &["close-pane", "--pane-id", pane]).map(drop)
+        self.pipe(r, "close", Some(pane), None).map(drop)
     }
 
+    /// Types `text` and Enter into the pane; focus doesn't move.
     pub fn type_line(&self, r: &dyn Runner, pane: &str, text: &str) -> Result<()> {
-        self.act(r, &["write-chars", "--pane-id", pane, "--", text])?;
-        self.act(r, &["write", "--pane-id", pane, "13"]).map(drop)
+        self.pipe(r, "write", Some(pane), Some(text)).map(drop)
     }
+}
+
+/// `panes terminal_0 terminal_3` -> the live pane ids.
+fn parse_panes(line: &str) -> Option<Vec<String>> {
+    let mut words = line.split_whitespace();
+    (words.next() == Some("panes")).then(|| words.map(String::from).collect())
+}
+
+/// Sends the live panes each time they change, for as long as the board runs.
+/// A dropped stream (say, the plugin reloaded) is reopened after a second.
+pub fn spawn_events(bin: String, tx: std::sync::mpsc::Sender<Vec<String>>) {
+    std::thread::spawn(move || loop {
+        let child = Command::new(&bin)
+            .args(&pipe_cmd(&bin, "events", None, None)[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = child {
+            let out = child.stdout.take().expect("piped above");
+            for line in std::io::BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                if let Some(live) = parse_panes(&line) {
+                    if tx.send(live).is_err() {
+                        let _ = child.kill();
+                        return;
+                    }
+                }
+            }
+            let _ = child.wait();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    });
 }
 
 #[cfg(test)]
@@ -163,26 +178,10 @@ mod tests {
         }
     }
 
-    /// Fails every focus the way zellij does when the pane already has focus.
-    struct Focused;
-    impl Runner for Focused {
-        fn run(&self, cmd: &[String]) -> Result<String> {
-            if cmd.iter().any(|c| c == "focus-pane-id") {
-                bail!("Pane Terminal(0) is already focused");
-            }
-            Ok("terminal_4".into())
-        }
-    }
-
-    #[test]
-    fn focusing_the_focused_pane_is_not_an_error() {
-        assert_eq!(zj().open(&Focused, "t", "/w", "/c", &[], &[]).unwrap(), "terminal_4");
-        zj().show(&Focused, "terminal_4").unwrap();
-        zj().enter(&Focused, "terminal_0").unwrap();
-    }
+    const P: &str = "wyrcan pipe --plugin zellij:wyrcan --name";
 
     fn zj() -> Zellij {
-        Zellij { session: Some("s".into()), board_pane: Some("terminal_0".into()) }
+        Zellij { session: Some("s".into()), board_pane: Some("terminal_0".into()), bin: "wyrcan".into() }
     }
 
     fn sess(zs: Option<&str>, pane: Option<&str>) -> Session {
@@ -201,36 +200,40 @@ mod tests {
     }
 
     #[test]
-    fn open_first_pane_goes_right_and_refocuses_board() {
-        let r = Rec(Default::default(), "terminal_1\n".into());
-        let id = zj().open(&r, "t", "/w", "/c", &["/next"], &[]).unwrap();
-        assert_eq!(id, "terminal_1");
+    fn open_sends_argv_and_stack_as_json() {
+        let r = Rec(Default::default(), "terminal_5\n".into());
+        let stack = ["terminal_1".to_string(), "terminal_2".to_string()];
+        let id = zj().open(&r, &"n".repeat(40), "/w", "/c", &["/next 3"], &stack).unwrap();
+        assert_eq!(id, "terminal_5");
+        let calls = r.0.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][..7].join(" "), format!("{P} open --"));
+        let v: serde_json::Value = serde_json::from_str(&calls[0][7]).unwrap();
         assert_eq!(
-            r.calls(),
-            [
-                "zellij run --name=t --cwd /w --no-focus --direction right -- env CLAUDE_CONFIG_DIR=/c claude /next",
-                "zellij action focus-pane-id terminal_0",
-            ]
+            v,
+            serde_json::json!({"name": "n".repeat(30), "cwd": "/w", "argv": ["env", "CLAUDE_CONFIG_DIR=/c", "claude", "/next 3"], "stack": stack})
         );
     }
 
     #[test]
-    fn open_later_pane_joins_the_stack() {
-        let r = Rec(Default::default(), "terminal_5".into());
-        let stack = ["terminal_1".to_string(), "terminal_2".to_string()];
-        zj().open(&r, &"n".repeat(40), "/w", "/c", &[], &stack).unwrap();
-        let c = r.calls();
-        assert_eq!(c[0], format!("zellij run --name={} --cwd /w --no-focus -- env CLAUDE_CONFIG_DIR=/c claude", "n".repeat(30)));
-        assert_eq!(c[1], "zellij action stack-panes -- terminal_1 terminal_2 terminal_5");
-        assert_eq!(c[2], "zellij action focus-pane-id terminal_0");
+    fn open_without_pane_id_fails() {
+        let r = Rec(Default::default(), "error: zellij opened no pane\n".into());
+        let e = zj().open(&r, "t", "/w", "/c", &[], &[]).unwrap_err();
+        assert_eq!(e.to_string(), "wyrcan opened no pane: error: zellij opened no pane");
     }
 
     #[test]
-    fn open_without_pane_id_fails_before_stacking() {
-        let r = Rec(Default::default(), "\n".into());
-        let e = zj().open(&r, "t", "/w", "/c", &[], &["terminal_1".into()]).unwrap_err();
-        assert_eq!(e.to_string(), "zellij run returned no pane id");
-        assert_eq!(r.calls().len(), 1);
+    fn show_focuses_the_pane_then_the_board() {
+        let r = Rec::default();
+        zj().show(&r, "terminal_4").unwrap();
+        assert_eq!(r.calls(), [format!("{P} focus --args pane=terminal_4"), format!("{P} focus --args pane=terminal_0")]);
+    }
+
+    #[test]
+    fn type_line_writes_through_the_plugin() {
+        let r = Rec::default();
+        zj().type_line(&r, "terminal_1", "/wrap").unwrap();
+        assert_eq!(r.calls(), [format!("{P} write --args pane=terminal_1 -- /wrap")]);
     }
 
     #[test]
@@ -244,39 +247,28 @@ mod tests {
     }
 
     #[test]
-    fn live_panes_keeps_terminals_only() {
-        let out = "PANE_ID  TYPE  TITLE\nplugin_1  plugin  status-bar\nterminal_0  terminal  Pane #1\nterminal_1  terminal  a\n";
-        let r = Rec(Default::default(), out.into());
-        assert_eq!(zj().live_panes(&r).unwrap(), ["terminal_0", "terminal_1"]);
-    }
-
-    #[test]
-    fn stack_outside_zellij_is_refused() {
+    fn outside_wyrcan_is_refused() {
         let r = Rec::default();
-        let z = Zellij { session: None, board_pane: None };
-        assert!(z.show(&r, "terminal_1").unwrap_err().to_string().contains("not inside zellij"));
-        assert!(z.live_panes(&r).is_err());
+        let z = Zellij { session: None, board_pane: None, bin: String::new() };
+        assert!(z.show(&r, "terminal_1").unwrap_err().to_string().contains("not inside wyrcan"));
         assert!(r.calls().is_empty());
     }
 
     #[test]
-    fn type_line_sends_text_then_enter() {
-        let r = Rec::default();
-        zj().type_line(&r, "terminal_1", "/wrap").unwrap();
-        assert_eq!(
-            r.calls(),
-            ["zellij action write-chars --pane-id terminal_1 -- /wrap", "zellij action write --pane-id terminal_1 13"]
-        );
+    fn events_lines_parse() {
+        assert_eq!(parse_panes("panes terminal_0 terminal_3"), Some(vec!["terminal_0".into(), "terminal_3".into()]));
+        assert_eq!(parse_panes("panes"), Some(vec![]));
+        assert_eq!(parse_panes("error: x"), None);
     }
 
-    /// Hands-on check, run by a person inside zellij:
+    /// Hands-on check, run by a person in the board's pane inside wyrcan:
     /// cargo test stack_spike -- --ignored --nocapture
     #[test]
     #[ignore]
     fn stack_spike() {
         let z = Zellij::from_env();
-        if z.session.is_none() || z.board_pane.is_none() {
-            println!("stack_spike: not inside zellij, nothing done");
+        if z.board().is_err() {
+            println!("stack_spike: not inside wyrcan, nothing done");
             return;
         }
         let r = ShellRunner;
@@ -293,7 +285,7 @@ mod tests {
         z.type_line(&r, &stack[0], "hello").unwrap();
         z.fullscreen(&r, &stack[1]).unwrap();
         println!("LOOK FOR: two stacked panes beside the board; 'hello' + Enter arrived in spike-a;");
-        println!("spike-b is fullscreen; press Alt b (RETURN_KEYBIND) to get back to the board.");
+        println!("spike-b is fullscreen; press Alt b to get back to the board.");
         println!("Clean up: close the spike-a / spike-b panes ({stack:?}) yourself.");
     }
 }

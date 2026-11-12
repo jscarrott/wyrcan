@@ -49,7 +49,7 @@ Writer (`/pen`) sessions register themselves with a state file `kind: "pen"` and
 - **Lives in** `~/git-personal/experiments/claude-board/`, a subfolder of an existing git monorepo of experiments (remote `jscarrott/experiments`). The Rust crate, the hook script, the skills (`next`, `pen`) and the smoke test all live here.
 - **Install step.** One command (e.g. `claude-board install`) symlinks the hook script and skills into `~/.claude-work` and registers the hooks in `~/.claude-work/settings.json` without disturbing existing entries. It's idempotent.
 - **Todoist is the source of truth** for tasks and their order. The TUI is a view and a remote control. I still reorder Up next from my phone.
-- **Multiplexer: zellij** (0.45.1: `zellij run --cwd DIR -- cmd` prints the new pane id; `zellij action focus-pane-id`; `zellij action list-panes`). I'm leaning away from herdr, so the TUI targets zellij only. `/next pane` should work under zellij, keeping herdr only as a fallback if trivial.
+- **Multiplexer: zellij**, since 2026-11-12 as the board's own distribution, `wyrcan` (zellij 0.46 with the board's layout, `Alt b` and a pane-control plugin built in; see `docs/2026-11-12-zellij-plugin-spike.md`). Originally (0.45.1: `zellij run --cwd DIR -- cmd` prints the new pane id; `zellij action focus-pane-id`; `zellij action list-panes`). I'm leaning away from herdr, so the TUI targets zellij only. `/next pane` should work under zellij, keeping herdr only as a fallback if trivial.
 - **The hook script stays bash** (it works and is tested). The TUI reads the same state files and calls the Todoist API directly.
 - **Hooks must never slow Claude down or break it.** They run async, exit 0 on every error, and use short timeouts.
 

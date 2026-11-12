@@ -127,7 +127,14 @@ pub fn run(repo_root: &Path, claude: &Path, bin_dir: &Path) -> Result<()> {
         std::fs::rename(&tmp, &settings_path).context("replacing settings.json")?;
         println!("updated {}", settings_path.display());
     }
-    println!("Add this to the `keybinds` block of your zellij config (not edited for you):\n{}", crate::zellij::RETURN_KEYBIND);
+    // wyrcan is built separately (wyrcan/build.sh): it can't share a lockfile with claude-board.
+    let wyrcan = root.join("wyrcan/target/release/wyrcan");
+    if wyrcan.exists() {
+        symlink(&claude, &wyrcan, &bin_dir.join("wyrcan"))?;
+        println!("Start the board with `wyrcan`.");
+    } else {
+        println!("Build wyrcan to run the board: {}", root.join("wyrcan/build.sh").display());
+    }
     Ok(())
 }
 

@@ -20,7 +20,7 @@ pub struct Ctx<'a> {
 
 /// What the board knows about zellij panes between effects.
 pub struct Panes {
-    /// The latest `list-panes` result.
+    /// The live panes, as wyrcan's events stream last reported them.
     live: Vec<String>,
     /// Panes opened for tasks whose session hasn't reported its pane yet.
     opened: HashMap<i64, String>,
@@ -34,6 +34,10 @@ pub struct Panes {
 impl Panes {
     pub fn new(since: i64) -> Panes {
         Panes { live: vec![], opened: HashMap::new(), since, settled: HashSet::new() }
+    }
+
+    pub fn set_live(&mut self, live: Vec<String>) {
+        self.live = live;
     }
 }
 
@@ -62,14 +66,12 @@ impl Ctx<'_> {
         }
     }
 
-    /// Re-reads the live panes. An opened pane is forgotten once it's gone, or once another task's session reports it.
+    /// Forgets an opened pane once another task's session reports it.
+    /// Not once it leaves `live`: an events line sent just before the open could still be on its way.
     fn refresh(&self, p: &mut Panes) -> Result<()> {
-        p.live = self.zj.live_panes(self.run)?;
         let sessions = self.store.sessions()?;
         let live = &p.live;
-        p.opened.retain(|id, x| {
-            live.contains(x) && !sessions.iter().any(|s| s.task_id != Some(*id) && self.zj.pane_of(s, live) == Some(x.as_str()))
-        });
+        p.opened.retain(|id, x| !sessions.iter().any(|s| s.task_id != Some(*id) && self.zj.pane_of(s, live) == Some(x.as_str())));
         Ok(())
     }
 
@@ -93,7 +95,7 @@ impl Ctx<'_> {
     fn stack(&self, p: &Panes) -> Result<Vec<String>> {
         let ours = self.store.sessions()?;
         let ours = ours.iter().filter(|s| s.task_id.is_some() || s.kind == SessionKind::Pen);
-        let mut v: Vec<String> = ours.filter_map(|s| self.zj.pane_of(s, &p.live)).map(String::from).chain(p.opened.values().cloned()).collect();
+        let mut v: Vec<String> = ours.filter_map(|s| self.zj.pane_of(s, &p.live)).map(String::from).chain(p.opened.values().filter(|x| p.live.contains(x)).cloned()).collect();
         v.retain(|x| Some(x.as_str()) != self.zj.board_pane.as_deref());
         v.sort();
         v.dedup();
@@ -289,7 +291,7 @@ mod tests {
     use crate::store::SessionUpdate;
     use std::cell::RefCell;
 
-    /// Records every command; `list-panes` answers with `live`, `zellij run` with "terminal_9".
+    /// Records every command; `open` answers "terminal_9". `live` is what the events stream reported (see `panes`).
     struct Rec {
         calls: RefCell<Vec<String>>,
         live: Vec<&'static str>,
@@ -298,20 +300,21 @@ mod tests {
         fn run(&self, cmd: &[String]) -> Result<String> {
             let line = cmd.join(" ");
             self.calls.borrow_mut().push(line.clone());
-            Ok(if line.ends_with("list-panes") {
-                self.live.iter().map(|p| format!("{p} terminal x\n")).collect()
-            } else if line.starts_with("zellij run") {
-                "terminal_9\n".into()
-            } else {
-                String::new()
-            })
+            Ok(if line.contains("--name open") { "terminal_9\n".into() } else { String::new() })
         }
     }
     fn rec(live: &[&'static str]) -> Rec {
         Rec { calls: RefCell::new(vec![]), live: live.to_vec() }
     }
+    /// Pane state as if the events stream had reported `r.live`.
+    fn panes(r: &Rec) -> Panes {
+        let mut p = Panes::new(0);
+        p.set_live(r.live.iter().map(|x| x.to_string()).collect());
+        p
+    }
+    const P: &str = "wyrcan pipe --plugin zellij:wyrcan --name";
     fn inside() -> Zellij {
-        Zellij { session: Some("z".into()), board_pane: Some("terminal_0".into()) }
+        Zellij { session: Some("z".into()), board_pane: Some("terminal_0".into()), bin: "wyrcan".into() }
     }
     fn ctx<'a>(s: &'a Store, c: &'a Config, zj: &'a Zellij, r: &'a Rec) -> Ctx<'a> {
         Ctx { store: s, cfg: c, zj, run: r, verify: &|_| true, cwd: "/home" }
@@ -330,7 +333,7 @@ mod tests {
         add(&s, "busy", Stage::Active);
         let q = add(&s, "next", Stage::Queue);
         let mut ap = app(&s, &c);
-        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
         assert!(r.calls.borrow().is_empty(), "{:?}", r.calls.borrow());
         assert_eq!(ap.message.as_deref(), Some("All 1 active slots are in use. Park or finish a stream first."));
         assert_eq!(stage(&s, q), Stage::Queue);
@@ -339,11 +342,11 @@ mod tests {
     #[test]
     fn start_outside_zellij_says_so_and_changes_nothing() {
         let (s, c, r) = (Store::open_in_memory(), cfg(3), rec(&[]));
-        let zj = Zellij { session: None, board_pane: None };
+        let zj = Zellij { session: None, board_pane: None, bin: String::new() };
         let q = add(&s, "next", Stage::Queue);
         let mut ap = app(&s, &c);
-        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
-        assert_eq!(ap.message.as_deref(), Some("not inside zellij"));
+        run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
+        assert!(ap.message.as_deref().unwrap().starts_with("not inside wyrcan"), "{:?}", ap.message);
         assert_eq!(stage(&s, q), Stage::Queue);
         assert!(r.calls.borrow().is_empty());
     }
@@ -353,14 +356,15 @@ mod tests {
         let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&["terminal_0", "terminal_9"]));
         let q = add(&s, "next", Stage::Queue);
         let mut ap = app(&s, &c);
-        let mut p = Panes::new(0);
+        let mut p = panes(&r);
         assert!(!run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap));
         assert_eq!(stage(&s, q), Stage::Active);
-        assert!(r.calls.borrow().iter().any(|l| l.ends_with(&format!("--direction right -- env CLAUDE_CONFIG_DIR=/c claude /next {q}"))));
+        let want = format!(r#""argv":["env","CLAUDE_CONFIG_DIR=/c","claude","/next {q}"]"#);
+        assert!(r.calls.borrow().iter().any(|l| l.starts_with(&format!("{P} open")) && l.contains(&want)), "{:?}", r.calls.borrow());
         // The session hasn't reported its pane yet, but Enter already finds it.
         r.calls.borrow_mut().clear();
         run_all(vec![Effect::Enter(q)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
-        assert_eq!(r.calls.borrow().last().unwrap(), "zellij action focus-pane-id terminal_9");
+        assert_eq!(r.calls.borrow().last().unwrap(), &format!("{P} focus --args pane=terminal_9"));
     }
 
     #[test]
@@ -368,7 +372,7 @@ mod tests {
         let (s, c, zj, r) = (Store::open_in_memory(), cfg(3), inside(), rec(&["terminal_0", "terminal_9"]));
         let q = s.add_task(NewTask { title: "t", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
         let mut ap = app(&s, &c);
-        let mut p = Panes::new(0);
+        let mut p = panes(&r);
         run_all(vec![Effect::Start(q)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
         assert_eq!(ap.prompt.as_ref().unwrap().label, "Directory for 't':");
         assert_eq!(stage(&s, q), Stage::Queue);
@@ -431,13 +435,13 @@ mod tests {
         session(&s, "new", Some(other), AgentState::Working);
         pane(&s, "new", "terminal_2", AgentState::Working);
         let mut ap = app(&s, &c);
-        let mut p = Panes::new(0);
+        let mut p = panes(&r);
         run_all(vec![Effect::Resume(parked)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
         assert_eq!(ap.message, None);
         assert_eq!(stage(&s, parked), Stage::Active);
         let calls = r.calls.borrow();
-        assert!(calls.iter().any(|l| l.starts_with("zellij run") && l.ends_with("claude --resume old")), "{calls:?}");
-        assert!(!calls.iter().any(|l| l.ends_with("focus-pane-id terminal_2")), "{calls:?}");
+        assert!(calls.iter().any(|l| l.starts_with(&format!("{P} open")) && l.contains(r#""claude","--resume","old"]"#)), "{calls:?}");
+        assert!(!calls.iter().any(|l| l.ends_with("pane=terminal_2")), "{calls:?}");
     }
 
     #[test]
@@ -448,11 +452,11 @@ mod tests {
         session(&s, "sb", Some(b), AgentState::Working);
         pane(&s, "sb", "terminal_9", AgentState::Working);
         let mut ap = app(&s, &c);
-        let mut p = Panes::new(0);
+        let mut p = panes(&r);
         p.opened.insert(a, "terminal_9".into());
         run_all(vec![Effect::Enter(a)], &ctx(&s, &c, &zj, &r), &mut p, &mut ap);
         assert_eq!(ap.message.as_deref(), Some("No live session. Resume it first."));
-        assert!(!r.calls.borrow().iter().any(|l| l.contains("focus-pane-id terminal_9")));
+        assert!(!r.calls.borrow().iter().any(|l| l.contains("pane=terminal_9")));
     }
 
     #[test]
@@ -462,9 +466,9 @@ mod tests {
         session(&s, "s1", Some(id), AgentState::Waiting);
         pane(&s, "s1", "terminal_4", AgentState::Waiting);
         let mut ap = app(&s, &c);
-        run_all(vec![Effect::Park(id)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+        run_all(vec![Effect::Park(id)], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
         assert_eq!(stage(&s, id), Stage::Parked);
-        assert_eq!(r.calls.borrow().last().unwrap(), "zellij action close-pane --pane-id terminal_4");
+        assert_eq!(r.calls.borrow().last().unwrap(), &format!("{P} close --args pane=terminal_4"));
     }
 
     #[test]
@@ -475,11 +479,11 @@ mod tests {
         pane(&s, "s1", "terminal_4", AgentState::Waiting);
         let mut ap = app(&s, &c);
         let gone = rec(&["terminal_0"]);
-        run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &gone), &mut Panes::new(0), &mut ap);
+        run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &gone), &mut panes(&gone), &mut ap);
         assert_eq!(ap.message.as_deref(), Some("No live session. Resume it first."));
         let r = rec(&["terminal_0", "terminal_4"]);
-        run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
-        assert!(r.calls.borrow().contains(&"zellij action write-chars --pane-id terminal_4 -- /wrap".to_string()));
+        run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
+        assert!(r.calls.borrow().contains(&format!("{P} write --args pane=terminal_4 -- /wrap")));
     }
 
     #[test]
@@ -491,7 +495,7 @@ mod tests {
             pane(&s, "s1", "terminal_4", state);
             let r = rec(&["terminal_0", "terminal_4"]);
             let mut ap = app(&s, &c);
-            run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &r), &mut Panes::new(0), &mut ap);
+            run_all(vec![Effect::Wrap(id)], &ctx(&s, &c, &zj, &r), &mut panes(&r), &mut ap);
             assert_eq!(ap.message.as_deref(), Some(msg));
             assert!(!r.calls.borrow().iter().any(|l| l.contains("write")), "{:?}", r.calls.borrow());
         }
@@ -534,7 +538,7 @@ mod tests {
         assert_eq!(ap.drag.as_ref().and_then(|d| d.over), Some(to), "the target highlights");
         e.extend(ap.on_mouse(ev(K::Up(MouseButton::Left), onto)));
         let (zj, r) = (inside(), rec(&["terminal_0"]));
-        run_all(e, &ctx(s, c, &zj, &r), &mut Panes::new(0), ap);
+        run_all(e, &ctx(s, c, &zj, &r), &mut panes(&r), ap);
     }
 
     #[test]
@@ -603,20 +607,23 @@ mod tests {
         // A stale session whose recorded pane id is now someone else's: other zellij session.
         mk(Stage::Review, "stale", "terminal_4", AgentState::Waiting);
         s.touch_session(SessionUpdate { id: "stale", cwd: "/w", state: AgentState::Waiting, zellij_session: Some("old"), zellij_pane: None }, false).unwrap();
-        let mut p = Panes::new(0);
+        let mut p = panes(&r);
         tick(&ctx(&s, &c, &zj, &r), &mut p).unwrap();
-        let mut closes: Vec<String> = r.calls.borrow().iter().filter(|l| l.contains("close-pane")).cloned().collect();
+        let mut closes: Vec<String> = r.calls.borrow().iter().filter(|l| l.contains("--name close")).cloned().collect();
         closes.sort();
-        assert_eq!(closes, ["zellij action close-pane --pane-id terminal_1", "zellij action close-pane --pane-id terminal_6"]);
+        assert_eq!(closes, [format!("{P} close --args pane=terminal_1"), format!("{P} close --args pane=terminal_6")]);
         // Resumed by hand in the user's own pane afterwards: flagged, never closed again.
         pane(&s, "idle", "terminal_7", AgentState::Waiting);
         pane(&s, "nopane", "terminal_8", AgentState::Waiting);
         let r3 = rec(&["terminal_0", "terminal_7", "terminal_8"]);
+        p.set_live(panes(&r3).live);
         tick(&ctx(&s, &c, &zj, &r3), &mut p).unwrap();
-        assert!(!r3.calls.borrow().iter().any(|l| l.contains("close-pane")), "{:?}", r3.calls.borrow());
+        assert!(!r3.calls.borrow().iter().any(|l| l.contains("--name close")), "{:?}", r3.calls.borrow());
         // Streams that left Active before the board started are left alone.
         let r2 = rec(&["terminal_0", "terminal_1"]);
-        tick(&ctx(&s, &c, &zj, &r2), &mut Panes::new(i64::MAX)).unwrap();
-        assert!(!r2.calls.borrow().iter().any(|l| l.contains("close-pane")));
+        let mut p2 = Panes::new(i64::MAX);
+        p2.set_live(panes(&r2).live);
+        tick(&ctx(&s, &c, &zj, &r2), &mut p2).unwrap();
+        assert!(!r2.calls.borrow().iter().any(|l| l.contains("--name close")));
     }
 }
