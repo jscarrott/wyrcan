@@ -451,7 +451,11 @@ impl App {
                     Some(Target::Card(k)) => {
                         self.drag = Some(Drag { key: k.clone(), over: None });
                         match self.flat().iter().position(|c| c.key() == k) {
-                            Some(i) => self.select(i),
+                            Some(i) => {
+                                // Reselect so a click always brings the pane forward: wyrcan's Alt+j/k swap it behind the board's back.
+                                self.selected = None;
+                                self.select(i)
+                            }
                             None => vec![],
                         }
                     }
@@ -465,17 +469,8 @@ impl App {
                 }
                 vec![]
             }
-            MouseEventKind::Up(MouseButton::Left) => match self.drag.take() {
-                Some(d) if self.selected.as_ref() == Some(&d.key) => {
-                    // Released on the card itself: a click, which hands an active task's terminal the keys.
-                    if self.hit(at, |t| matches!(t, Target::Card(_))) == Some(Target::Card(d.key)) {
-                        return match self.task() {
-                            Some((t, _)) if t.stage == Stage::Active => vec![Effect::Enter(t.id)],
-                            _ => vec![],
-                        };
-                    }
-                    self.group_at(at).map_or(vec![], |g| self.drop_on(g))
-                }
+            MouseEventKind::Up(MouseButton::Left) => match (self.drag.take(), self.group_at(at)) {
+                (Some(d), Some(g)) if self.selected.as_ref() == Some(&d.key) => self.drop_on(g),
                 _ => vec![],
             },
             _ if wheel != 0 && self.wide => {
@@ -1035,6 +1030,7 @@ pub(crate) mod tests {
         let ev = |kind, row| MouseEvent { kind, column: 2, row, modifiers: KeyModifiers::NONE };
         assert_eq!(ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 4)), [Effect::Show(b)]);
         assert_eq!(ap.selected, Some(CardKey::Task(b)));
+        assert_eq!(ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 4)), [Effect::Show(b)]);
         // Narrow: the wheel walks the list.
         ap.on_mouse(ev(MouseEventKind::ScrollUp, 0));
         assert_eq!(ap.selected, Some(CardKey::Task(a)));
@@ -1044,27 +1040,6 @@ pub(crate) mod tests {
         assert_eq!((ap.selected.clone(), ap.scroll[Group::Queue as usize]), (Some(CardKey::Task(a)), 3));
         ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 6));
         assert!(ap.quick.is_some());
-    }
-
-    #[test]
-    fn click_on_an_active_card_enters_its_pane() {
-        let s = Store::open_in_memory();
-        let (q, a) = (add(&s, "q", Stage::Queue), add(&s, "a", Stage::Active));
-        let mut ap = app(&s, &cfg(3));
-        ap.hits = vec![
-            Hit { rect: Rect::new(0, 0, 10, 3), target: Target::Card(CardKey::Task(q)) },
-            Hit { rect: Rect::new(0, 3, 10, 3), target: Target::Card(CardKey::Task(a)) },
-        ];
-        let ev = |kind, row| MouseEvent { kind, column: 2, row, modifiers: KeyModifiers::NONE };
-        let click = |ap: &mut App, row| {
-            ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), row));
-            ap.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), row))
-        };
-        assert_eq!(click(&mut ap, 4), [Effect::Enter(a)]);
-        assert!(click(&mut ap, 1).is_empty());
-        // Pressed on the card but released elsewhere is a drag, not a click.
-        ap.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 4));
-        assert!(ap.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 1)).is_empty());
     }
 
     /// Presses `c` and loads the rows the way the loop does.
