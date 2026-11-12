@@ -85,7 +85,7 @@ pub fn sync_once(store: &Store, remote: &dyn Remote, sec: &Sections) -> Result<S
     }
 
     let remote_section: HashMap<&str, Option<&str>> = rtasks.iter().map(|r| (r.id.as_str(), r.section_id.as_deref())).collect();
-    for t in store.tasks()? {
+    for t in store.tasks()?.into_iter().filter(|t| t.kind != "review") {
         let want = section_for(t.stage, sec);
         let behind = t.synced_stage.as_deref() != Some(t.stage.as_str());
         let (rid, in_place) = match t.todoist_id.clone() {
@@ -338,6 +338,25 @@ mod tests {
         let n = f.calls().len();
         sync_once(&s, &f, &sections()).unwrap();
         assert_eq!(f.calls().len(), n, "second run changes nothing");
+    }
+
+    #[test]
+    fn reviews_are_never_pushed_and_shelved_goes_to_parked() {
+        let (s, f) = synced_board();
+        let a = by_remote(&s, "a").id;
+        s.conn.execute("UPDATE tasks SET stage='shelved' WHERE id=?1", [a]).unwrap();
+        let mk = |stage: &str| {
+            let id = s.add_task(NewTask { title: "PR", description: "", dir: None, labels: &[], todoist_id: None }).unwrap();
+            s.set_kind(id, "review", Some("https://github.com/o/r/pull/1")).unwrap();
+            s.conn.execute("UPDATE tasks SET stage=?2 WHERE id=?1", rusqlite::params![id, stage]).unwrap();
+            id
+        };
+        let (q, d) = (mk("queue"), mk("done"));
+        let r = sync_once(&s, &f, &sections()).unwrap();
+        assert_eq!(r.pushed, 1, "only the shelved task");
+        assert_eq!(f.section_of("a").as_deref(), Some(P));
+        assert_eq!(f.calls(), ["move a P"], "no create/move/complete for reviews");
+        assert!(s.task(q).unwrap().unwrap().todoist_id.is_none() && s.task(d).unwrap().unwrap().todoist_id.is_none());
     }
 
     #[test]
