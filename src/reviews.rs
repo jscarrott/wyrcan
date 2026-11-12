@@ -1,5 +1,7 @@
 //! Parsers for `gh` output used to import PRs awaiting the user's review. Pure: no process calls.
+use crate::config::Config;
 use crate::model::{AgentState, PrState, Stage};
+use crate::pr;
 use crate::store::{NewTask, Store};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -75,6 +77,46 @@ pub struct Poll {
     pub me: String,
 }
 
+const SEARCH: [&str; 7] = ["search", "prs", "--state=open", "--json", "url,title,author,repository,number", "--limit", "100"];
+
+/// `origin` of the repo at `root`, as `owner/name`; git first, then jj for jj-only checkouts.
+fn repo_slug(root: &str, path: Option<&str>) -> Option<String> {
+    let git = pr::gh_args("git", path, &["-C", root, "remote", "get-url", "origin"]);
+    let url = git.or_else(|| {
+        let out = pr::gh_args("jj", path, &["-R", root, "git", "remote", "list"])?;
+        out.lines().find_map(|l| l.strip_prefix("origin ").map(str::to_string))
+    })?;
+    parse_remote(url.trim())
+}
+
+/// Asks GitHub what the board needs. Without a login, every field is empty so `apply` changes nothing.
+fn fetch_with(store: &Store, cfg: &Config, path: Option<&str>) -> Poll {
+    let gh = |args: &[&str]| pr::gh_args("gh", path, args);
+    let none = Poll { requested: None, open_in_repos: None, prs: HashMap::new(), me: String::new() };
+    let Some(me) = gh(&["api", "user", "--jq", ".login"]).map(|m| m.trim().to_string()).filter(|m| !m.is_empty()) else { return none };
+    let requested = gh(&[&SEARCH[..], &["--review-requested=@me"]].concat()).and_then(|j| parse_search(&j));
+    let open_in_repos = cfg.reviews_all_open.then(|| {
+        let since = crate::store::now() - 14 * 86400;
+        let mut repos: Vec<String> = store.active_repo_roots(since).unwrap_or_default().iter().filter_map(|r| repo_slug(r, path)).collect();
+        repos.sort();
+        repos.dedup();
+        let args: Vec<&str> = SEARCH.iter().copied().chain(repos.iter().flat_map(|r| ["--repo", r.as_str()])).collect();
+        if repos.is_empty() { None } else { gh(&args).and_then(|j| parse_search(&j)).map(|f| f.into_iter().filter(|f| f.author != me).collect()) }
+    });
+    let mut prs = HashMap::new();
+    for t in store.tasks().unwrap_or_default().into_iter().filter(|t| t.kind == "review" && !matches!(t.stage, Stage::Done | Stage::Dropped)) {
+        let Some(url) = t.link.filter(|u| u.starts_with("https://")) else { continue };
+        if let Some(r) = gh(&["pr", "view", &url, "--json", "state,reviews,headRefName"]).and_then(|j| parse_pr_review(&j)) {
+            prs.insert(url, r);
+        }
+    }
+    Poll { requested, open_in_repos: open_in_repos.flatten(), prs, me }
+}
+
+pub fn fetch(store: &Store, cfg: &Config) -> Poll {
+    fetch_with(store, cfg, None)
+}
+
 /// Import new PRs as review tasks, then move known ones by what GitHub says. Missing data never moves anything.
 pub fn apply(store: &Store, poll: &Poll) -> Result<()> {
     let go = |id: i64, to: Stage| store.transition(id, to, usize::MAX, &|_, _| vec![]).map(|_| ());
@@ -145,6 +187,24 @@ mod tests {
         let r = parse_pr_review(&fixture("pr_review")).unwrap();
         assert_eq!(r, PrReview { state: PrState::Merged, reviewed_by: vec!["john".into()], head: "feat/x".into() });
         assert!(parse_pr_review("nope").is_none());
+    }
+
+    #[test]
+    fn fetch_without_gh_is_all_none() {
+        let p = fetch_with(&Store::open_in_memory(), &Config::from_env(), Some(""));
+        assert!(p.requested.is_none() && p.open_in_repos.is_none() && p.prs.is_empty() && p.me.is_empty());
+    }
+
+    #[test]
+    fn fetch_with_failed_login_is_a_no_op() {
+        let dir = std::env::temp_dir().join(format!("gh-fake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gh = dir.join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nif [ \"$1\" = api ]; then exit 0; fi\necho '[]'\n").unwrap();
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let p = fetch_with(&Store::open_in_memory(), &Config::from_env(), Some(dir.to_str().unwrap()));
+        assert!(p.requested.is_none() && p.open_in_repos.is_none() && p.prs.is_empty());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

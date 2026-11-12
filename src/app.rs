@@ -821,6 +821,7 @@ pub(crate) mod tests {
             state_dir: "/nonexistent/state".into(),
             claude_dir: "/c".into(),
             max_active: max,
+            reviews_all_open: false,
             file: String::new(),
         }
     }

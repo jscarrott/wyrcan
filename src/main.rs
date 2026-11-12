@@ -164,6 +164,7 @@ fn spawn_poller() {
             for t in store.tasks().unwrap_or_default().iter().filter(|t| t.stage == model::Stage::Review) {
                 pr::refresh(&store, t.id);
             }
+            let _ = reviews::apply(&store, &reviews::fetch(&store, &cfg));
         }
         std::thread::sleep(Duration::from_secs(120));
     });

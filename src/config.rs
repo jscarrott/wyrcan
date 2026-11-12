@@ -10,6 +10,8 @@ pub struct Config {
     pub claude_dir: PathBuf,
     /// Cap on tasks in the Active stage.
     pub max_active: usize,
+    /// Also import open PRs in active repos that nobody asked you to review.
+    pub reviews_all_open: bool,
     /// Raw config file text, for keys read on demand.
     pub(crate) file: String,
 }
@@ -68,6 +70,7 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home().join(".claude")),
             max_active: file_value(&file, "max_active").and_then(|v| v.parse().ok()).unwrap_or(3),
+            reviews_all_open: file_value(&file, "reviews_all_open").is_some_and(|v| v == "true"),
             file,
         }
     }
@@ -108,6 +111,11 @@ mod tests {
         let tilde = file_value("claude_dir = \"~/.claude-work\"", "claude_dir").unwrap();
         assert_eq!(PathBuf::from(tilde), home().join(".claude-work"));
         assert_eq!(file_value("max_active = 5", "max_active").and_then(|v| v.parse::<usize>().ok()), Some(5));
+    }
+
+    #[test]
+    fn config_reads_reviews_all_open() {
+        assert!(file_value("reviews_all_open = true", "reviews_all_open").is_some_and(|v| v == "true"));
     }
 
     #[test]

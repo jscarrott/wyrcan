@@ -376,6 +376,16 @@ impl Store {
         Ok(rows)
     }
 
+    /// Repos edited for tasks that changed stage at or after `since`.
+    pub fn active_repo_roots(&self, since: i64) -> Result<Vec<String>> {
+        let mut q = self.conn.prepare(
+            "SELECT DISTINCT r.root FROM repos r JOIN sessions s ON s.id=r.session_id JOIN tasks t ON t.id=s.task_id
+             WHERE t.stage_at>=?1 ORDER BY r.root",
+        )?;
+        let rows = q.query_map([since], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// (root, git ref) per repo the task's sessions edited; the latest-recorded ref wins.
     pub fn task_refs(&self, task_id: i64) -> Result<Vec<(String, String)>> {
         let mut q = self.conn.prepare(
@@ -525,6 +535,20 @@ mod tests {
     }
     fn stage_of(s: &Store, id: i64) -> Stage {
         s.task(id).unwrap().unwrap().stage
+    }
+
+    #[test]
+    fn active_repo_roots_only_recent() {
+        let s = Store::open_in_memory();
+        let (old, new) = (s.add_task(nt("old")).unwrap(), s.add_task(nt("new")).unwrap());
+        s.conn.execute("UPDATE tasks SET stage_at=100 WHERE id=?1", [old]).unwrap();
+        s.conn.execute("UPDATE tasks SET stage_at=200 WHERE id=?1", [new]).unwrap();
+        for (sid, id, root) in [("a", old, "/old"), ("b", new, "/new")] {
+            s.link_session(sid, id, root).unwrap();
+            s.mark_edited(sid, root, "main").unwrap();
+        }
+        assert_eq!(s.active_repo_roots(150).unwrap(), ["/new"]);
+        assert_eq!(s.active_repo_roots(0).unwrap(), ["/new", "/old"]);
     }
 
     #[test]
