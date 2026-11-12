@@ -49,6 +49,10 @@ fn file_value(text: &str, key: &str) -> Option<String> {
     })
 }
 
+fn reviews_all_open_in(file: &str) -> bool {
+    file_value(file, "reviews_all_open").is_some_and(|v| v == "true")
+}
+
 impl Config {
     /// Same env vars and defaults as hooks/claude-board.sh, plus claude_dir.
     pub fn from_env() -> Config {
@@ -70,7 +74,7 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home().join(".claude")),
             max_active: file_value(&file, "max_active").and_then(|v| v.parse().ok()).unwrap_or(3),
-            reviews_all_open: file_value(&file, "reviews_all_open").is_some_and(|v| v == "true"),
+            reviews_all_open: reviews_all_open_in(&file),
             file,
         }
     }
@@ -115,7 +119,9 @@ mod tests {
 
     #[test]
     fn config_reads_reviews_all_open() {
-        assert!(file_value("reviews_all_open = true", "reviews_all_open").is_some_and(|v| v == "true"));
+        assert!(reviews_all_open_in("reviews_all_open = true"));
+        assert!(!reviews_all_open_in("reviews_all_open = false"));
+        assert!(!reviews_all_open_in("max_active = 3"));
     }
 
     #[test]

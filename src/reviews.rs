@@ -77,6 +77,9 @@ pub struct Poll {
     pub me: String,
 }
 
+/// Repos edited for tasks that moved within this many days count as active.
+const ACTIVE_DAYS: i64 = 30;
+
 const SEARCH: [&str; 7] = ["search", "prs", "--state=open", "--json", "url,title,author,repository,number", "--limit", "100"];
 
 /// `origin` of the repo at `root`, as `owner/name`; git first, then jj for jj-only checkouts.
@@ -96,7 +99,7 @@ fn fetch_with(store: &Store, cfg: &Config, path: Option<&str>) -> Poll {
     let Some(me) = gh(&["api", "user", "--jq", ".login"]).map(|m| m.trim().to_string()).filter(|m| !m.is_empty()) else { return none };
     let requested = gh(&[&SEARCH[..], &["--review-requested=@me"]].concat()).and_then(|j| parse_search(&j));
     let open_in_repos = cfg.reviews_all_open.then(|| {
-        let since = crate::store::now() - 14 * 86400;
+        let since = crate::store::now() - ACTIVE_DAYS * 86400;
         let mut repos: Vec<String> = store.active_repo_roots(since).unwrap_or_default().iter().filter_map(|r| repo_slug(r, path)).collect();
         repos.sort();
         repos.dedup();
@@ -191,7 +194,10 @@ mod tests {
 
     #[test]
     fn fetch_without_gh_is_all_none() {
-        let p = fetch_with(&Store::open_in_memory(), &Config::from_env(), Some(""));
+        let empty = std::env::temp_dir().join(format!("no-gh-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let p = fetch_with(&Store::open_in_memory(), &Config::from_env(), Some(empty.to_str().unwrap()));
+        std::fs::remove_dir_all(&empty).ok();
         assert!(p.requested.is_none() && p.open_in_repos.is_none() && p.prs.is_empty() && p.me.is_empty());
     }
 
