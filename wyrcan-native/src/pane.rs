@@ -31,6 +31,8 @@ pub struct Pane {
     killer: Box<dyn ChildKiller + Send + Sync>,
     pub exited: Option<Option<i32>>,
     size: (u16, u16),
+    /// Inside a synchronized update (mode 2026) since then: the screen is half-drawn, so don't show it yet.
+    held_since: Option<std::time::Instant>,
 }
 
 fn pty_size(cols: u16, rows: u16) -> PtySize {
@@ -91,16 +93,30 @@ impl Pane {
             killer,
             exited: None,
             size: (cols, rows),
+            held_since: None,
         })
     }
 
     /// Child output: through the emulator; its replies (cursor reports, mode queries) go back to the child.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.term.vt_write(bytes);
-        let replies: Vec<Vec<u8>> = self.term.events().filter_map(|e| if let GEvent::PtyWrite(b) = e { Some(b) } else { None }).collect();
+        let mut replies = vec![];
+        for e in self.term.events() {
+            match e {
+                GEvent::PtyWrite(b) => replies.push(b),
+                GEvent::RenderHold(true) => self.held_since = self.held_since.or(Some(std::time::Instant::now())),
+                GEvent::RenderHold(false) => self.held_since = None,
+                _ => {}
+            }
+        }
         for r in replies {
             self.write(&r);
         }
+    }
+
+    /// Mid-way through a synchronized update; a program that never ends one is shown after 150 ms anyway.
+    pub fn held(&self) -> bool {
+        self.held_since.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(150))
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -394,6 +410,16 @@ mod tests {
         assert_eq!(color(StyleColor::None), Color::Reset);
         assert_eq!(color(StyleColor::Palette(ghostty_vt::style::PaletteIndex(12))), Color::LightBlue);
         assert_eq!(color(StyleColor::Palette(ghostty_vt::style::PaletteIndex(208))), Color::Indexed(208));
+    }
+
+    #[test]
+    fn synchronized_updates_hold_the_pane() {
+        let mut p = pane();
+        p.feed(b"\x1b[?2026h half");
+        assert!(p.held());
+        p.feed(b" done\x1b[?2026l");
+        assert!(!p.held());
+        p.kill();
     }
 
     #[test]

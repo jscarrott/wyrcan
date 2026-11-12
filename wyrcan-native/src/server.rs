@@ -10,7 +10,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -26,7 +26,8 @@ pub enum Ev {
 
 struct Client {
     id: u64,
-    term: Terminal<CrosstermBackend<UnixStream>>,
+    /// Buffered: a frame is many small escape sequences; ratatui flushes once per draw.
+    term: Terminal<CrosstermBackend<BufWriter<UnixStream>>>,
     size: (u16, u16),
     /// To hang up: the reader thread holds another handle, so dropping `term` alone leaves it open.
     sock: UnixStream,
@@ -189,6 +190,10 @@ impl Server {
     fn render(&mut self) {
         let Some((w, h)) = self.client.as_ref().map(|c| c.size) else { return };
         let l = self.layout();
+        // A visible pane is mid-way through a synchronized redraw: wait for the rest (dirty stays set).
+        if l.panes.iter().any(|(id, _)| self.panes.iter().any(|p| p.id == *id && p.held())) {
+            return;
+        }
         let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
         let mut cursor = None;
         let focus = self.focus;
@@ -224,6 +229,8 @@ impl Server {
         buf.set_stringn(l.status.x, l.status.y, STATUS, l.status.width as usize, bar);
 
         let Some(c) = self.client.as_mut() else { return };
+        // Synchronized output: the outer terminal shows the frame whole, never half-painted.
+        let _ = c.term.backend_mut().write_all(b"\x1b[?2026h");
         let drawn = c.term.draw(|f| {
             f.buffer_mut().merge(&buf);
             if let Some((pos, _)) = cursor {
@@ -235,7 +242,7 @@ impl Server {
             return;
         }
         // DECSCUSR: the focused pane's cursor shape.
-        let _ = write!(c.term.backend_mut(), "\x1b[{} q", cursor.map_or(2, |(_, s)| s));
+        let _ = write!(c.term.backend_mut(), "\x1b[{} q\x1b[?2026l", cursor.map_or(2, |(_, s)| s));
         let _ = c.term.backend_mut().flush();
         self.last_screen = Some(buf);
         self.dirty = false;
@@ -423,7 +430,10 @@ impl Server {
             Ev::Output(id, b) => {
                 if let Some(p) = self.pane(id) {
                     p.feed(&b);
-                    self.dirty = true;
+                    // A collapsed agent's output changes nothing on screen until it's shown.
+                    if self.layout().panes.iter().any(|(v, _)| *v == id) {
+                        self.dirty = true;
+                    }
                 }
             }
             Ev::Exited(id, code) => {
@@ -441,7 +451,7 @@ impl Server {
                 self.next_client += 1;
                 let opts = TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, w, h)) };
                 let (Ok(reader), Ok(sock)) = (s.try_clone(), s.try_clone()) else { return };
-                if let Ok(mut term) = Terminal::with_options(CrosstermBackend::new(s), opts) {
+                if let Ok(mut term) = Terminal::with_options(CrosstermBackend::new(BufWriter::with_capacity(256 * 1024, s)), opts) {
                     let _ = term.clear();
                     // One client at a time: a new attach takes over (the old one is hung up on drop).
                     self.client = Some(Client { id, term, size: (w, h), sock });
@@ -529,16 +539,35 @@ pub fn run(session: &str) -> anyhow::Result<()> {
     s.publish();
     let frame = Duration::from_millis(16);
     let mut last = Instant::now();
+    // WYRCAN_PROFILE=1: render cost to the log every 5 s.
+    let profile = std::env::var_os("WYRCAN_PROFILE").is_some();
+    let (mut frames, mut spent, mut worst, mut since) = (0u32, Duration::ZERO, Duration::ZERO, Instant::now());
     while !s.quit {
-        match rx.recv_timeout(frame) {
-            Ok(ev) => s.handle(ev),
+        // Idle: block. Dirty: wait only for the rest of this frame, then draw.
+        let wait = if s.dirty { frame.saturating_sub(last.elapsed()) } else { Duration::from_secs(1) };
+        match rx.recv_timeout(wait) {
+            Ok(ev) => {
+                s.handle(ev);
+                // Take what's already queued, so one frame covers it (capped: a flooding pane mustn't starve drawing).
+                for ev in rx.try_iter().take(256) {
+                    s.handle(ev);
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         // Coalesce: PTY output arrives per read; draw at most once a frame.
         if s.dirty && last.elapsed() >= frame {
+            let t = Instant::now();
             s.render();
             last = Instant::now();
+            frames += 1;
+            spent += last - t;
+            worst = worst.max(last - t);
+        }
+        if profile && since.elapsed() >= Duration::from_secs(5) {
+            eprintln!("render: {frames} frames, avg {:?}, worst {:?}", spent / frames.max(1), worst);
+            (frames, spent, worst, since) = (0, Duration::ZERO, Duration::ZERO, Instant::now());
         }
     }
     for p in &mut s.panes {

@@ -204,8 +204,15 @@ fn attach(session: &str) -> Result<()> {
     let mut from = s.try_clone()?;
     let flag = done.clone();
     // Server output straight to the terminal until it hangs up (detach, takeover, or the session ended).
+    // Flushed per chunk: stdout is line-buffered, and screen updates rarely contain a newline.
     let copier = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut from, &mut std::io::stdout());
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut out = std::io::stdout().lock();
+        while let Ok(n) = from.read(&mut buf) {
+            if n == 0 || out.write_all(&buf[..n]).and_then(|_| out.flush()).is_err() {
+                break;
+            }
+        }
         flag.store(true, Ordering::Relaxed);
     });
     while !done.load(Ordering::Relaxed) {

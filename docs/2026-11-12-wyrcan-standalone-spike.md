@@ -89,6 +89,41 @@ scrollback unless the program in it tracks the mouse.
    2,000,000 lines of output in about 0.6 s. Not yet re-measured with
    libghostty.
 
+## Performance (after the first hands-on try felt slow)
+
+Measured by typing into a pane through a client in a pseudo-terminal and
+timing until the echo reached the client's output, 30 keys each:
+
+| | keystroke → screen, median / p90 |
+|---|---|
+| First version | ~2,000 ms (most echoes only appeared when later output pushed them out) |
+| Fixed, idle | 5 / 5 ms |
+| Fixed, two agents streaming in the background | 4 / 5 ms |
+
+What was wrong, and what changed:
+
+- **The client's stdout is line-buffered**, and screen updates rarely contain
+  a newline, so small updates (a key's echo) sat in the buffer. It now
+  flushes after every chunk. This was nearly all of it.
+- **The server wrote each escape sequence to the socket separately.** It now
+  buffers a frame and sends it in one write.
+- **Hidden panes caused redraws.** Output from a collapsed agent redrew the
+  screen about 40 times a second for nothing. Now only visible panes mark it
+  dirty: with two agents streaming in the background, the server dropped
+  from 38 to 6 ms of CPU per second.
+- **Frame pacing.** The loop waited up to a whole extra frame before drawing.
+  It now waits only for the rest of the current frame, and draws once for
+  everything already queued (at most 256 events, so a flood can't stop it
+  drawing).
+- **Synchronized output (mode 2026).** Claude brackets its redraws so the
+  terminal shows them whole. The server now waits for a visible pane to
+  finish such a redraw before drawing (at most 150 ms), and wraps each of its
+  own frames the same way, so kitty never shows a half-painted frame.
+
+A frame costs about 0.8 ms to compose with one agent visible, and redraws
+run at up to 60 a second. `WYRCAN_PROFILE=1` in the server's environment logs
+the frame count and cost every 5 s.
+
 ## Not tested, and known gaps
 
 - **A real Claude session.** The test Claude had no login, so only its
